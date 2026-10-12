@@ -1,4 +1,5 @@
-"""Pure helpers for the STT no-speech confidence gate.
+"""
+Pure helpers for the STT no-speech confidence gate.
 
 Kept import-free (no rclpy/numpy) so pytest can exercise the filtering logic
 directly. ``stt_node`` calls into here after Whisper transcription.
@@ -21,16 +22,15 @@ def keep_segment(no_speech_prob, max_no_speech_prob=0.5):
 
 
 def filter_segments(segments, max_no_speech_prob=0.5):
-    """Split Whisper segments into kept texts and dropped (score, text).
+    """
+    Split Whisper segments into kept texts and dropped (score, text) tuples.
 
-    Args:
-        segments: iterable of objects with ``.text`` and
-            ``.no_speech_prob`` (e.g. faster-whisper Segment).
-        max_no_speech_prob: segments scoring above this are dropped.
+    :param segments: iterable of objects with ``.text`` and ``.no_speech_prob``
+        (e.g. faster-whisper Segment).
+    :param max_no_speech_prob: segments scoring above this are dropped.
 
-    Returns:
-        (kept_texts, dropped) where kept_texts is a list of stripped
-        non-empty strings and dropped is a list of (score, text) tuples.
+    :returns: ``(kept_texts, dropped)`` where kept_texts is a list of stripped
+        non-empty strings and dropped is a list of ``(score, text)`` tuples.
     """
     kept = []
     dropped = []

@@ -3,13 +3,12 @@ from rclpy.node import Node
 from std_msgs.msg import String
 import socket
 import subprocess
-import threading
-import time
-import os
 
 
 class RobotStateNode(Node):
     """
+    Enrich STT transcripts with live robot state before the LLM sees them.
+
     Subscribes to /g1/stt/transcript, enriches it with live robot state,
     and republishes to llm_prompt (which llm_node listens to).
 
@@ -129,7 +128,8 @@ class RobotStateNode(Node):
 
         # Battery
         if self.battery_soc is not None:
-            status = 'charging' if self.battery_current and self.battery_current > 0 else 'discharging'
+            charging = self.battery_current and self.battery_current > 0
+            status = 'charging' if charging else 'discharging'
             lines.append(
                 f'Battery: {self.battery_soc}% (health {self.battery_soh}%, '
                 f'{abs(self.battery_current):.1f}A {status}, '

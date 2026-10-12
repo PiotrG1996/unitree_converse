@@ -2,7 +2,6 @@
 """Separate-process worker for native Unitree G1 speaker playback."""
 
 import json
-import os
 import sys
 import time
 import traceback

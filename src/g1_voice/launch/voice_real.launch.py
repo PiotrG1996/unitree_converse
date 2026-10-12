@@ -50,13 +50,13 @@ def generate_launch_description():
             output='screen',
             parameters=[params_file],
         ),
-	    Node(
-    	    package='g1_voice',
-    	    executable='button_trigger_node',
-    	    name='button_trigger_node',
-    	    output='screen',
-    	    parameters=[params_file],
-	    ),
+        Node(
+            package='g1_voice',
+            executable='button_trigger_node',
+            name='button_trigger_node',
+            output='screen',
+            parameters=[params_file],
+        ),
         Node(
             package='g1_voice',
             executable='robot_state_node',

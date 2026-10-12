@@ -16,13 +16,20 @@ import numpy as np
 
 
 class TTSNode(Node):
+    def _param(self, name):
+        """Return a declared parameter's value (short form of get_parameter)."""
+        return self.get_parameter(name).value
+
     def __init__(self):
         super().__init__('tts_node')
 
-        self.declare_parameter('voice_model_path',
+        self.declare_parameter(
+            'voice_model_path',
             os.path.expanduser('~/.local/share/piper/en_US-lessac-medium.onnx'))
-        self.declare_parameter('polish_voice_model_path',
-            os.path.expanduser('~/.local/share/piper/pl_PL-gosia-medium/pl_PL-gosia-medium.onnx'))
+        self.declare_parameter(
+            'polish_voice_model_path',
+            os.path.expanduser(
+                '~/.local/share/piper/pl_PL-gosia-medium/pl_PL-gosia-medium.onnx'))
         self.declare_parameter('use_cuda', True)
         self.declare_parameter('output_device', -1)
         self.declare_parameter('continuous_mode', True)
@@ -32,12 +39,12 @@ class TTSNode(Node):
         self.declare_parameter('piper_binary', os.path.expanduser('~/.local/piper-bin/piper'))
         self.declare_parameter('piper_lib_dir', os.path.expanduser('~/.local/piper-bin'))
 
-        self.model_path = self.get_parameter('voice_model_path').get_parameter_value().string_value
-        self.polish_model_path = self.get_parameter('polish_voice_model_path').get_parameter_value().string_value
-        self.use_cuda = self.get_parameter('use_cuda').get_parameter_value().bool_value
-        self.output_device = self.get_parameter('output_device').get_parameter_value().integer_value
-        self.output_sample_rate = self.get_parameter('output_sample_rate').get_parameter_value().integer_value
-        self.network_interface = self.get_parameter('network_interface').get_parameter_value().string_value
+        self.model_path = self._param('voice_model_path')
+        self.polish_model_path = self._param('polish_voice_model_path')
+        self.use_cuda = self._param('use_cuda')
+        self.output_device = self._param('output_device')
+        self.output_sample_rate = self._param('output_sample_rate')
+        self.network_interface = self._param('network_interface')
         worker_path = os.path.join(
             os.path.dirname(os.path.abspath(__file__)),
             'g1_audio_worker.py'
@@ -65,14 +72,14 @@ class TTSNode(Node):
         self.get_logger().info(
             f'Native G1 audio worker initialized on {self.network_interface}'
         )
-        self.tts_mode = self.get_parameter('tts_mode').get_parameter_value().string_value
-        self.piper_binary = self.get_parameter('piper_binary').get_parameter_value().string_value
-        self.piper_lib_dir = self.get_parameter('piper_lib_dir').get_parameter_value().string_value
+        self.tts_mode = self._param('tts_mode')
+        self.piper_binary = self._param('piper_binary')
+        self.piper_lib_dir = self._param('piper_lib_dir')
 
         # Playback always goes through the native g1_audio_worker (Unitree AudioHub),
         # so sounddevice output-device selection is not used. The output_device param
         # is retained only for config compatibility with older profiles.
-        self.continuous_mode = self.get_parameter('continuous_mode').get_parameter_value().bool_value
+        self.continuous_mode = self._param('continuous_mode')
 
         # Speaking enabled/muted, controlled by the F3 button via
         # /g1/voice/speak_enable (published by button_trigger_node). Default True
@@ -153,7 +160,6 @@ class TTSNode(Node):
         """Play a 16-bit PCM WAV through the native G1 speaker (g1_audio_worker)."""
         with wave.open(io.BytesIO(wav_bytes), 'rb') as wf:
             n_channels = wf.getnchannels()
-            sampwidth = wf.getsampwidth()
             src_rate = wf.getframerate()
             frames = wf.readframes(wf.getnframes())
 
@@ -191,8 +197,12 @@ class TTSNode(Node):
         self._speech_queue.put((language, reply))
 
     def _normalize(self, audio: np.ndarray, target: float = 0.9) -> np.ndarray:
-        """Scale audio so its peak sits at `target`, preventing hard clipping
-        (Piper peaks at ≈1.0) and keeping TTS loudness consistent."""
+        """
+        Scale audio so its peak sits at `target`.
+
+        Prevents hard clipping (Piper peaks at ≈1.0) and keeps TTS loudness
+        consistent.
+        """
         if audio.size == 0:
             return audio
         peak = float(np.max(np.abs(audio)))
@@ -365,7 +375,6 @@ class TTSNode(Node):
         }
         return len(tokens & polish_words) >= 2
 
-
     def _speak_binary(self, text: str, language: str):
         """Synthesize text with Piper and play it through the G1 speaker."""
         text = text.strip()
@@ -495,7 +504,6 @@ class TTSNode(Node):
             f"{time.monotonic() - playback_start:.2f}s"
         )
 
-
     # def _speak_binary(self, text: str):
     #     """Synthesize with the standalone Piper binary and play through the
     #     G1 on-device speaker (ALSA default). The upstream g1_piper_tts helper
@@ -570,12 +578,11 @@ class TTSNode(Node):
     #         f'Audio processing and playback took {time.monotonic() - t1:.2f}s'
     #     )
 
-
     def _continuous_start_cb(self, msg: Bool):
         if msg.data:
             self.continuous_mode = True
             self.get_logger().info('Continuous mode enabled')
-    
+
     def _continuous_stop_cb(self, msg: Bool):
         if msg.data:
             self.continuous_mode = False
@@ -587,7 +594,7 @@ class TTSNode(Node):
         self.speak_enabled = bool(msg.data)
         state = 'ENABLED' if self.speak_enabled else 'MUTED'
         self.get_logger().info(f'Speaking {state} (via F3 / /g1/voice/speak_enable)')
-    
+
     def _publish_status(self, status: str):
         msg = String()
         msg.data = status
@@ -604,6 +611,7 @@ def main(args=None):
     finally:
         node.destroy_node()
         rclpy.shutdown()
+
 
 if __name__ == '__main__':
     main()

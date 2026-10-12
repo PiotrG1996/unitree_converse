@@ -5,11 +5,14 @@ import numpy as np
 import socket
 import struct
 import threading
-import time
 import re
 
 
 class STTNode(Node):
+    def _param(self, name):
+        """Return a declared parameter's value (short form of get_parameter)."""
+        return self.get_parameter(name).value
+
     def __init__(self):
         super().__init__('stt_node')
 
@@ -30,23 +33,23 @@ class STTNode(Node):
         self.declare_parameter('max_no_speech_prob', 0.5)
         self.declare_parameter('language_detection_min_probability', 0.55)
 
-        self.model_size = self.get_parameter('model_size').get_parameter_value().string_value
-        self.language = self.get_parameter('language').get_parameter_value().string_value
-        self.device = self.get_parameter('device').get_parameter_value().string_value
-        self.sample_rate = self.get_parameter('sample_rate').get_parameter_value().integer_value
-        self.recording_duration = self.get_parameter('recording_duration').get_parameter_value().double_value
-        self.silence_threshold = self.get_parameter('silence_threshold').get_parameter_value().double_value
-        self.silence_duration = self.get_parameter('silence_duration').get_parameter_value().double_value
-        self.use_udp_mic = self.get_parameter('use_udp_mic').get_parameter_value().bool_value
-        self.udp_multicast_group = self.get_parameter('udp_multicast_group').get_parameter_value().string_value
-        self.udp_port = self.get_parameter('udp_port').get_parameter_value().integer_value
-        self.udp_local_ip = self.get_parameter('udp_local_ip').get_parameter_value().string_value
-        self.continuous_mode = self.get_parameter('continuous_mode').get_parameter_value().bool_value
-        self.watchdog_interval = self.get_parameter('watchdog_interval').get_parameter_value().double_value
-        self.boot_kick_delay = self.get_parameter('boot_kick_delay').get_parameter_value().double_value
-        self.max_no_speech_prob = self.get_parameter('max_no_speech_prob').get_parameter_value().double_value
-        self.language_detection_min_probability = self.get_parameter(
-            'language_detection_min_probability').get_parameter_value().double_value
+        self.model_size = self._param('model_size')
+        self.language = self._param('language')
+        self.device = self._param('device')
+        self.sample_rate = self._param('sample_rate')
+        self.recording_duration = self._param('recording_duration')
+        self.silence_threshold = self._param('silence_threshold')
+        self.silence_duration = self._param('silence_duration')
+        self.use_udp_mic = self._param('use_udp_mic')
+        self.udp_multicast_group = self._param('udp_multicast_group')
+        self.udp_port = self._param('udp_port')
+        self.udp_local_ip = self._param('udp_local_ip')
+        self.continuous_mode = self._param('continuous_mode')
+        self.watchdog_interval = self._param('watchdog_interval')
+        self.boot_kick_delay = self._param('boot_kick_delay')
+        self.max_no_speech_prob = self._param('max_no_speech_prob')
+        self.language_detection_min_probability = self._param(
+            'language_detection_min_probability')
 
         self.is_recording = False
         self.stop_requested = False
@@ -106,12 +109,13 @@ class STTNode(Node):
             self._retrigger()
 
     def _retrigger(self):
-        """Start a new listening turn directly (self-advance).
+        """
+        Start a new listening turn directly (self-advance).
 
         Unlike the TTS node, the STT node does not own the trigger *publisher* --
         it subscribes to /g1/voice/trigger. So to advance the loop ourselves we
-        start the recording thread the same way trigger_callback does, rather than
-        publishing on a publisher we don't have.
+        start the recording thread the same way trigger_callback does, rather
+        than publishing on a publisher we don't have.
         """
         if self.is_recording:
             return
@@ -119,11 +123,14 @@ class STTNode(Node):
         threading.Thread(target=self._record_and_transcribe, daemon=True).start()
 
     def _schedule_self_retrigger(self, delay=None):
-        """Arm a watchdog that re-triggers listening after `delay` seconds unless
-        cancelled. This keeps the loop moving when a turn yields no reply (muted,
-        empty transcript, LLM hiccup). The watchdog is cancelled by the normal
-        flow path, so in the healthy case the TTS node's re-trigger drives the
-        loop and the watchdog never fires."""
+        """
+        Arm a watchdog that re-triggers listening after `delay` seconds.
+
+        Cancelled by the normal flow path, so in the healthy case the TTS node's
+        re-trigger drives the loop and the watchdog never fires. This keeps the
+        loop moving when a turn yields no reply (muted, empty transcript, LLM
+        hiccup).
+        """
         if delay is None:
             delay = self.watchdog_interval
         with self._watchdog_lock:
@@ -142,6 +149,7 @@ class STTNode(Node):
             self._retrigger()
 
     def trigger_callback(self, msg: Bool):
+        """Handle an external /g1/voice/trigger message to start recording."""
         if msg.data and not self.is_recording:
             self.get_logger().info('Trigger received — starting recording')
             # An external trigger means the loop is being driven normally; cancel
@@ -171,15 +179,17 @@ class STTNode(Node):
 
     @staticmethod
     def _looks_like_noise(text: str) -> bool:
-        """Detect Whisper hallucination/noise transcripts so they never reach the LLM.
+        """
+        Detect Whisper hallucination/noise transcripts so they never reach the LLM.
 
         Continuous mode records silence/ambient noise, and faster-whisper reliably
         turns that into short looping garbage (e.g. "I'm sorry. I'm sorry.",
-        "Thank you very much." repeated, single repeated words). Sending those to the
-        LLM makes it roleplay nonsense like "check the internet connection". We drop:
+        "Thank you very much." repeated, single repeated words). Sending those to
+        the LLM makes it roleplay nonsense like "check the internet connection".
+        We drop:
           * text with no letters/digits at all (punctuation/artifacts only), and
-          * heavy word repetition: the same word/phrase repeated 3+ times, or a very
-            short transcript whose words are almost all identical.
+          * heavy word repetition: the same word/phrase repeated 3+ times, or a
+            very short transcript whose words are almost all identical.
         """
         t = text.strip()
         if not t:
@@ -360,7 +370,8 @@ class STTNode(Node):
         sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEPORT, 1)
         sock.bind(('', self.udp_port))
 
-        mreq = struct.pack('4s4s',
+        mreq = struct.pack(
+            '4s4s',
             socket.inet_aton(self.udp_multicast_group),
             socket.inet_aton(self.udp_local_ip))
         sock.setsockopt(socket.IPPROTO_IP, socket.IP_ADD_MEMBERSHIP, mreq)
@@ -449,7 +460,8 @@ class STTNode(Node):
                     total_samples = sum(len(f) for f in audio_frames)
 
                     if audio_frames:
-                        recent = np.concatenate(audio_frames[-10:]) if len(audio_frames) >= 10 else np.concatenate(audio_frames)
+                        tail = audio_frames[-10:]
+                        recent = np.concatenate(tail)
                         rms = np.sqrt(np.mean(recent**2))
                         if rms >= self.silence_threshold:
                             speech_detected = True

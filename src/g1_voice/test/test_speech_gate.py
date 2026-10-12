@@ -13,7 +13,7 @@ import os
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'g1_voice'))
 
-from speech_gate import filter_segments, keep_segment
+from speech_gate import filter_segments, keep_segment  # noqa: E402
 
 
 class _Seg:

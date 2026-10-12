@@ -10,10 +10,13 @@ import time
 #   bit12 up, bit13 right, bit14 down, bit15 left
 # NOTE: there is no physical "F3" on the pad — bit 7 is F2 (referred to as "F3"
 # in older Unitree docs); we keep the F3 name here to match that convention.
-F1_KEY = 64    # bit 6 — push-to-talk (hold to record, release to send)
-F3_KEY = 128   # bit 7 — toggle speaking enabled/muted (robot's TTS output)
-START_KEY = 4  # bit 2 — toggle continuous listening mode (moved off F3 so F3
-               #          can be dedicated to the speaking mute control)
+# bit 6 F1: push-to-talk (hold to record, release to send)
+F1_KEY = 64
+# bit 7 F2 (called "F3" in older Unitree docs): toggle speaking enabled/muted
+F3_KEY = 128
+# bit 2 START: toggle continuous listening mode (moved off F3 so F3 can be
+# dedicated to the speaking mute control)
+START_KEY = 4
 
 DEBOUNCE_TIME = 0.25  # seconds — de-bounce the switch but allow fast double-taps
 

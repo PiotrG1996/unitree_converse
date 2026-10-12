@@ -11,6 +11,10 @@ import unicodedata
 
 
 class WakeWordNode(Node):
+    def _param(self, name):
+        """Return a declared parameter's value (short form of get_parameter)."""
+        return self.get_parameter(name).value
+
     def __init__(self):
         super().__init__('wake_word_node')
 
@@ -31,23 +35,19 @@ class WakeWordNode(Node):
         self.declare_parameter('use_select_button', False)
         self.declare_parameter('select_key', 's')
 
-        self.wake_phrases = list(
-            self.get_parameter('wake_phrases').get_parameter_value().string_array_value)
-        self.wake_phrase_aliases = list(
-            self.get_parameter('wake_phrase_aliases')
-            .get_parameter_value().string_array_value)
-        self.wake_model_size = self.get_parameter('wake_model_size').get_parameter_value().string_value
-        self.wake_language = self.get_parameter('wake_language').get_parameter_value().string_value
-        self.wake_initial_prompt = self.get_parameter(
-            'wake_initial_prompt').get_parameter_value().string_value
-        self.sample_rate = self.get_parameter('sample_rate').get_parameter_value().integer_value
-        self.wake_chunk_duration = self.get_parameter('wake_chunk_duration').get_parameter_value().double_value
-        self.use_udp_mic = self.get_parameter('use_udp_mic').get_parameter_value().bool_value
-        self.udp_multicast_group = self.get_parameter('udp_multicast_group').get_parameter_value().string_value
-        self.udp_port = self.get_parameter('udp_port').get_parameter_value().integer_value
-        self.udp_local_ip = self.get_parameter('udp_local_ip').get_parameter_value().string_value
-        self.use_select_button = self.get_parameter('use_select_button').get_parameter_value().bool_value
-        self.select_key = self.get_parameter('select_key').get_parameter_value().string_value
+        self.wake_phrases = list(self._param('wake_phrases'))
+        self.wake_phrase_aliases = list(self._param('wake_phrase_aliases'))
+        self.wake_model_size = self._param('wake_model_size')
+        self.wake_language = self._param('wake_language')
+        self.wake_initial_prompt = self._param('wake_initial_prompt')
+        self.sample_rate = self._param('sample_rate')
+        self.wake_chunk_duration = self._param('wake_chunk_duration')
+        self.use_udp_mic = self._param('use_udp_mic')
+        self.udp_multicast_group = self._param('udp_multicast_group')
+        self.udp_port = self._param('udp_port')
+        self.udp_local_ip = self._param('udp_local_ip')
+        self.use_select_button = self._param('use_select_button')
+        self.select_key = self._param('select_key')
 
         self.last_trigger_time = 0.0
         self.cooldown = 2.0
@@ -79,7 +79,9 @@ class WakeWordNode(Node):
             # Use a ROS2 timer-based keyboard poller instead of raw tty
             # This works even when stdin is not a terminal (e.g. ros2 launch)
             threading.Thread(target=self._select_button_loop, daemon=True).start()
-            self.get_logger().info(f'SELECT button listener started — press "{self.select_key}" + Enter to trigger')
+            self.get_logger().info(
+                f'SELECT button listener started — press "{self.select_key}"'
+                ' + Enter to trigger')
 
         self.get_logger().info('Wake word node ready')
 
@@ -221,13 +223,16 @@ class WakeWordNode(Node):
 
     def _select_button_loop(self):
         """
+        Poll stdin for a trigger keypress.
+
         Reads lines from stdin. Works both in terminal and via ros2 launch.
         Press Enter (or 's' + Enter) to trigger.
         On real robot: replace this with a subscriber to the Unitree remote topic.
         """
         import sys
         self.get_logger().info(
-            f'Keyboard trigger ready — press Enter (or "{self.select_key}" + Enter) in this terminal')
+            f'Keyboard trigger ready — press Enter (or '
+            f'"{self.select_key}" + Enter) in this terminal')
         try:
             for line in sys.stdin:
                 line = line.strip()
