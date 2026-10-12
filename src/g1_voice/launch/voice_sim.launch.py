@@ -33,17 +33,16 @@ def generate_launch_description():
         ),
 
         # LLM — using bob_llm
-        # llm_prompt  ← stt_node publishes transcript here
-        # llm_response → tts_node subscribes here
+        # llm_prompt  <- robot_state_node enriches transcript with live state
+        # llm_response -> tts_node subscribes here
+        # NOTE: keep default 'llm_prompt' topic (do NOT remap to /g1/stt/transcript)
+        # so robot_state_node's enrichment is not bypassed.
         Node(
             package='bob_llm',
-            executable='llm',
+            executable='llm_node.py',
             name='llm_node',
             output='screen',
             parameters=[params_file],
-            remappings=[
-                ('llm_prompt', '/g1/stt/transcript'),
-            ],
         ),
 
         # Text to speech
@@ -55,4 +54,14 @@ def generate_launch_description():
             parameters=[params_file],
         ),
 
+        # Robot state - enriches transcripts with battery/IMU/network context.
+        # Degrades safely to "unknown" when the Unitree state topics are absent
+        # (as on a dev machine), matching the real-robot pipeline wiring.
+        Node(
+            package='g1_voice',
+            executable='robot_state_node',
+            name='robot_state_node',
+            output='screen',
+            parameters=[params_file],
+        ),
     ])

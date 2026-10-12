@@ -36,9 +36,11 @@ def generate_launch_description():
             name='llm_node',
             output='screen',
             parameters=[params_file],
-            remappings=[
-                ('llm_prompt', '/g1/stt/transcript'),
-            ],
+            # NOTE: llm_node subscribes to its default 'llm_prompt' topic, which is
+            # fed by robot_state_node (transcript enriched with live battery/IMU/
+            # network state). Do NOT remap llm_prompt -> /g1/stt/transcript here, or
+            # the robot_state enrichment is bypassed and the LLM only sees the raw
+            # transcript and never gets real robot state.
         ),
 
         Node(

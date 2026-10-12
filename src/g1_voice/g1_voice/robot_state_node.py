@@ -163,12 +163,39 @@ class RobotStateNode(Node):
 
     def _transcript_callback(self, msg: String):
         """Intercept transcript, enrich with robot state, forward to LLM."""
-        transcript = msg.data.strip()
+        raw_text = msg.data.strip()
+        language_code = ''
+        transcript = raw_text
+
+        # Read language metadata from STT while preserving the spoken text.
+        first_line, separator, remaining = raw_text.partition('\n')
+        if separator and first_line.startswith('[USER_LANGUAGE:') and first_line.endswith(']'):
+            language_code = first_line[len('[USER_LANGUAGE:'):-1].lower()
+            transcript = remaining.strip()
         if not transcript:
             return
 
         state_context = self._build_state_context()
-        enriched = f"{state_context}\n\nUser: {transcript}"
+        if language_code == 'pl':
+            language_name = 'Polish'
+        elif language_code == 'en':
+            language_name = 'English'
+        else:
+            language_name = ''
+
+        if language_name:
+            language_instruction = (
+                f"LATEST USER TURN LANGUAGE: {language_name} ({language_code}). "
+                f"Reply in {language_name} for this turn, regardless of earlier "
+                "conversation turns. This instruction overrides the language "
+                "used in previous turns."
+            )
+            enriched = (
+                f"{state_context}\n\n{language_instruction}"
+                f"\n\nUser: {transcript}"
+            )
+        else:
+            enriched = f"{state_context}\n\nUser: {transcript}"
 
         out = String()
         out.data = enriched

@@ -3,7 +3,7 @@
     api_url: "http://localhost:11434/v1"
     api_key: "no_key"
     api_model: "llama3.2"
-    system_prompt: "You are Aletta, a friendly humanoid robot by Unitree Robotics. Currently you are being researched and worked upon by the SMART Research Group at Saxion University of Applied Sciences in Enschede, Netherlands. You have access to your live robot state in [ROBOT STATE] blocks. Use this to answer questions about your battery, orientation, network, and software. Keep ALL responses under 2 sentences. You are speaking out loud, be concise."
+    system_prompt: "You are Aletta, a friendly humanoid robot by Unitree Robotics. You are being researched by the SMART Research Group at Saxion University of Applied Sciences in Enschede, Netherlands. You have access to live robot state in [ROBOT STATE] blocks; use it only to answer specific questions the user asks, and do not volunteer diagnostics or connectivity information. Reply in the same language as the latest user utterance, using only Polish or English. If the user speaks Polish, reply in natural Polish with correct Polish diacritics; if the user speaks English, reply in English. Do not switch languages unnecessarily. Keep every response under two sentences and concise for spoken output."
     temperature: 0.7
     max_history_length: 10
     stream: false
@@ -11,34 +11,50 @@
 /stt_node:
   ros__parameters:
     use_udp_mic: true
-    continuous_mode: false
+    continuous_mode: true
+    watchdog_interval: 8.0
+    boot_kick_delay: 6.0
     udp_multicast_group: "239.168.123.161"
     udp_port: 5555
     udp_local_ip: "192.168.123.164"
     model_size: "base"
-    language: "en"
+    language: "auto"
     device: "cpu"
     sample_rate: 16000
     recording_duration: 8.0
     silence_threshold: 0.008
-    silence_duration: 2.0
+    silence_duration: 1.0
+    # Drop Whisper segments it flags as likely non-speech (no_speech_prob).
+    # Quiet-room hallucinations measure 0.53-0.59; real speech is well below
+    # 0.5. Raise this if genuine speech is ever filtered.
+    max_no_speech_prob: 0.5
+    language_detection_min_probability: 0.55
 
 /wake_word_node:
   ros__parameters:
-    wake_word_model: "hey_jarvis"
-    detection_threshold: 0.5
+    wake_phrases: ["hey robot", "Cześć robot"]
+    wake_phrase_aliases: ["czesc robot", "cześ robot"]
+    wake_model_size: "base"
+    wake_language: "auto"
+    wake_initial_prompt: "Hey robot. Cześć robot. Czesc robot."
     sample_rate: 16000
-    chunk_duration: 0.08
-    use_wake_word: false
+    wake_chunk_duration: 3.0
+    use_udp_mic: false
+    udp_multicast_group: "239.168.123.161"
+    udp_port: 5555
+    udp_local_ip: "192.168.123.164"
     use_select_button: false
     select_key: "s"
 
 /tts_node:
   ros__parameters:
     voice_model_path: "/home/unitree/.local/share/piper/en_US-lessac-medium.onnx"
-    continuous_mode: false
+    polish_voice_model_path: "/home/unitree/.local/share/piper/pl_PL-gosia-medium/pl_PL-gosia-medium.onnx"
+    continuous_mode: true
     use_cuda: false
-    output_device: 25
-    output_sample_rate: 44100
-    tts_mode: "binary"
-    piper_binary: "/usr/local/bin/piper"
+    output_device: -1          # unused: playback goes via native g1_audio_worker (AudioHub)
+    output_sample_rate: 44100  # native rate of hw:APE,0 (22050 is rejected -> paInvalidSampleRate)
+    tts_mode: "binary"         # 'python' (piper pip pkg) or 'binary' (standalone piper)
+    piper_binary: "/home/unitree/.local/piper-bin/piper"
+    piper_lib_dir: "/home/unitree/.local/piper-bin"
+    network_interface: "eth0"

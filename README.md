@@ -7,7 +7,8 @@ A complete voice conversation pipeline for the **Unitree G1 humanoid robot** ("A
 ## Demo
 
 - **Hold F1** on the Unitree remote → robot listens → release F1 → robot responds
-- **Press F3** → toggle continuous conversation mode (robot keeps listening after each response)
+- **Press START** → toggle continuous conversation mode (robot keeps listening after each response)
+- **Press F3** → mute/unmute the robot's spoken replies (processing continues while muted)
 - Aletta knows her battery level, orientation, network status, uptime, and software stack
 
 ---
@@ -62,9 +63,9 @@ The setup script will ask whether you are setting up on the **Unitree G1 Jetson*
 | LLM | Ollama + LLaMA 3.2 3B |
 | LLM ROS2 node | bob_llm |
 | Speech-to-text | faster-whisper (base, CPU) |
-| Text-to-speech | Piper TTS (`en_US-lessac-medium`) |
-| Audio output | Unitree AudioHub API via `g1_piper_tts` C++ binary |
-| Wake word | openWakeWord (`hey_jarvis`) — disabled in production |
+| Text-to-speech | Piper TTS (`en_US-lessac-medium` for English, `pl_PL-gosia-medium` for Polish) |
+| Audio output | Unitree AudioHub API via `g1_audio_worker` (`AudioClient.PlayStream`) |
+| Wake phrase | Whisper transcript gate (`hey_robot`) over the G1 UDP microphone |
 
 ---
 
@@ -75,21 +76,30 @@ unitree_converse/
 ├── setup.sh                        # Interactive setup script
 ├── unitree_converse.service        # Systemd service file
 ├── ollama.service                  # Ollama systemd service reference
+├── ensure_pulse.sh                 # ExecStartPre: bring up PulseAudio
+├── source_ros.sh                   # Source ROS2 + CycloneDDS env for manual use
+├── scripts/
+│   ├── wait_for_robot_ready.sh     # ExecStartPre: DDS/eth0 readiness gate
+│   ├── check_audio.sh              # Speaker + mic diagnostics (Pulse/ALSA/UDP)
+│   └── check_pipeline.sh           # Ollama + Piper + Whisper stage checks
 ├── README.md
 └── src/
     ├── g1_voice/
     │   ├── g1_voice/
     │   │   ├── wake_word_node.py       # openWakeWord + keyboard trigger (sim)
     │   │   ├── stt_node.py             # faster-whisper + UDP mic + stop signal
-    │   │   ├── tts_node.py             # Piper TTS via g1_piper_tts binary
-    │   │   ├── button_trigger_node.py  # F1/F3 remote button mapping
+    │   │   ├── tts_node.py             # Piper TTS with language-specific voices
+    │   │   ├── button_trigger_node.py  # F1/F3/START remote button mapping
     │   │   └── robot_state_node.py     # Live robot state injection into LLM
     │   ├── launch/
     │   │   ├── voice_sim.launch.py     # Dev machine (sounddevice mic, Python TTS)
-    │   │   └── voice_real.launch.py    # On-robot (UDP mic, g1_piper_tts)
-    │   └── config/
-    │       ├── voice_params.yaml       # Dev machine params
-    │       └── voice_params_real.yaml  # Jetson robot params
+    │   │   └── voice_real.launch.py    # On-robot (UDP mic, piper binary)
+    │   ├── config/
+    │   │   ├── voice_params.yaml       # Dev machine params
+    │   │   └── voice_params_real.yaml  # Jetson robot params
+    │   └── test/
+    │       ├── test_audio_hw.py        # Speaker/microphone hardware tests
+    │       └── test_llm_pipeline.py    # Ollama/Piper/Whisper stage tests
     └── bob_llm/                        # LLM ROS2 node (submodule, Foxy-patched fork)
 ```
 
@@ -111,18 +121,35 @@ sock.setsockopt(socket.IPPROTO_IP, socket.IP_ADD_MEMBERSHIP, mreq)
 ```
 
 ### Speaker
-The G1 speaker is controlled via the Unitree `AudioClient::PlayStream()` API which requires **16kHz mono PCM**. A custom C++ binary `g1_piper_tts` handles this:
+The G1 speaker is driven by the **Unitree AudioHub API** through the
+`unitree_sdk2py` `AudioClient` (`PlayStream()`), reached over the G1 DDS channel.
+The `tts_node` synthesises speech with the standalone **Piper** binary, then hands
+the resulting 16-bit PCM to a dedicated `g1_audio_worker` subprocess which plays
+it on the onboard speaker:
 
 ```
-tts_node → subprocess: g1_piper_tts eth0 < text
-               │
-               ├── piper → /tmp/tts_raw.wav  (22050Hz)
-               ├── sox → /tmp/tts_16k.wav    (16000Hz mono)
-               └── AudioClient::PlayStream() → RockChip → Speaker
+tts_node._speak_binary(text)
+        │
+        ├── piper --model <voice> --output-file /tmp/xxx.wav   (local render)
+        ├── read WAV → normalise → resample → 16-bit PCM @ 16 kHz
+        └── g1_audio_worker (subprocess, stdin/stdout JSON protocol)
+                 │
+                 └── AudioClient.PlayStream(...)  →  G1 AudioHub speaker
 ```
 
-Source: `~/unitree_sdk2_latest/example/g1/audio/g1_piper_tts.cpp`
-Binary: `~/unitree_sdk2_latest/build/bin/g1_piper_tts`
+Because playback is routed through `AudioClient::PlayStream`, the Jetson's
+ALSA/PulseAudio output devices are **not** used; the `output_device` parameter is
+retained only for config compatibility and has no effect. The `tts_mode`
+parameter still selects how speech is *rendered* — `python` (piper-tts Python
+package) or `binary` (standalone Piper) — but both render paths play back through
+the same native audio worker.
+
+> **Historical note:** the earliest revisions piped Piper → sox → the Jetson
+> PulseAudio/ALSA stack (sink `alsa_output.platform-sound.analog-stereo`,
+> tried via sounddevice device candidates `['pulse', 'default', None]`). That
+> PulseAudio output path is no longer used on the robot; playback now goes
+> straight to the AudioHub. The `ensure_pulse.sh` `ExecStartPre` hook is still
+> kept for the dev-machine audio diagnostics.
 
 ---
 
@@ -147,21 +174,68 @@ Binary: `~/unitree_sdk2_latest/build/bin/g1_piper_tts`
 
 ## Button Mapping
 
-| Button | Keys Value | Action |
-|--------|-----------|--------|
-| **Hold F1** | 64 | Push-to-talk: records while held, transcribes on release |
-| **F3** | 128 | Toggle continuous conversation mode on/off |
+The `button_trigger_node` maps the Unitree wireless controller bitfield
+(`unitree_go/msg/WirelessController`) to pipeline actions:
+
+| Button | Bit | keys Value | Action |
+|--------|-----|-----------|--------|
+| **Hold F1** | bit 6 | 64 | Push-to-talk: records while held, transcribes on release |
+| **F3** (F2 on pad) | bit 7 | 128 | Toggle spoken output: mute/unmute the robot's replies |
+| **START** | bit 2 | 4 | Toggle continuous conversation mode on/off |
+
+> **Note:** There is no physical "F3" label on the pad — bit 7 is F2 in hardware
+> docs but is referred to as "F3" in older Unitree docs; this project keeps the
+> F3 name for that convention. Continuous mode was moved from F3 to START so F3
+> could be dedicated to the mute control.
 
 ---
 
 ## Conversation Modes
 
-### Push-to-Talk (default)
+### Wake phrase (real robot)
+The real-robot configuration currently runs in continuous conversation mode.
+It starts listening automatically after startup and listens for the next turn
+after each response. The wake listener is disabled in this profile so it cannot
+compete with STT for the UDP microphone stream.
+
+The systemd service is configured with `Restart=always`, waits for the robot
+network and PulseAudio, and validates the installed ROS configuration, Piper
+binary, and both language voice models before launching. After changing source
+or configuration files, rebuild and reload the service registration before
+testing a reboot.
+
+The wake phrase is transcript-based because openWakeWord's built-in models do
+not include these phrases; changing a model name in YAML alone cannot create a
+new wake-word model.
+
+> **Mutually exclusive modes:** the wake-phrase workflow and the F1/START remote
+> workflow cannot run at the same time, because both need the single G1 UDP
+> microphone stream. The real profile runs purely in continuous (remote-managed)
+> mode with `wake_word_node` disabled (`use_udp_mic: false`); to use wake phrases
+> instead, enable the wake listener and drive it from the same mic rather than
+> also starting STT's UDP capture.
+
+Whisper's wake listener logs each non-empty recognition as `Wake phrase audio`.
+This makes it possible to distinguish a microphone/Whisper problem from a
+phrase-matching problem. The real-robot configuration also includes common
+accent-free Polish transcription variants such as `czesc robot`.
+
+For conversation turns, automatic language detection is confidence-aware:
+high-confidence Polish or English results are accepted directly. Ambiguous
+results are decoded once in each supported language and the stronger result is
+selected, avoiding accidental English-voice output for short Polish speech.
+
+### Push-to-Talk (optional)
 Hold F1 while speaking → release → robot responds → done.
 
 ### Continuous Mode
-Press F3 to toggle on → robot listens → responds → automatically listens again.
-Press F3 again to stop.
+Press **START** to toggle on → robot listens → responds → automatically listens again.
+Press **START** again to stop.
+
+### Mute (F3)
+Press **F3** at any time to mute/unmute the robot's spoken replies. While muted the
+pipeline still records, transcribes, and runs the LLM — it simply does not play the
+audio, so the continuous loop keeps turning silently.
 
 ---
 
@@ -201,7 +275,41 @@ sudo systemctl stop unitree_converse.service
 
 ## Testing
 
+### Automated checks (scripts)
+
 ```bash
+# Speaker + microphones (PulseAudio/ALSA mic + RockChip UDP multicast mic)
+./scripts/check_audio.sh
+
+# LLM pipeline stages: Ollama -> Piper -> Whisper (no mic/speaker needed)
+./scripts/check_pipeline.sh
+
+# Also probe the running ROS2 graph (start the service first)
+ROS_FULL=1 ./scripts/check_pipeline.sh
+```
+
+Both scripts print `[PASS]`/`[FAIL]` per check and exit non-zero on failure,
+so they are suitable for CI or a post-deploy smoke test.
+
+### Pytest suite
+
+```bash
+# Audio hardware tests (devices open + stream). Add G1_INTERACTIVE=1 to also
+# require you to hear a tone / speak into the mic.
+cd src/g1_voice && python3 -m pytest test/test_audio_hw.py -v
+
+# LLM pipeline tests (Ollama / Piper / Whisper round trip)
+cd src/g1_voice && python3 -m pytest test/test_llm_pipeline.py -v
+
+# bob_llm integration test (requires tests/.env with LLM_API_KEY etc.)
+cd src/bob_llm && python3 -m pytest tests/test_llm_integration.py -v
+```
+
+### Manual ROS2 checks
+
+```bash
+source source_ros.sh   # sets the exact service environment
+
 # Manual transcript — bypasses mic, tests LLM + TTS
 ros2 topic pub --once /g1/stt/transcript std_msgs/msg/String "data: 'What is your battery level?'"
 
@@ -214,8 +322,8 @@ ros2 topic pub --once /g1/voice/continuous_start std_msgs/msg/Bool "data: true"
 # Check live robot state
 ros2 topic echo /g1/robot_state
 
-# Test TTS binary directly
-echo "Hello, I am Aletta." | ~/unitree_sdk2_latest/build/bin/g1_piper_tts eth0
+# Test the TTS stage directly (renders via Piper, plays via native AudioHub)
+./scripts/check_pipeline.sh
 ```
 
 ---

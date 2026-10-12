@@ -6,6 +6,7 @@ import socket
 import struct
 import threading
 import time
+import re
 
 
 class STTNode(Node):
@@ -13,7 +14,7 @@ class STTNode(Node):
         super().__init__('stt_node')
 
         self.declare_parameter('model_size', 'base')
-        self.declare_parameter('language', 'en')
+        self.declare_parameter('language', 'auto')
         self.declare_parameter('device', 'cpu')
         self.declare_parameter('sample_rate', 16000)
         self.declare_parameter('recording_duration', 8.0)
@@ -23,7 +24,11 @@ class STTNode(Node):
         self.declare_parameter('udp_multicast_group', '239.168.123.161')
         self.declare_parameter('udp_port', 5555)
         self.declare_parameter('udp_local_ip', '192.168.123.164')
-        self.declare_parameter('continuous_mode', False)
+        self.declare_parameter('continuous_mode', True)
+        self.declare_parameter('watchdog_interval', 2.0)
+        self.declare_parameter('boot_kick_delay', 6.0)
+        self.declare_parameter('max_no_speech_prob', 0.5)
+        self.declare_parameter('language_detection_min_probability', 0.55)
 
         self.model_size = self.get_parameter('model_size').get_parameter_value().string_value
         self.language = self.get_parameter('language').get_parameter_value().string_value
@@ -37,9 +42,16 @@ class STTNode(Node):
         self.udp_port = self.get_parameter('udp_port').get_parameter_value().integer_value
         self.udp_local_ip = self.get_parameter('udp_local_ip').get_parameter_value().string_value
         self.continuous_mode = self.get_parameter('continuous_mode').get_parameter_value().bool_value
+        self.watchdog_interval = self.get_parameter('watchdog_interval').get_parameter_value().double_value
+        self.boot_kick_delay = self.get_parameter('boot_kick_delay').get_parameter_value().double_value
+        self.max_no_speech_prob = self.get_parameter('max_no_speech_prob').get_parameter_value().double_value
+        self.language_detection_min_probability = self.get_parameter(
+            'language_detection_min_probability').get_parameter_value().double_value
 
         self.is_recording = False
         self.stop_requested = False
+        self._transcript_published = False
+        self.llm_busy = False
 
         self.get_logger().info(f'Loading faster-whisper model: {self.model_size}')
         from faster_whisper import WhisperModel
@@ -54,6 +66,8 @@ class STTNode(Node):
             Bool, '/g1/voice/continuous_start', self._continuous_start_cb, 10)
         self.create_subscription(
             Bool, '/g1/voice/continuous_stop', self._continuous_stop_cb, 10)
+        self.create_subscription(
+            String, '/g1/llm/status', self._llm_status_callback, 10)
 
         self.transcript_pub = self.create_publisher(String, '/g1/stt/transcript', 10)
         self.status_pub = self.create_publisher(String, '/g1/stt/status', 10)
@@ -62,9 +76,79 @@ class STTNode(Node):
         self.get_logger().info(f'STT node ready — mic: {mic_mode}')
         self.get_logger().info(f'Continuous mode: {self.continuous_mode}')
 
+        # Always-on (continuous) machinery is OPT-IN and only armed when
+        # continuous_mode is True (e.g. enabled at runtime via the START button).
+        # In the default push-to-talk mode (continuous_mode False) the robot only
+        # listens after F1 is held, and never re-arms itself -- so it will NOT
+        # answer on its own, which is the desired default behaviour.
+        self._watchdog = None
+        self._watchdog_lock = threading.Lock()
+        if self.continuous_mode:
+            # Keep the always-on conversation loop alive: after each recording
+            # pass, if nobody advanced the loop (no reply came back through the
+            # TTS node), re-trigger ourselves so the robot keeps listening. This
+            # makes the "answer all the time" behaviour robust even when a turn is
+            # muted, empty, or the LLM/robot-state hop produces no reply.
+            self._schedule_self_retrigger(self.watchdog_interval)
+
+            # Kick off the very first turn shortly after startup so the robot
+            # starts answering immediately, without waiting for any button press.
+            self._start_kick = self.create_timer(
+                self.boot_kick_delay, self._boot_kick_cb)
+        else:
+            self._start_kick = None
+
+    def _boot_kick_cb(self):
+        # One-shot: disarm the timer, then start the first turn.
+        self._start_kick.cancel()
+        if not self.is_recording:
+            self.get_logger().info('Always-on mode — starting first listening turn')
+            self._retrigger()
+
+    def _retrigger(self):
+        """Start a new listening turn directly (self-advance).
+
+        Unlike the TTS node, the STT node does not own the trigger *publisher* --
+        it subscribes to /g1/voice/trigger. So to advance the loop ourselves we
+        start the recording thread the same way trigger_callback does, rather than
+        publishing on a publisher we don't have.
+        """
+        if self.is_recording:
+            return
+        self.get_logger().info('Always-on — starting next listening turn')
+        threading.Thread(target=self._record_and_transcribe, daemon=True).start()
+
+    def _schedule_self_retrigger(self, delay=None):
+        """Arm a watchdog that re-triggers listening after `delay` seconds unless
+        cancelled. This keeps the loop moving when a turn yields no reply (muted,
+        empty transcript, LLM hiccup). The watchdog is cancelled by the normal
+        flow path, so in the healthy case the TTS node's re-trigger drives the
+        loop and the watchdog never fires."""
+        if delay is None:
+            delay = self.watchdog_interval
+        with self._watchdog_lock:
+            if self._watchdog is not None:
+                self._watchdog.cancel()
+            self._watchdog = self.create_timer(delay, self._watchdog_fire)
+
+    def _watchdog_fire(self):
+        self._watchdog.cancel()
+        if self.llm_busy:
+            self.get_logger().info(
+                'Continuous watchdog deferred while LLM is generating')
+            self._schedule_self_retrigger(self.watchdog_interval)
+        elif not self.is_recording:
+            self.get_logger().info('Always-on watchdog — no reply received, listening again')
+            self._retrigger()
+
     def trigger_callback(self, msg: Bool):
         if msg.data and not self.is_recording:
             self.get_logger().info('Trigger received — starting recording')
+            # An external trigger means the loop is being driven normally; cancel
+            # the self-retrigger watchdog for this turn.
+            with self._watchdog_lock:
+                if self._watchdog is not None:
+                    self._watchdog.cancel()
             threading.Thread(target=self._record_and_transcribe, daemon=True).start()
 
     def stop_callback(self, msg: Bool):
@@ -82,8 +166,60 @@ class STTNode(Node):
             self.continuous_mode = False
             self.get_logger().info('Continuous mode disabled')
 
+    def _llm_status_callback(self, msg: String):
+        self.llm_busy = msg.data == 'thinking'
+
+    @staticmethod
+    def _looks_like_noise(text: str) -> bool:
+        """Detect Whisper hallucination/noise transcripts so they never reach the LLM.
+
+        Continuous mode records silence/ambient noise, and faster-whisper reliably
+        turns that into short looping garbage (e.g. "I'm sorry. I'm sorry.",
+        "Thank you very much." repeated, single repeated words). Sending those to the
+        LLM makes it roleplay nonsense like "check the internet connection". We drop:
+          * text with no letters/digits at all (punctuation/artifacts only), and
+          * heavy word repetition: the same word/phrase repeated 3+ times, or a very
+            short transcript whose words are almost all identical.
+        """
+        t = text.strip()
+        if not t:
+            return True
+        # Must contain at least one letter or digit, else it's pure noise/punctuation.
+        if not re.search(r'[A-Za-z0-9]', t):
+            return True
+
+        words = re.findall(r"[A-Za-z0-9']+", t.lower())
+        if not words:
+            return True
+
+        # Immediate phrase repetition: a run of >=2 words that is immediately
+        # repeated (e.g. "thank you very much thank you very much", "it's a
+        # mouthful it's a mouthful"). This is the classic Whisper hallucination
+        # loop and the single-word ratio check above misses it.
+        for p in range(2, len(words) // 2 + 1):
+            for i in range(0, len(words) - 2 * p + 1):
+                if words[i:i + p] == words[i + p:i + 2 * p]:
+                    return True
+
+        # Repetition ratio: (occurrences of most common word) / total words.
+        # Loops like "sorry sorry sorry sorry" score high. Require >=4 words so a
+        # legit short reply like "hello there" or "yes please" is never dropped.
+        if len(words) >= 4:
+            from collections import Counter
+            top, count = Counter(words).most_common(1)[0]
+            if count / len(words) >= 0.5:
+                return True
+
+        # Any single word repeated 3+ times in a row is a classic Whisper loop.
+        for i in range(len(words) - 2):
+            if words[i] == words[i + 1] == words[i + 2]:
+                return True
+
+        return False
+
     def _record_and_transcribe(self):
         self.is_recording = True
+        self._transcript_published = False
         self._publish_status('recording')
 
         if self.use_udp_mic:
@@ -95,26 +231,56 @@ class STTNode(Node):
             self.get_logger().warn('No audio recorded')
             self._publish_status('idle')
             self.is_recording = False
+            if self.continuous_mode:
+                self._schedule_self_retrigger()
             return
 
         self._publish_status('transcribing')
 
         try:
-            segments, info = self.model.transcribe(
-                audio_data,
-                language=self.language,
-                beam_size=5,
-                vad_filter=True,
-                vad_parameters=dict(min_silence_duration_ms=500)
-            )
+            segments, info = self._transcribe_with_language_fallback(audio_data)
 
-            transcript = ' '.join([seg.text.strip() for seg in segments]).strip()
+            # Confidence gate: drop segments Whisper flags as likely non-speech
+            # (see speech_gate.py). Quiet-room noise hallucinations measure
+            # no_speech_prob 0.53-0.59 while genuine speech is well below 0.5,
+            # so this removes invented transcripts (e.g. "please check the
+            # network") before they reach the LLM.
+            try:
+                from g1_voice.speech_gate import filter_segments
+                kept, dropped = filter_segments(
+                    segments, self.max_no_speech_prob)
+            except Exception:
+                self.get_logger().warn(
+                    'speech_gate unavailable; keeping raw transcript')
+                kept = [s.text.strip() for s in segments if s.text.strip()]
+                dropped = []
 
-            if transcript:
+            if dropped:
+                self.get_logger().info(
+                    f'Filtered {len(dropped)} no-speech segment(s): '
+                    + '; '.join(f'[{nsp:.2f}] "{t}"' for nsp, t in dropped))
+
+            transcript = ' '.join(kept).strip()
+            detected_language = (getattr(info, 'language', '') or '').lower()
+            language_probability = getattr(info, 'language_probability', 0.0)
+            self.get_logger().info(
+                f'Whisper detected language: {detected_language} '
+                f'(probability={language_probability:.2f})')
+            if detected_language not in ('pl', 'en'):
+                self.get_logger().warn(
+                    f'Ignoring speech detected as unsupported language: '
+                    f'{detected_language or "unknown"}')
+                transcript = ''
+
+            if transcript and self._looks_like_noise(transcript):
+                self.get_logger().info(
+                    f'Ignored noise/hallucination transcript: "{transcript}"')
+            elif transcript:
                 self.get_logger().info(f'Transcript: "{transcript}"')
                 msg = String()
-                msg.data = transcript
+                msg.data = f'[USER_LANGUAGE:{detected_language}]\n{transcript}'
                 self.transcript_pub.publish(msg)
+                self._transcript_published = True
             else:
                 self.get_logger().warn('Empty transcript — nothing detected')
 
@@ -122,10 +288,66 @@ class STTNode(Node):
             self.get_logger().error(f'Transcription error: {e}')
             self._publish_status('error')
             self.is_recording = False
+            if self.continuous_mode:
+                self._schedule_self_retrigger()
             return
 
         self._publish_status('idle')
         self.is_recording = False
+        # TTS owns the healthy continuous-mode handoff after a valid transcript.
+        # Do not let the watchdog start a second turn while the LLM is still
+        # generating the response for this turn.
+        if self.continuous_mode and not self._transcript_published:
+            self._schedule_self_retrigger()
+
+    def _transcribe(self, audio_data, language=None):
+        segments, info = self.model.transcribe(
+            audio_data,
+            language=language,
+            beam_size=5,
+            temperature=0.0,
+            condition_on_previous_text=False,
+            vad_filter=True,
+            vad_parameters=dict(min_silence_duration_ms=500),
+        )
+        return list(segments), info
+
+    @staticmethod
+    def _transcription_score(segments):
+        text = ' '.join(segment.text.strip() for segment in segments).strip()
+        if not text:
+            return float('-inf')
+        # avg_logprob is a model confidence signal; prefer longer supported
+        # speech only when confidence is comparable.
+        confidence = np.mean([
+            getattr(segment, 'avg_logprob', -10.0) for segment in segments])
+        return float(confidence) + min(len(text), 80) * 0.001
+
+    def _transcribe_with_language_fallback(self, audio_data):
+        configured = self.language.lower()
+        if configured not in ('', 'auto'):
+            segments, info = self._transcribe(audio_data, configured)
+            return segments, info
+
+        auto_segments, auto_info = self._transcribe(audio_data)
+        detected = (getattr(auto_info, 'language', '') or '').lower()
+        probability = getattr(auto_info, 'language_probability', 0.0)
+
+        if detected in ('pl', 'en') and probability >= self.language_detection_min_probability:
+            return auto_segments, auto_info
+
+        candidates = {}
+        for language in ('pl', 'en'):
+            candidates[language] = self._transcribe(audio_data, language)
+
+        best_language = max(
+            candidates,
+            key=lambda language: self._transcription_score(candidates[language][0]))
+        best_segments, best_info = candidates[best_language]
+        self.get_logger().info(
+            f'Language fallback: auto={detected or "unknown"} '
+            f'(probability={probability:.2f}), selected={best_language}')
+        return best_segments, best_info
 
     def _record_via_udp(self):
         self.stop_requested = False
@@ -168,7 +390,14 @@ class STTNode(Node):
                         if speech_detected:
                             silence_bytes += len(data)
 
-                    if speech_detected and silence_bytes >= silence_limit:
+                    # Early silence-stop ONLY in continuous mode.
+                    # In push-to-talk (F1) the user controls the endpoint by
+                    # releasing the button, so we must keep recording until the
+                    # release (or the recording_duration cap) — otherwise a brief
+                    # pause between words truncates the clip and yields an empty
+                    # transcript.
+                    if (self.continuous_mode and speech_detected
+                            and silence_bytes >= silence_limit):
                         self.get_logger().info('Silence detected — stopping early')
                         break
 

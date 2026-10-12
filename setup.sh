@@ -46,6 +46,13 @@ wget -q --show-progress \
     https://huggingface.co/rhasspy/piper-voices/resolve/main/en/en_US/lessac/medium/en_US-lessac-medium.onnx
 wget -q --show-progress \
     https://huggingface.co/rhasspy/piper-voices/resolve/main/en/en_US/lessac/medium/en_US-lessac-medium.onnx.json
+mkdir -p pl_PL-gosia-medium
+wget -q --show-progress \
+    https://huggingface.co/rhasspy/piper-voices/resolve/main/pl/pl_PL/gosia/medium/pl_PL-gosia-medium.onnx \
+    -O pl_PL-gosia-medium/pl_PL-gosia-medium.onnx
+wget -q --show-progress \
+    https://huggingface.co/rhasspy/piper-voices/resolve/main/pl/pl_PL/gosia/medium/pl_PL-gosia-medium.onnx.json \
+    -O pl_PL-gosia-medium/pl_PL-gosia-medium.onnx.json
 cd -
 
 # ── faster-whisper base model (both machines) ────────────────────

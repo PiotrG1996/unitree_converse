@@ -1,7 +1,5 @@
-/**:
+/llm_node:
   ros__parameters:
-
-    # --- bob_llm (LLM Node) ---
     api_url: "http://localhost:11434/v1"      # Ollama OpenAI-compatible endpoint
     api_key: "no_key"
     api_model: "llama3.2"
@@ -10,30 +8,38 @@
     max_history_length: 10
     stream: false                             # keep false for TTS compatibility
 
-    # --- STT Node ---
-    stt_node:
-      model_size: "base"
-      language: "en"
-      device: "cpu"
-      sample_rate: 16000
-      recording_duration: 5.0
-      silence_threshold: 0.01
-      silence_duration: 1.5
+/stt_node:
+  ros__parameters:
+    use_udp_mic: false                        # dev machine: use local sounddevice mic
+    continuous_mode: false
+    model_size: "base"
+    language: "en"
+    device: "cpu"
+    sample_rate: 16000
+    recording_duration: 5.0
+    silence_threshold: 0.01
+    silence_duration: 1.5
+    max_no_speech_prob: 0.5
+    language_detection_min_probability: 0.55
 
-    # --- Wake Word Node ---
-    wake_word_node:
-      wake_word_model: "hey_aletta"
-      detection_threshold: 0.5
-      sample_rate: 16000
-      chunk_duration: 0.08
-      use_wake_word: true
-      use_select_button: true
-      select_key: "s"
+/wake_word_node:
+  ros__parameters:
+    wake_phrases: ["hey robot", "cześć robot"]
+    wake_phrase_aliases: ["czesc robot", "cześ robot"]
+    wake_model_size: "base"
+    wake_language: "auto"
+    wake_initial_prompt: "Hey robot. Cześć robot. Czesc robot."
+    sample_rate: 16000
+    wake_chunk_duration: 3.0
+    use_udp_mic: false
+    use_select_button: true
+    select_key: "s"
 
-    # --- TTS Node ---
-    tts_node:
-      voice_model_path: "/home/asmn/.local/share/piper/en_US-lessac-medium.onnx"
-      use_cuda: true
-      output_device: 5
-      output_sample_rate: 44100
-      tts_mode: "python"
+/tts_node:
+  ros__parameters:
+    voice_model_path: "/home/asmn/.local/share/piper/en_US-lessac-medium.onnx"
+    polish_voice_model_path: "/home/asmn/.local/share/piper/pl_PL-gosia-medium/pl_PL-gosia-medium.onnx"
+    use_cuda: true
+    output_device: 5                          # unused: playback goes via native g1_audio_worker (AudioHub)
+    output_sample_rate: 44100
+    tts_mode: "python"                        # 'python' (piper pip pkg) or 'binary' (standalone piper)

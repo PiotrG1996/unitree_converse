@@ -1,7 +1,11 @@
 [Unit]
 Description=Unitree G1 Voice Conversation Pipeline
-After=network.target ollama.service
+After=network-online.target ollama.service sound.target
+Wants=network-online.target
 Requires=ollama.service
+# Disable the default start rate-limit so the unit is never permanently
+# disabled after repeated quick failures — it must keep trying all the time.
+StartLimitIntervalSec=0
 
 [Service]
 Type=simple
@@ -11,10 +15,32 @@ Environment="HOME=/home/unitree"
 Environment="ROS_DOMAIN_ID=0"
 Environment="RMW_IMPLEMENTATION=rmw_cyclonedds_cpp"
 Environment="CYCLONEDDS_URI=/home/unitree/cyclonedds_ws/cyclonedds.xml"
+Environment="UNITREE_DDS_IFACE=eth0"
 Environment="LD_LIBRARY_PATH=/usr/local/lib"
+Environment="XDG_RUNTIME_DIR=/run/user/1000"
+Environment="PULSE_SERVER=unix:/run/user/1000/pulse/native"
+Environment="DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/1000/bus"
 Environment="AMENT_PREFIX_PATH=/home/unitree/unitree_ros2/cyclonedds_ws/install:/home/unitree/unitree_converse/install/g1_voice:/home/unitree/unitree_converse/install/bob_llm"
-ExecStart=/bin/bash -c 'source /opt/ros/foxy/setup.bash && source /home/unitree/cyclonedds_ws/install/setup.bash && source /home/unitree/unitree_ros2/cyclonedds_ws/install/setup.bash && source /home/unitree/unitree_converse/install/setup.bash && ros2 launch g1_voice voice_real.launch.py'
-Restart=on-failure
+# Let network interfaces (eth0) and CycloneDDS finish coming up at boot before the
+# pipeline starts — avoids the boot-time rmw_create_node "failed to create domain"
+# race described in the README Known Issues.
+#
+# wait_for_robot_ready.sh blocks until eth0 has its IPv4 address (192.168.123.164)
+# and the CycloneDDS config is present (up to 30s), instead of a blind sleep.
+ExecStartPre=/home/unitree/unitree_converse/scripts/wait_for_robot_ready.sh 30
+ExecStartPre=/home/unitree/unitree_converse/ensure_pulse.sh
+# Validate the installed artifacts used by the launch file before starting ROS.
+# This prevents a reboot from starting a partial pipeline after an incomplete
+# build or missing voice model.
+ExecStartPre=/usr/bin/test -r /home/unitree/unitree_converse/install/g1_voice/share/g1_voice/config/voice_params_real.yaml
+ExecStartPre=/usr/bin/test -x /home/unitree/.local/piper-bin/piper
+ExecStartPre=/usr/bin/test -r /home/unitree/.local/share/piper/en_US-lessac-medium.onnx
+ExecStartPre=/usr/bin/test -r /home/unitree/.local/share/piper/pl_PL-gosia-medium/pl_PL-gosia-medium.onnx
+ExecStart=/bin/bash -c 'source /opt/ros/foxy/setup.bash && source /home/unitree/cyclonedds_ws/install/setup.bash && source /home/unitree/unitree_ros2/cyclonedds_ws/install/setup.bash && source /home/unitree/unitree_converse/install/setup.bash && exec ros2 launch g1_voice voice_real.launch.py'
+# Keep the unit alive no matter how the launch process exits (clean 0 after all
+# nodes died still counts as a stop we must recover from). Rate limiting is
+# disabled above so repeated quick failures never disable the unit.
+Restart=always
 RestartSec=10
 
 [Install]
