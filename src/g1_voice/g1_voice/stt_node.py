@@ -301,6 +301,21 @@ class STTNode(Node):
             if words[i] == words[i + 1] == words[i + 2]:
                 return True
 
+        # Run-on repetition WITHIN a single word (no spaces): Whisper often
+        # loops one syllable without a break, e.g. "nienienie...", "lalala",
+        # "yeahyeahyeah", "aaaaaah". Each whole run tokenizes as ONE word, so
+        # the word-level checks above never see the repetition. Detect a word
+        # that STARTS with a short unit repeated 3+ times (the final repeat may
+        # be truncated, so we compare the leading window, not an exact tiling).
+        # The length floor keeps real short words ("murmur", "banana") safe.
+        for word in words:
+            if len(word) < 6:
+                continue
+            for unit_len in range(1, len(word) // 3 + 1):
+                unit = word[:unit_len]
+                if word[:unit_len * 3] == unit * 3:
+                    return True
+
         return False
 
     def _record_and_transcribe(self):

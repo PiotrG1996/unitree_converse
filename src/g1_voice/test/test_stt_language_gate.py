@@ -183,5 +183,62 @@ class TestSkipDuelOnNoSpeech(unittest.TestCase):
         self.assertEqual(node._transcribe_calls, [None])
 
 
+class TestWithinWordRepetition(unittest.TestCase):
+    """
+    Regression: Whisper loops one syllable with no space between repeats.
+
+    Run-ons like "nienienienie", "lalala", "yeahyeahyeah", "aaaaaah" each
+    tokenize as a SINGLE word, so the word-level repetition checks never see
+    the repetition. A word that starts with a short unit repeated 3+ times
+    (allowing a truncated final repeat) is flagged. The length floor and the
+    "starts-with unit" comparison keep real words ("murmur", "chihuahua",
+    "rehearsal", "beriberi") safe.
+    """
+
+    def _noise(self, text):
+        return _stt_module.STTNode._looks_like_noise(text)
+
+    def test_run_on_single_syllable_is_noise(self):
+        for text in (
+            'nienienienie',
+            'lalalala',
+            'yeahyeahyeah',
+            'aaaaaah',
+            'murmurmurmur',
+            'alexandraalexandraalexandra',
+        ):
+            self.assertTrue(self._noise(text), msg=text)
+
+    def test_run_on_polish_word_is_noise(self):
+        # A real Polish word looped, both ASCII-tokenized and with diacritics
+        # (the diacritic case is also caught by the phrase-repetition check).
+        self.assertTrue(self._noise('wytrzymajwytrzymajwytrzymaj'))
+        self.assertTrue(self._noise('sobórzęsobórzęsobórzę'))
+
+    def test_truncated_final_repeat_is_noise(self):
+        # Leading window of 3 full units still matches even if the tail is cut.
+        self.assertTrue(self._noise('lalalal'))
+        self.assertTrue(self._noise('nienienien'))
+
+    def test_real_repetitive_words_are_kept(self):
+        # Genuine words containing internal repetition must NOT be dropped.
+        for text in (
+            'murmur', 'banana', 'murmuring', 'bananas', 'papa', 'mama',
+            'coco', 'kayak', 'couscous', 'chihuahua', 'rehearsal', 'beriberi',
+            'froufrou', 'hotshots', 'tartar', 'cuscus', 'alpapapa',
+        ):
+            self.assertFalse(self._noise(text), msg=text)
+
+    def test_real_sentences_are_kept(self):
+        for text in (
+            'Hello robot, can you tell me what time it is please?',
+            'Cześć robocie, która jest godzina?',
+            'The big brown fox jumps over the lazy dog again.',
+            'I would like to understand how this works exactly.',
+            'Piotr Gąski prowadzi badania na politechnice.',
+        ):
+            self.assertFalse(self._noise(text), msg=text)
+
+
 if __name__ == '__main__':
     unittest.main()
