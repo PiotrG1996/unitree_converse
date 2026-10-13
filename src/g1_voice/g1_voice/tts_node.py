@@ -611,14 +611,19 @@ class TTSNode(Node):
 
     @staticmethod
     def _is_polish_text(text: str) -> bool:
+        # Function words and inflections that exist ONLY in Polish. Words that
+        # are spelled identically in English ('robot', 'bateria', 'to', 'jak',
+        # 'jest', 'tak', 'nie', 'oraz', 'ale') must NOT be listed: an English
+        # reply such as "I am a robot, able to help you" matched 'robot'+'to'
+        # and was misdetected as Polish. Diacritics remain the strong signal.
         if any(ch in text for ch in 'ąćęłńóśźżĄĆĘŁŃÓŚŹŻ'):
             return True
         tokens = set(re.findall(r'[^\W_]+', text.lower(), flags=re.UNICODE))
         polish_words = {
-            'cześć', 'dzień', 'dobry', 'dziękuję', 'proszę', 'tak', 'nie',
-            'jestem', 'jesteś', 'jest', 'możesz', 'mogę', 'pomóc', 'jak',
-            'się', 'niech', 'mój', 'moja', 'moje', 'twoje', 'to', 'czy',
-            'oraz', 'ale', 'dlaczego', 'ponieważ', 'robot', 'bateria'
+            'cześć', 'dzień', 'dobry', 'dziękuję', 'proszę',
+            'jestem', 'jesteś', 'możesz', 'mogę', 'pomóc',
+            'się', 'niech', 'mój', 'moja', 'moje', 'twoje', 'czy',
+            'dlaczego', 'ponieważ', 'witaj', 'przepraszam'
         }
         return len(tokens & polish_words) >= 2
 

@@ -204,6 +204,26 @@ class TestLanguagePipeline(unittest.TestCase):
         self.assertTrue(
             [m for m in self.node.logged if 'mismatch' in m[1]])
 
+    def test_english_reply_with_polish_spelled_words_is_not_polish(self):
+        # Regression (seen live 2026-10-13 13:51): the heuristic listed words
+        # that are spelled identically in both languages ('robot', 'to'), so
+        # the English reply "Hello, I'm Aletta, your friendly humanoid robot.
+        # I'm currently able to assist you." matched 'robot'+'to' and was
+        # flagged as Polish — a false "Reply language mismatch" warning.
+        # Words shared with English must not count as Polish evidence.
+        english = [
+            "Hello, I'm Aletta, your friendly humanoid robot. I'm currently "
+            "able to assist you.",
+            'I am a robot and I am able to speak to you.',
+            'Yes, I can help you today. Ask me anything you like.',
+        ]
+        for text in english:
+            self.assertFalse(
+                self.node._is_polish_text(text), msg=text)
+        # Diacritics and Polish-only function words still detect Polish.
+        for text in ('Cześć, jak się masz?', 'Dzień dobry, witaj!'):
+            self.assertTrue(self.node._is_polish_text(text), msg=text)
+
 
 class TestStreamingDedup(unittest.TestCase):
     """
