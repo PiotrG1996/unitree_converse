@@ -145,37 +145,65 @@ python3 scripts/bench_whisper_gpu.py base /tmp/bench_speech.wav
 
 ## Package Structure
 
+Top-level layout (as produced by `tree -L 1`):
+
 ```
 unitree_converse/
-├── setup.sh                        # Interactive setup script
-├── unitree_converse.service        # Systemd service file
-├── ollama.service                  # Ollama systemd service reference
-├── ensure_pulse.sh                 # ExecStartPre: bring up PulseAudio
-├── source_ros.sh                   # Source ROS2 + CycloneDDS env for manual use
+├── build                            # colcon build dir (generated, git-ignored)
+├── install                          # colcon install dir (generated, git-ignored)
+├── log                              # colcon build/test logs (generated)
+├── ensure_pulse.sh                  # ExecStartPre: bring up PulseAudio
+├── setup.sh                         # Interactive setup script
+├── source_ros.sh                    # Source ROS2 + CycloneDDS env for manual use
+├── ollama.service                   # Ollama systemd service reference
+├── unitree_converse.service         # Voice-pipeline systemd service file
+├── unitree_converse_architecture.svg  # Architecture diagram
+├── README.md
 ├── scripts/
 │   ├── wait_for_robot_ready.sh     # ExecStartPre: DDS/eth0 readiness gate
 │   ├── check_audio.sh              # Speaker + mic diagnostics (Pulse/ALSA/UDP)
-│   └── check_pipeline.sh           # Ollama + Piper + Whisper stage checks
-├── README.md
+│   ├── check_pipeline.sh           # Ollama + Piper + Whisper stage checks
+│   ├── bench_whisper_gpu.py        # CPU vs GPU Whisper transcription benchmark
+│   └── test_mic_live.py            # Capture from the UDP mic and transcribe live
 └── src/
-    ├── g1_voice/
+    ├── g1_voice/                       # This package (ROS2 ament_python)
+    │   ├── package.xml                 # ROS2 package manifest
+    │   ├── setup.py                    # Console-script entry points for each node
+    │   ├── setup.cfg                   # setuptools develop/install config
+    │   ├── resource/g1_voice           # ament resource index marker
     │   ├── g1_voice/
-    │   │   ├── wake_word_node.py       # openWakeWord + keyboard trigger (sim)
-    │   │   ├── stt_node.py             # faster-whisper + UDP mic + stop signal
-    │   │   ├── tts_node.py             # Piper TTS with language-specific voices
-    │   │   ├── button_trigger_node.py  # F1/F3/START remote button mapping
-    │   │   └── robot_state_node.py     # Live robot state injection into LLM
+    │   │   ├── __init__.py                 # (empty) marks the Python package
+    │   │   ├── wake_word_node.py           # faster-whisper wake listener (CPU int8)
+    │   │   ├── stt_node.py                 # faster-whisper STT on GPU + UDP mic + speech gate
+    │   │   ├── speech_gate.py              # No-speech confidence filter (rclpy-free helpers)
+    │   │   ├── tts_node.py                 # Piper TTS, bilingual streamed via llm_stream
+    │   │   ├── g1_audio_worker.py          # Native G1 AudioHub playback (separate process)
+    │   │   ├── action_dispatcher_node.py   # (placeholder, empty) future robot-action node
+    │   │   ├── button_trigger_node.py      # F1/F3/START remote button mapping
+    │   │   └── robot_state_node.py         # Live robot state injection into the LLM
     │   ├── launch/
     │   │   ├── voice_sim.launch.py     # Dev machine (sounddevice mic, Python TTS)
-    │   │   └── voice_real.launch.py    # On-robot (UDP mic, piper binary)
+    │   │   └── voice_real.launch.py    # On-robot (UDP mic, piper binary, all 6 nodes)
     │   ├── config/
     │   │   ├── voice_params.yaml       # Dev machine params
-    │   │   └── voice_params_real.yaml  # Jetson robot params
+    │   │   └── voice_params_real.yaml  # Jetson robot params (GPU STT, tuned prompt)
     │   └── test/
-    │       ├── test_audio_hw.py        # Speaker/microphone hardware tests
-    │       └── test_llm_pipeline.py    # Ollama/Piper/Whisper stage tests
+    │       ├── test_audio_hw.py            # Speaker/microphone hardware tests
+    │       ├── test_llm_pipeline.py        # Ollama/Piper/Whisper stage tests
+    │       ├── test_speech_gate.py         # No-speech confidence-gate unit tests
+    │       ├── test_split_sentences.py     # TTS sentence split / bilingual voice-latch tests
+    │       ├── test_stt_language_gate.py   # STT language-duel + noise-skip unit tests
+    │       ├── test_copyright.py           # ament_copyright linter (skipped repo-wide)
+    │       ├── test_flake8.py              # ament_flake8 linter
+    │       └── test_pep257.py              # ament_pep257 (docstring) linter
     └── bob_llm/                        # LLM ROS2 node (submodule, Foxy-patched fork)
 ```
+
+> The six nodes launched by `voice_real.launch.py` are `wake_word_node`,
+> `stt_node`, `llm_node.py` (from `bob_llm`), `tts_node`,
+> `button_trigger_node`, and `robot_state_node`. `speech_gate.py`,
+> `g1_audio_worker.py`, and `__init__.py` are library/helper modules, not
+> standalone nodes.
 
 ---
 
