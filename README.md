@@ -62,10 +62,84 @@ The setup script will ask whether you are setting up on the **Unitree G1 Jetson*
 | DDS | CycloneDDS via `~/cyclonedds_ws` |
 | LLM | Ollama + LLaMA 3.2 3B |
 | LLM ROS2 node | bob_llm |
-| Speech-to-text | faster-whisper (base, CPU) |
+| Speech-to-text | faster-whisper (`base`, **GPU** — CUDA float16) |
 | Text-to-speech | Piper TTS (`en_US-lessac-medium` for English, `pl_PL-gosia-medium` for Polish) |
 | Audio output | Unitree AudioHub API via `g1_audio_worker` (`AudioClient.PlayStream`) |
 | Wake phrase | Whisper transcript gate (`hey_robot`) over the G1 UDP microphone |
+
+---
+
+## GPU-Only Speech-to-Text (faster-whisper on CUDA)
+
+Speech recognition runs **entirely on the Jetson Orin iGPU** — there is no CPU
+fallback. On this platform the CPU is too slow for a natural turn cadence, so
+the pipeline is deliberately GPU-only.
+
+### How it is wired
+
+Three things make GPU-only transcription work on this Jetson:
+
+1. **Device + compute type come from config.** `stt_node` reads
+   `device: "cuda"` from `voice_params_real.yaml` and derives the matching
+   quantisation automatically — `float16` for CUDA, `int8` for CPU. Plain
+   `int8` is not a valid CUDA quantisation for faster-whisper.
+
+   ```yaml
+   /stt_node:
+     ros__parameters:
+       device: "cuda"      # GPU-only: float16 on the Jetson iGPU
+   ```
+
+2. **The CUDA CTranslate2 engine is preloaded by absolute path.** The pip
+   `ctranslate2` wheel on this Jetson ships *without* the native
+   `libctranslate2.so.4`, so the user compiled CTranslate2 from source and
+   installed it outside the dynamic-linker search path. Under the minimal
+   systemd environment (`LD_LIBRARY_PATH=/usr/local/lib` only) a bare
+   `import faster_whisper` would fail with
+   `ImportError: libctranslate2.so.4: cannot open shared object file`.
+   `stt_node._preload_ctranslate2()` loads the hand-built library with
+   `ctypes.CDLL(path, mode=ctypes.RTLD_LOCAL)` before importing
+   faster-whisper. `RTLD_LOCAL` (not `RTLD_GLOBAL`) is essential — forcing
+   global symbols corrupts the heap inside a full ROS node
+   (`free(): invalid pointer` during CUDA model load). This is a harmless
+   no-op on machines where CTranslate2 is already on the loader path.
+
+3. **A CUDA load failure fails loudly instead of silently dropping to CPU.**
+   If the model cannot load on the GPU, the node logs the device/compute type
+   and re-raises — a broken GPU path is never papered over by a slow CPU run
+   that would go unnoticed.
+
+> **Wake word stays on CPU by design.** The wake listener uses a *separate*
+> Whisper instance pinned to `device: "cpu"` / `compute_type: "int8"`. Wake
+> detection never overlaps transcription, and a second GPU-resident model only
+> adds unified-memory pressure (a prior OOM on this robot killed the LLM
+> mid-reply). Only switch the wake word to CUDA if its latency is measured to
+> be too slow.
+
+### CPU vs GPU benchmark
+
+`scripts/bench_whisper_gpu.py` transcribes the **same audio** with the same
+`base` model on both backends (CPU = stock pip `ctranslate2` int8; GPU =
+hand-built CUDA `ctranslate2` float16) and reports load time, transcription
+time, and the real-time factor (transcribe time ÷ audio duration; `<1` means
+faster than real time).
+
+Measured on the G1 Jetson Orin NX, `base` model, 5.53 s utterance, 5 passes:
+
+| Backend | Compute type | Model load | Transcribe (median) | Real-time factor | Transcript |
+|---------|--------------|-----------:|--------------------:|-----------------:|------------|
+| **CPU** (previous) | int8 | 0.79 s | 1.217 s | 0.220 | correct |
+| **GPU** (current)  | float16 | 0.75 s | **0.367 s** | **0.066** | correct |
+
+**Result: ~3.3× faster end-to-end transcription**, with the same transcript.
+Because the real-time factor falls from `0.22` to `0.066`, transcribing a
+5.5-second utterance drops from ~1.2 s to ~0.37 s, and the first token of the
+reply starts noticeably sooner. Reproduce it with:
+
+```bash
+./scripts/check_pipeline.sh          # also synthesises a WAV to transcribe
+python3 scripts/bench_whisper_gpu.py base /tmp/bench_speech.wav
+```
 
 ---
 
@@ -389,8 +463,14 @@ mkdir -p ~/.local/share/piper && cd ~/.local/share/piper
 wget https://huggingface.co/rhasspy/piper-voices/resolve/main/en/en_US/lessac/medium/en_US-lessac-medium.onnx
 wget https://huggingface.co/rhasspy/piper-voices/resolve/main/en/en_US/lessac/medium/en_US-lessac-medium.onnx.json
 
-# faster-whisper base model
-python3 -c "from faster_whisper import WhisperModel; WhisperModel('base', device='cpu', compute_type='int8')"
+# faster-whisper base model (pip wheel + CUDA CTranslate2 — see GPU section above)
+pip3 install faster-whisper
+# The pip ctranslate2 wheel ships WITHOUT the native CUDA libctranslate2.so.4,
+# so build CTranslate2 from source with CUDA and install it outside the loader
+# path (stt_node preloads it by absolute path). Then pre-download the weights:
+python3 -c "from faster_whisper import WhisperModel; WhisperModel('base', device='cuda', compute_type='float16')"
+# If that raises 'libctranslate2.so.4: cannot open shared object file', set the
+# preload dir stt_node searches (ct2_install/lib or CTRANSLATE2_LIB_DIR).
 
 # Ollama
 curl -fsSL https://ollama.com/install.sh | sh
