@@ -15,6 +15,68 @@ import queue
 import numpy as np
 
 
+# Sentence boundaries for incremental TTS. A sentence is "complete" once a
+# terminator (. ! ? ;) is followed by whitespace, a newline, or end-of-string.
+# This guarantees we never start speaking a half-word when the next streamed
+# chunk would have continued it. Used by split_complete_sentences() below.
+#
+# NOTE: `(?<=[.!?;])` is a fixed-width lookbehind, so the two alternatives
+# `(?<=[.!?;])\s+` and `(?<=[.!?;])$` never overlap — the $ only matches the
+# single position at the very end of the buffer. That means a run like
+# `a.a.a...` yields one sentence per terminator only when separators exist.
+# The function below is the authoritative version; it handles the
+# end-of-string terminator case deterministically (e.g. "a." * 500 ->
+# 500 complete sentences, not 1).
+_SENTENCE_BOUNDARY_RE = re.compile(r'(?<=[.!?;])\s+|\n+|(?<=[.!?;]$)')
+
+
+def split_complete_sentences(buffer):
+    """
+    Split streamed text into complete sentences plus a trailing remainder.
+
+    Returns (sentences, remainder):
+      * sentences — stripped, non-empty pieces that end on a terminator and are
+        therefore safe to speak right now.
+      * remainder — the not-yet-terminated trailing text, kept for the next
+        chunk (and flushed by the caller when the turn ends).
+
+    Pure function (no ROS state) so it is unit-testable in isolation, mirroring
+    speech_gate.py.
+    """
+    buffer = buffer.strip()
+    if not buffer:
+        return [], ""
+
+    sentences = []
+    start = 0
+    n = len(buffer)
+    i = 0
+    while i < n:
+        if buffer[i] in '.!?;':
+            # End of a sentence when the terminator is followed by whitespace,
+            # a newline, or the end of the buffer itself.
+            if i + 1 >= n or buffer[i + 1] in ' \t\n\r':
+                piece = buffer[start:i + 1].strip()
+                if piece:
+                    sentences.append(piece)
+                start = i + 1
+                # Skip any separating whitespace so the next sentence starts
+                # at the next non-space character.
+                while start < n and buffer[start] in ' \t\n\r':
+                    start += 1
+        i += 1
+
+    remainder = buffer[start:].strip()
+    return sentences, remainder
+
+
+# Sentinel placed on the speech queue to mark "the whole LLM turn is enqueued
+# and spoken". The worker loop fires the continuous-listening trigger ONCE when
+# it drains this — instead of firing after every sentence — so a streamed,
+# multi-sentence reply never re-triggers the microphone mid-answer.
+_TURN_END = object()
+
+
 class TTSNode(Node):
     def _param(self, name):
         """Return a declared parameter's value (short form of get_parameter)."""
@@ -38,6 +100,15 @@ class TTSNode(Node):
         self.declare_parameter('tts_mode', 'binary')  # 'python' or 'binary'
         self.declare_parameter('piper_binary', os.path.expanduser('~/.local/piper-bin/piper'))
         self.declare_parameter('piper_lib_dir', os.path.expanduser('~/.local/piper-bin'))
+        # Piper speaking rate. 1.0 = the model's natural baseline; lower speaks
+        # faster, higher speaks slower. Exposed as a parameter so "make it feel
+        # faster" is a config tweak, not a code change.
+        self.declare_parameter('length_scale', 0.85)
+        # Streaming flag lives in this package's own YAML block so the TTS
+        # node can read it directly (previously it reached for the llm_node
+        # block's `stream` key, which raised at startup). Keep the default in
+        # sync with /llm_node's `stream: true`.
+        self.declare_parameter('stream', True)
 
         self.model_path = self._param('voice_model_path')
         self.polish_model_path = self._param('polish_voice_model_path')
@@ -75,17 +146,37 @@ class TTSNode(Node):
         self.tts_mode = self._param('tts_mode')
         self.piper_binary = self._param('piper_binary')
         self.piper_lib_dir = self._param('piper_lib_dir')
+        self.length_scale = self._param('length_scale')
 
         # Playback always goes through the native g1_audio_worker (Unitree AudioHub),
         # so sounddevice output-device selection is not used. The output_device param
         # is retained only for config compatibility with older profiles.
         self.continuous_mode = self._param('continuous_mode')
 
-        # Speaking enabled/muted, controlled by the F3 button via
-        # /g1/voice/speak_enable (published by button_trigger_node). Default True
-        # so behaviour is unchanged until F3 is pressed. When muted, replies are
-        # still processed but not played through the speaker.
+        # Streaming enabled (from voice_params_real.yaml `/llm_node` block).
+        self._streaming_enabled = self._param('stream')
+        self._response_language = None
         self.speak_enabled = True
+
+        # Incremental-stream state. `_turn_language` is latched once per LLM
+        # turn (from the STT USER_LANGUAGE marker carried on the transcript)
+        # so every streamed sentence of one reply is spoken with the same
+        # voice, in either language. `_stream_saw_chunk` records that at least
+        # one live llm_stream delta arrived, so response_callback can skip
+        # re-enqueueing the already-streamed full reply (which would speak
+        # every sentence twice).
+        self._stream_text = ''
+        self._stream_remaining = ''
+        self._stream_saw_chunk = False
+        # Count of complete sentences already enqueued this turn, so a
+        # cumulative re-split only speaks the not-yet-spoken tail.
+        self._stream_spoken = 0
+        self._turn_language = 'en'
+        # True while a turn is being streamed: stream_callback may enqueue.
+        # response_callback closes the turn; any straggler delta arriving
+        # after that is ignored so a late chunk can never leak into the
+        # next turn (which would speak stale text, in either language).
+        self._turn_open = False
 
         self.voice = None
         self.polish_voice = None
@@ -105,6 +196,8 @@ class TTSNode(Node):
 
         self.response_sub = self.create_subscription(
             String, 'llm_response', self.response_callback, 10)
+        self.stream_sub = self.create_subscription(
+            String, 'llm_stream', self.stream_callback, 10)
         self.create_subscription(
             String, '/g1/stt/transcript', self._transcript_language_callback, 10)
         self.create_subscription(Bool, '/g1/voice/continuous_start', self._continuous_start_cb, 10)
@@ -192,9 +285,36 @@ class TTSNode(Node):
         if not reply:
             self.get_logger().warning('Ignoring empty response after language marker')
             return
-        preview = f'"{reply[:80]}..."' if len(reply) > 80 else f'"{reply}"'
-        self.get_logger().info(f'Speaking: {preview}')
-        self._speech_queue.put((language, reply))
+
+        # Latch the turn language FIRST: live llm_stream deltas carry plain
+        # text (no marker), so stream_callback speaks them with whatever
+        # language is latched for this turn. Close the turn after flushing so
+        # straggler deltas cannot leak sentences into the next turn.
+        self._turn_language = language
+        self._warn_on_language_mismatch(reply, language)
+
+        # In streaming mode the live `llm_stream` deltas (stream_callback) have
+        # already enqueued this turn's sentences as they arrived. If none
+        # arrived (older llm_node, dropped chunks), sentence-split the full
+        # reply here so the turn is still spoken exactly once, in the
+        # language latched from the STT USER_LANGUAGE marker.
+        if self._streaming_enabled:
+            if not self._stream_saw_chunk:
+                self._stream_text = ''
+                self._stream_remaining = ''
+                self._on_stream_chunk(reply, language)
+            else:
+                # Reconcile tail: the buffer already reflects every live
+                # chunk; only refresh the unspoken remainder view.
+                _, self._stream_remaining = split_complete_sentences(
+                    self._stream_text)
+            self._finish_stream(language)
+            self._turn_open = False
+        else:
+            preview = f'"{reply[:80]}..."' if len(reply) > 80 else f'"{reply}"'
+            self.get_logger().info(f'Speaking: {preview}')
+            self._speech_queue.put((language, reply))
+            self._speech_queue.put(_TURN_END)
 
     def _normalize(self, audio: np.ndarray, target: float = 0.9) -> np.ndarray:
         """
@@ -271,11 +391,26 @@ class TTSNode(Node):
                 except OSError:
                     pass
 
+    def _process_queue_item(self, item) -> bool:
+        """Consume one speech-queue item. Returns True if it was _TURN_END."""
+        if item is _TURN_END:
+            # End of turn: re-trigger continuous listening once.
+            if self.continuous_mode:
+                time.sleep(0.5)
+                trigger = Bool()
+                trigger.data = True
+                self.trigger_pub.publish(trigger)
+                self.get_logger().info('Continuous mode — auto-triggering next turn')
+            return True
+        language, text = item
+        self._speak(text, language)
+        return False
+
     def _speech_worker_loop(self):
         while rclpy.ok():
-            language, text = self._speech_queue.get()
+            item = self._speech_queue.get()
             try:
-                self._speak(text, language)
+                self._process_queue_item(item)
             finally:
                 self._speech_queue.task_done()
 
@@ -303,24 +438,31 @@ class TTSNode(Node):
 
             self.is_speaking = False
             self._publish_status('idle')
-            if self.continuous_mode:
-                import time
-                time.sleep(0.5)
-                trigger = Bool()
-                trigger.data = True
-                self.trigger_pub.publish(trigger)
-                self.get_logger().info('Continuous mode — auto-triggering next turn')
 
     def _transcript_language_callback(self, msg: String):
-        """Remember the language of the user turn for the upcoming LLM reply."""
+        """
+        Remember the language of the user turn for the upcoming LLM reply.
+
+        The transcript arriving means a NEW user turn started, so the stream
+        state is reset here: the next streamed sentence belongs to this
+        turn's reply, in this turn's language (pl or en).
+        """
         match = re.match(
             r'^\s*\[USER_LANGUAGE:(pl|en)\]\s*\n',
             msg.data,
             flags=re.IGNORECASE,
         )
         if match:
+            language = match.group(1).lower()
             with self._response_language_lock:
-                self._response_language = match.group(1).lower()
+                self._response_language = language
+            # Latch the streamed-sentence voice HERE, at turn start:
+            # llm_stream deltas arrive while generation is still running, long
+            # before response_callback latches the final reply. Without this,
+            # the first streamed sentence(s) of each turn are spoken with the
+            # PREVIOUS turn's language voice.
+            self._turn_language = language
+            self._reset_turn()
 
     def _language_and_text(self, text: str):
         """Return the explicit or remembered language and clean response text."""
@@ -343,6 +485,111 @@ class TTSNode(Node):
         self.get_logger().info(
             f'TTS language selected from latest user turn: {language}')
         return language, text.strip()
+
+    def _warn_on_language_mismatch(self, reply: str, language: str):
+        """
+        Log when the reply text's language disagrees with the turn language.
+
+        The LLM is instructed to reply in the user's language, but it can
+        drift (mixed-language input, history pull). Speaking a reply in the
+        wrong voice sounds broken, so surface the mismatch in the logs.
+        Warn-only by design: the diacritics/keyword heuristic is not perfect
+        (e.g. English text mentioning Polish proper names like "Poznań"
+        contains diacritics), so it must not override the latched voice.
+        """
+        looks_polish = self._is_polish_text(reply)
+        expected_polish = (language == 'pl')
+        if looks_polish != expected_polish:
+            actual = 'pl' if looks_polish else 'en'
+            self.get_logger().warning(
+                f'Reply language mismatch: turn language is {language!r} '
+                f'but reply text looks {actual!r}: {reply[:60]!r}...')
+
+    # --- streamed-llm state machine (llm_stream -> incremental sentences) ---
+
+    # Cumulative buffer of the current LLM turn. Each `llm_stream` chunk appends
+    # here; we split out complete sentences for the queue. `_remaining` keeps the
+    # not-yet-terminated tail between chunks.
+    def _reset_turn(self):
+        self._stream_text = ''
+        self._stream_remaining = ''
+        self._stream_saw_chunk = False
+        self._stream_spoken = 0
+        self._turn_open = True
+
+    def stream_callback(self, msg: String):
+        """
+        Enqueue one incremental `llm_stream` delta as complete sentences.
+
+        The llm_node publishes raw incremental text on `llm_stream` (cumulative
+        chunks flushed on word boundaries, plain text) plus the final full
+        reply on `llm_response` via response_callback. This path speaks the
+        first sentence while generation is still running, in either language —
+        the turn language was latched by response_callback/_on_stream_chunk
+        from the STT USER_LANGUAGE marker. If no live chunks arrive (e.g. an
+        older llm_node), response_callback falls back to sentence-splitting
+        the full reply.
+        """
+        if not self._turn_open:
+            self.get_logger().warning(
+                'Ignoring llm_stream delta for a closed turn')
+            return
+        self._on_stream_chunk(msg.data, self._turn_language)
+
+    def _on_stream_chunk(self, chunk: str, language: str = 'en'):
+        """
+        Push an incremental `llm_stream` delta into the sentence queue.
+
+        Args:
+            chunk: Streamed text delta from the LLM.
+            language: The target language ('pl' or 'en') for this turn, taken
+                from the STT USER_LANGUAGE marker. Passed explicitly so a
+                streamed reply in either language is spoken with the correct
+                voice, even though the marker is consumed from the text.
+        """
+        if not chunk:
+            return
+        self._turn_language = language
+        self._stream_saw_chunk = True
+
+        # Drop a leading language marker if it somehow arrives in-stream.
+        if not self._stream_text and chunk.startswith('[USER_LANGUAGE:'):
+            parts = chunk.split(']', 1)
+            chunk = parts[1].lstrip() if len(parts) == 2 else ''
+            if not chunk:
+                return
+
+        self._stream_text += chunk
+
+        # The buffer is cumulative, so re-splitting returns every complete
+        # sentence each time. Enqueue only the sentences beyond the count we
+        # have already spoken so each is uttered exactly once. Slicing the
+        # full-buffer result (rather than concatenating a stripped remainder
+        # with the next chunk) preserves inter-word whitespace at boundaries.
+        sentences, self._stream_remaining = split_complete_sentences(
+            self._stream_text)
+
+        for sentence in sentences[self._stream_spoken:]:
+            self._speech_queue.put((language, sentence))
+        self._stream_spoken = len(sentences)
+
+    def _finish_stream(self, language: str = 'en'):
+        """
+        Flush the not-yet-terminated tail as the final sentence of the turn.
+
+        This is the end-of-turn handler: once the buffer's last sentence is
+        enqueued, we publish the continuous-mode trigger exactly once so the
+        mic doesn't re-open mid-reply. The trigger is also queued as an item so
+        the turn-ordered drain order is preserved.
+
+        Args:
+            language: Target language ('pl' or 'en') for the final sentence,
+                passed explicitly to keep it in sync with the rest of the turn.
+        """
+        if self._stream_remaining.strip():
+            self._speech_queue.put(
+                (language, self._stream_remaining.strip()))
+        self._speech_queue.put(_TURN_END)
 
     def _speak_python(self, text: str, language: str):
         voice = self.polish_voice if language == 'pl' else self.voice
@@ -428,10 +675,11 @@ class TTSNode(Node):
 
         # A value of 1.0 is the model's usual baseline speed.
         # Lower values speak faster; higher values speak slower.
+        # Tuned via the `length_scale` parameter (default 0.85).
         cmd = [
             self.piper_binary,
             "--model", selected_model,
-            "--length_scale", "0.95",
+            "--length_scale", f"{self.length_scale:g}",
         ]
 
         wav_path = None

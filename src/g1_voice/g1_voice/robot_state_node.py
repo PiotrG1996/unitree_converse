@@ -32,6 +32,12 @@ class RobotStateNode(Node):
         self.imu_rpy = None
         self.mode = None
 
+        # Cached ROS2 node count. Counting nodes requires spawning `ros2 node
+        # list`, which performs full DDS discovery and can take hundreds of ms
+        # to seconds. It is refreshed periodically in the background instead of
+        # on every user turn so it never blocks the transcript -> LLM path.
+        self._cached_ros_nodes = 'unknown'
+
         # Subscribe to robot state topics
         try:
             from unitree_hg.msg import BmsState
@@ -64,7 +70,32 @@ class RobotStateNode(Node):
         # Publish state summary every 30 seconds
         self.create_timer(30.0, self._publish_state_summary)
 
+        # Refresh the (expensive) ROS2 node count in the background, decoupled
+        # from the per-turn prompt path.
+        self.create_timer(30.0, self._update_ros_node_count)
+
         self.get_logger().info('Robot state node ready')
+
+    def _update_ros_node_count(self):
+        """Count ROS2 nodes in the background; cache for per-turn reuse."""
+        try:
+            result = subprocess.run(
+                ['ros2', 'node', 'list'],
+                capture_output=True, text=True, timeout=5
+            )
+        except Exception:
+            # Timeout/spawn failure: keep the previous cached value.
+            return
+        if result.returncode != 0:
+            # CLI/daemon errors return empty stdout; caching that would
+            # overwrite a good count with a bogus 0.
+            return
+        nodes = [n for n in result.stdout.strip().split('\n') if n]
+        if not nodes:
+            # An empty graph is never true (this node itself is always in it);
+            # treat as a discovery race and keep the previous value.
+            return
+        self._cached_ros_nodes = len(nodes)
 
     def _bms_callback(self, msg):
         self.battery_soc = msg.soc
@@ -109,16 +140,8 @@ class RobotStateNode(Node):
         except Exception:
             info['uptime'] = 'unknown'
 
-        # ROS2 nodes
-        try:
-            result = subprocess.run(
-                ['ros2', 'node', 'list'],
-                capture_output=True, text=True, timeout=2
-            )
-            nodes = [n for n in result.stdout.strip().split('\n') if n]
-            info['ros_nodes'] = len(nodes)
-        except Exception:
-            info['ros_nodes'] = 'unknown'
+        # ROS2 nodes (use the background-cached count; never block the turn here)
+        info['ros_nodes'] = self._cached_ros_nodes
 
         return info
 
@@ -188,7 +211,8 @@ class RobotStateNode(Node):
                 f"LATEST USER TURN LANGUAGE: {language_name} ({language_code}). "
                 f"Reply in {language_name} for this turn, regardless of earlier "
                 "conversation turns. This instruction overrides the language "
-                "used in previous turns."
+                "used in previous turns, unless the user explicitly requests "
+                "a different language."
             )
             enriched = (
                 f"{state_context}\n\n{language_instruction}"

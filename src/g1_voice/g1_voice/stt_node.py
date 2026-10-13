@@ -6,6 +6,62 @@ import socket
 import struct
 import threading
 import re
+import os
+import ctypes
+
+
+# Directories searched for a hand-built (CUDA-enabled) libctranslate2. The pip
+# ctranslate2 wheel on this Jetson ships without the native shared library, so
+# the user compiled CTranslate2 from source and installed it here. The dynamic
+# linker does not know about these paths, so we preload the .so by absolute
+# path with ctypes before importing faster_whisper (see _preload_ctranslate2).
+_CTRANSLATE2_LIB_DIRS = (
+    os.environ.get('CTRANSLATE2_LIB_DIR', ''),
+    '/home/unitree/ct2_install/lib',
+    '/home/unitree/CTranslate2/build',
+    os.path.expanduser('~/ct2_install/lib'),
+    os.path.expanduser('~/CTranslate2/build'),
+)
+
+
+def _preload_ctranslate2(logger=None):
+    """
+    Preload a hand-built CUDA libctranslate2 by absolute path.
+
+    faster_whisper -> ctranslate2 needs libctranslate2.so.4 at import time. On
+    this Jetson that library lives outside the default loader search path, so a
+    bare `import faster_whisper` raises
+        ImportError: libctranslate2.so.4: cannot open shared object file
+    under the minimal systemd environment (which sets LD_LIBRARY_PATH=/usr/local/lib
+    only). Setting os.environ['LD_LIBRARY_PATH'] at runtime does NOT help because
+    glibc caches the search path at process start. Loading the library explicitly
+    with ctypes (RTLD_LOCAL) makes its symbols available to the subsequently
+    imported ctranslate2 extension regardless of the launcher.
+
+    Best-effort: if the library is already loadable (e.g. on the dev machine or
+    a normally-installed wheel) this is a harmless no-op.
+    """
+    for lib_dir in _CTRANSLATE2_LIB_DIRS:
+        if not lib_dir:
+            continue
+        for name in ('libctranslate2.so.4', 'libctranslate2.so'):
+            path = os.path.join(lib_dir, name)
+            if os.path.exists(path):
+                try:
+                    # RTLD_LOCAL, NOT RTLD_GLOBAL: ctranslate2's C extension links
+                    # against libctranslate2.so.4 by soname, so the dynamic linker
+                    # reuses this already-loaded instance without needing its symbols
+                    # exported globally. Forcing RTLD_GLOBAL pollutes the process
+                    # symbol namespace and corrupts the heap inside a full ROS node
+                    # ("free(): invalid pointer" abort during CUDA model load).
+                    ctypes.CDLL(path, mode=ctypes.RTLD_LOCAL)
+                    if logger:
+                        logger.info(f'Preloaded CUDA runtime lib: {path}')
+                except OSError as e:
+                    if logger:
+                        logger.warn(f'Found {path} but failed to preload: {e}')
+                return
+    # Nothing to preload — assume the system-provided library is resolvable.
 
 
 class STTNode(Node):
@@ -56,9 +112,29 @@ class STTNode(Node):
         self._transcript_published = False
         self.llm_busy = False
 
-        self.get_logger().info(f'Loading faster-whisper model: {self.model_size}')
+        # Pick a compute_type that is valid for the selected device. On CUDA,
+        # plain 'int8' is not a supported quantisation; faster-whisper wants
+        # 'float16' (or 'int8_float16') for GPU, while CPU keeps 'int8'.
+        compute_type = 'float16' if self.device == 'cuda' else 'int8'
+
+        self.get_logger().info(
+            f'Loading faster-whisper model: {self.model_size} '
+            f'(device={self.device}, compute_type={compute_type})')
+        # Make the hand-built CUDA libctranslate2 resolvable before faster_whisper
+        # imports it. Harmless no-op when the library is already on the loader path.
+        _preload_ctranslate2(logger=self.get_logger())
         from faster_whisper import WhisperModel
-        self.model = WhisperModel(self.model_size, device=self.device, compute_type='int8')
+        try:
+            self.model = WhisperModel(
+                self.model_size, device=self.device, compute_type=compute_type)
+        except Exception as e:
+            # GPU-only target: if the CUDA load fails (no CUDA build of
+            # ctranslate2, driver issue, etc.), surface it loudly rather than
+            # silently falling back to CPU.
+            self.get_logger().error(
+                f'faster-whisper failed to load on device="{self.device}" '
+                f'(compute_type={compute_type}): {e}')
+            raise
         self.get_logger().info('faster-whisper model loaded')
 
         self.trigger_sub = self.create_subscription(
@@ -314,7 +390,7 @@ class STTNode(Node):
         segments, info = self.model.transcribe(
             audio_data,
             language=language,
-            beam_size=5,
+            beam_size=1,
             temperature=0.0,
             condition_on_previous_text=False,
             vad_filter=True,

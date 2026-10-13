@@ -24,6 +24,9 @@ set -u
 
 OLLAMA_URL="${OLLAMA_URL:-http://localhost:11434/v1}"
 OLLAMA_MODEL="${OLLAMA_MODEL:-llama3.2}"
+# STT device: default 'cuda' to match the GPU-only real config. Override with
+# WHISPER_DEVICE=cpu to test the CPU fallback.
+WHISPER_DEVICE="${WHISPER_DEVICE:-cuda}"
 PIPER_BIN="${PIPER_BIN:-$HOME/.local/piper-bin/piper}"
 PIPER_LIB_DIR="${PIPER_LIB_DIR:-$HOME/.local/piper-bin}"
 VOICE_MODEL="${VOICE_MODEL:-$HOME/.local/share/piper/en_US-lessac-medium.onnx}"
@@ -76,6 +79,25 @@ except Exception:
         bad "no usable reply from $OLLAMA_MODEL (empty/error response)"
         info "raw: $(printf '%s' "$RESP" | head -c 300)"
     fi
+
+    # GPU offload probe: does the loaded model actually run on GPU? We force a
+    # load via a tiny request, then read `ollama ps`, whose PROCESSOR column
+    # reports "100% GPU" or "100% CPU". GPU-only target => expect GPU.
+    echo "  ... checking GPU offload via 'ollama ps' ..."
+    if ! command -v ollama >/dev/null 2>&1; then
+        info "'ollama' CLI not on PATH - skipping GPU offload probe"
+    else
+        PS_ROW="$(ollama ps 2>/dev/null | grep -F "$OLLAMA_MODEL" | head -n1)"
+        if [ -z "$PS_ROW" ]; then
+            info "'ollama ps' shows no resident row for '$OLLAMA_MODEL' yet; cannot confirm offload"
+        elif printf '%s' "$PS_ROW" | grep -qiE '[0-9]+% *GPU'; then
+            ok "Ollama model offloaded to GPU ($PS_ROW)"
+        elif printf '%s' "$PS_ROW" | grep -qiE '[0-9]+% *CPU'; then
+            bad "Ollama model running on CPU, not GPU ($PS_ROW) - check Jetson CUDA driver and that cuda-11.4 is on the ollama service PATH"
+        else
+            info "could not read GPU/CPU offload from 'ollama ps' row: $PS_ROW"
+        fi
+    fi
 fi
 
 
@@ -111,12 +133,33 @@ hdr "faster-whisper STT (round-trip on synthesised audio)"
 if [ -z "$PIPER_WAV" ] || [ ! -s "$PIPER_WAV" ]; then
     info "skipping STT round-trip (no Piper WAV to transcribe)"
 else
-    echo "  ... transcribing (model 'base' loads on first use) ..."
-    TRANSCRIPT="$(python3 - "$PIPER_WAV" <<'PY'
-import sys
+    echo "  ... transcribing (model 'base' loads on first use, device=$WHISPER_DEVICE) ..."
+    TRANSCRIPT="$(python3 - "$PIPER_WAV" "$WHISPER_DEVICE" <<'PY'
+import os, ctypes, sys
+# Preload the hand-built CUDA libctranslate2 (same approach as stt_node) so the
+# check works under the minimal service env where ct2 is not on LD_LIBRARY_PATH.
+for _d in (os.environ.get('CTRANSLATE2_LIB_DIR', ''), '/home/unitree/ct2_install/lib',
+           '/home/unitree/CTranslate2/build', os.path.expanduser('~/ct2_install/lib'),
+           os.path.expanduser('~/CTranslate2/build')):
+    if _d:
+        for _n in ('libctranslate2.so.4', 'libctranslate2.so'):
+            _p = os.path.join(_d, _n)
+            if os.path.exists(_p):
+                try:
+                    # RTLD_LOCAL (not RTLD_GLOBAL) — avoids heap corruption in the
+                    # ROS process; the ct2 extension binds by soname. See stt_node.
+                    ctypes.CDLL(_p, mode=ctypes.RTLD_LOCAL)
+                except OSError:
+                    pass
+                break
+        else:
+            continue
+        break
 try:
     from faster_whisper import WhisperModel
-    m = WhisperModel('base', device='cpu', compute_type='int8')
+    device = sys.argv[2]
+    compute_type = 'float16' if device == 'cuda' else 'int8'
+    m = WhisperModel('base', device=device, compute_type=compute_type)
     segs, _ = m.transcribe(sys.argv[1], language='en', beam_size=5)
     print(' '.join(s.text.strip() for s in segs).strip())
 except Exception as e:

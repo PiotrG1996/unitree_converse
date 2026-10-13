@@ -1,12 +1,51 @@
+
 /llm_node:
   ros__parameters:
     api_url: "http://localhost:11434/v1"
     api_key: "no_key"
     api_model: "llama3.2"
-    system_prompt: "You are Aletta, a friendly humanoid robot by Unitree Robotics. You are being researched by the SMART Research Group at Saxion University of Applied Sciences in Enschede, Netherlands. You have access to live robot state in [ROBOT STATE] blocks; use it only to answer specific questions the user asks, and do not volunteer diagnostics or connectivity information. Reply in the same language as the latest user utterance, using only Polish or English. If the user speaks Polish, reply in natural Polish with correct Polish diacritics; if the user speaks English, reply in English. Do not switch languages unnecessarily. Keep every response under two sentences and concise for spoken output."
-    temperature: 0.7
+
+    system_prompt: >-
+      You are Aletta, a friendly humanoid robot developed by Unitree
+      Robotics. You are part of a PhD research project carried out by
+      Piotr Gąski at Poznań University of Technology in Poland.
+
+      LANGUAGE:
+      Reply in the language of the latest user utterance, using only
+      Polish or English. Use natural, grammatically correct Polish
+      with proper diacritics, or clear, natural English. Do not switch
+      languages unnecessarily. If the language is unclear, ask a brief
+      clarification in Polish or English.
+
+      ROBOT STATE:
+      You may receive live robot-state information in [ROBOT STATE]
+      blocks. Use only relevant information from these blocks to answer
+      the user's specific questions. Do not volunteer diagnostics or
+      connectivity information. Never invent sensor readings, robot
+      capabilities, or operating conditions. If information is missing,
+      stale, contradictory, or insufficient, say so briefly.
+
+      SAFETY:
+      Never claim that a physical action has been completed unless
+      execution is confirmed by an authoritative source. Do not imply
+      that conversational instructions override hardware-level safety
+      mechanisms. If an ambiguous request could cause unsafe movement,
+      ask for clarification.
+
+      SPEECH:
+      Keep responses concise and natural for spoken interaction.
+      Prefer one sentence and use no more than two sentences unless
+      essential safety information requires additional explanation.
+      Avoid unnecessary lists, technical details, and repetition.
+
+    temperature: 0.4
     max_history_length: 10
-    stream: false
+    # stream: false
+    stream: true
+
+    # Hard output cap to reduce generation and TTS latency.
+    max_tokens: 90
+
 
 /stt_node:
   ros__parameters:
@@ -14,47 +53,166 @@
     continuous_mode: true
     watchdog_interval: 8.0
     boot_kick_delay: 6.0
+
     udp_multicast_group: "239.168.123.161"
     udp_port: 5555
     udp_local_ip: "192.168.123.164"
+
+    # Baseline: benchmark against small on the target Jetson.
     model_size: "base"
     language: "auto"
-    device: "cpu"
+    device: "cuda"
+
     sample_rate: 16000
     recording_duration: 8.0
     silence_threshold: 0.008
-    silence_duration: 1.0
-    # Drop Whisper segments it flags as likely non-speech (no_speech_prob).
-    # Quiet-room hallucinations measure 0.53-0.59; real speech is well below
-    # 0.5. Raise this if genuine speech is ever filtered.
+
+    # Benchmark 0.45 against 0.60 seconds for turn-taking.
+    silence_duration: 0.45
+
+    # Tune with recorded speech and silence samples.
     max_no_speech_prob: 0.5
-    language_detection_min_probability: 0.55
+    # 0.55 was too permissive: Whisper's silence/noise floor is en@0.55-0.57
+    # (observed 153x on 2026-10-13), and real uncertain speech lands in
+    # 0.55-0.74 too. Anything at/above the gate skips the pl/en duel, so
+    # short/noisy Polish could auto-detect as English and get an English
+    # reply. 0.75 routes those windows through the scored duel (robust);
+    # confident real speech clusters at 0.90-1.00 and is unaffected.
+    language_detection_min_probability: 0.75
+
 
 /wake_word_node:
   ros__parameters:
     wake_phrases: ["hey robot", "Cześć robot"]
+
+    # Requires implementation-side case/diacritic normalization
+    # and alias matching; YAML alone does not implement normalization.
     wake_phrase_aliases: ["czesc robot", "cześ robot"]
+
     wake_model_size: "base"
     wake_language: "auto"
-    wake_initial_prompt: "Hey robot. Cześć robot. Czesc robot."
+    # CPU int8 by design: wake listening never overlaps STT, and a second
+    # GPU-resident Whisper adds unified-memory pressure (see the
+    # 2026-10-13 OOM). Only override to cuda/float16 if wake latency is
+    # measured to be too slow.
+    wake_device: "cpu"
+    wake_compute_type: "int8"
+
+    # Use the actual Polish spelling rather than English-style
+    # phonetic spelling as the primary recognition hint.
+    wake_initial_prompt: "Hey robot. Cześć robot."
+
     sample_rate: 16000
     wake_chunk_duration: 3.0
+
     use_udp_mic: false
     udp_multicast_group: "239.168.123.161"
     udp_port: 5555
     udp_local_ip: "192.168.123.164"
+
     use_select_button: false
     select_key: "s"
+
 
 /tts_node:
   ros__parameters:
     voice_model_path: "/home/unitree/.local/share/piper/en_US-lessac-medium.onnx"
     polish_voice_model_path: "/home/unitree/.local/share/piper/pl_PL-gosia-medium/pl_PL-gosia-medium.onnx"
+
     continuous_mode: true
     use_cuda: false
-    output_device: -1          # unused: playback goes via native g1_audio_worker (AudioHub)
-    output_sample_rate: 44100  # native rate of hw:APE,0 (22050 is rejected -> paInvalidSampleRate)
-    tts_mode: "binary"         # 'python' (piper pip pkg) or 'binary' (standalone piper)
+
+    # Playback is handled by the native G1 AudioHub worker.
+    output_device: -1
+    output_sample_rate: 44100
+
+    tts_mode: "binary"
+
+    # Mirrors /llm_node's `stream` flag: when true, TTS speaks incremental
+    # llm_stream sentence chunks as they arrive (works in both PL and EN);
+    # llm_response then only flushes the tail. Must stay in sync with the
+    # llm_node block, otherwise streaming deltas arrive but are never
+    # enqueued (or vice versa). Default True to match llm_node.
+    stream: true
+
+    # Benchmark 0.80 against 0.88 for intelligibility and naturalness.
+    length_scale: 0.80
+
     piper_binary: "/home/unitree/.local/piper-bin/piper"
     piper_lib_dir: "/home/unitree/.local/piper-bin"
+
     network_interface: "eth0"
+
+
+# /llm_node:
+#   ros__parameters:
+#     api_url: "http://localhost:11434/v1"
+#     api_key: "no_key"
+#     api_model: "llama3.2"
+# system_prompt: "You are Aletta, a friendly humanoid robot by Unitree Robotics. You are part of a PhD research project carried out by Piotr Gąski at Poznań University of Technology in Poznań, Poland. You have access to live robot state in [ROBOT STATE] blocks; use it only to answer specific questions the user asks, and do not volunteer diagnostics or connectivity information. Reply in the same language as the latest user utterance, using only Polish or English. If the user speaks Polish, reply in natural Polish with correct Polish diacritics; if the user speaks English, reply in English. Do not switch languages unnecessarily. Keep every response under two sentences and concise for spoken output."    temperature: 0.7
+#     max_history_length: 10
+#     stream: false
+#     # Hard cap on reply length. The system prompt already asks for <=2 sentences;
+#     # this bounds the worst case so a chatty model can't ramble, which would add
+#     # LLM generation time + TTS time before playback even starts. ~90 tokens is
+#     # comfortably two spoken sentences and forces an early stop.
+#     max_tokens: 90
+
+# /stt_node:
+#   ros__parameters:
+#     use_udp_mic: true
+#     continuous_mode: true
+#     watchdog_interval: 8.0
+#     boot_kick_delay: 6.0
+#     udp_multicast_group: "239.168.123.161"
+#     udp_port: 5555
+#     udp_local_ip: "192.168.123.164"
+#     model_size: "base"
+#     language: "auto"
+#     device: "cuda"                      # GPU-only: run Whisper on the Jetson iGPU (float16)
+#     sample_rate: 16000
+#     recording_duration: 8.0
+#     silence_threshold: 0.008
+#     silence_duration: 0.45              # trailing silence before we treat the turn as
+#                                         # done; lower = snappier first-audio, but too low
+#                                         # clips slow talkers mid-pause. 0.45 is a safe step
+#                                         # down from 0.6 that still tolerates natural pauses.
+#     # Drop Whisper segments it flags as likely non-speech (no_speech_prob).
+#     # Quiet-room hallucinations measure 0.53-0.59; real speech is well below
+#     # 0.5. Raise this if genuine speech is ever filtered.
+#     max_no_speech_prob: 0.5
+#     language_detection_min_probability: 0.75
+
+# /wake_word_node:
+#   ros__parameters:
+#     wake_phrases: ["hey robot", "Cześć robot"]
+#     wake_phrase_aliases: ["czesc robot", "cześ robot"]
+#     wake_model_size: "base"
+#     wake_language: "auto"
+#     wake_device: "cpu"              # cpu/int8 by design; cuda/float16 adds GPU memory pressure
+#     wake_compute_type: "int8"
+#     wake_initial_prompt: "Hey robot. Cheshch robot. Cheshch robot."
+#     sample_rate: 16000
+#     wake_chunk_duration: 3.0
+#     use_udp_mic: false
+#     udp_multicast_group: "239.168.123.161"
+#     udp_port: 5555
+#     udp_local_ip: "192.168.123.164"
+#     use_select_button: false
+#     select_key: "s"
+
+# /tts_node:
+#   ros__parameters:
+#     voice_model_path: "/home/unitree/.local/share/piper/en_US-lessac-medium.onnx"
+#     polish_voice_model_path: "/home/unitree/.local/share/piper/pl_PL-gosia-medium/pl_PL-gosia-medium.onnx"
+#     continuous_mode: true
+#     use_cuda: false
+#     output_device: -1          # unused: playback goes via native g1_audio_worker (AudioHub)
+#     output_sample_rate: 44100  # native rate of hw:APE,0 (22050 is rejected -> paInvalidSampleRate)
+#     tts_mode: "binary"         # 'python' (piper pip pkg) or 'binary' (standalone piper)
+#     length_scale: 0.80         # Piper speech rate: <1 = faster. 0.88 was hardcoded
+#                                # before; 0.80 speaks ~10% faster for a livelier feel.
+#                                # Lower too far and prosody gets rushed/clipped.
+#     piper_binary: "/home/unitree/.local/piper-bin/piper"
+#     piper_lib_dir: "/home/unitree/.local/piper-bin"
+#     network_interface: "eth0"

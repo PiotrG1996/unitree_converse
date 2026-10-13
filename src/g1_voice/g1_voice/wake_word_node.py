@@ -24,6 +24,12 @@ class WakeWordNode(Node):
             'wake_phrase_aliases', ['czesc robot', 'cześ robot'])
         self.declare_parameter('wake_model_size', 'base')
         self.declare_parameter('wake_language', 'auto')
+        # CPU int8 by design: wake listening never overlaps STT, and a second
+        # GPU-resident Whisper adds unified-memory pressure (see the
+        # 2026-10-13 OOM). Only override to cuda/float16 if wake latency is
+        # measured to be too slow.
+        self.declare_parameter('wake_device', 'cpu')
+        self.declare_parameter('wake_compute_type', 'int8')
         self.declare_parameter(
             'wake_initial_prompt', 'Hey robot. Cześć robot. Czesc robot.')
         self.declare_parameter('sample_rate', 16000)
@@ -39,6 +45,8 @@ class WakeWordNode(Node):
         self.wake_phrase_aliases = list(self._param('wake_phrase_aliases'))
         self.wake_model_size = self._param('wake_model_size')
         self.wake_language = self._param('wake_language')
+        self.wake_device = self._param('wake_device')
+        self.wake_compute_type = self._param('wake_compute_type')
         self.wake_initial_prompt = self._param('wake_initial_prompt')
         self.sample_rate = self._param('sample_rate')
         self.wake_chunk_duration = self._param('wake_chunk_duration')
@@ -120,8 +128,13 @@ class WakeWordNode(Node):
         try:
             from faster_whisper import WhisperModel
             self.model = WhisperModel(
-                self.wake_model_size, device='cpu', compute_type='int8')
-            self.get_logger().info('Wake phrase Whisper model loaded')
+                self.wake_model_size,
+                device=self.wake_device,
+                compute_type=self.wake_compute_type)
+            self.get_logger().info(
+                'Wake phrase Whisper model loaded '
+                f'(device={self.wake_device}, '
+                f'compute_type={self.wake_compute_type})')
         except Exception as e:
             self.get_logger().error(f'Failed to load wake phrase model: {e}')
             self.model = None

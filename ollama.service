@@ -4,6 +4,16 @@ After=network-online.target
 
 [Service]
 ExecStart=/usr/local/bin/ollama serve
+# Keep the 3B model resident in memory between turns so the first token of each
+# reply is not delayed by reloading the model from disk.
+Environment="OLLAMA_KEEP_ALIVE=-1"
+# Don't let the kernel OOM killer pick the LLM as victim: at 2026-10-13 11:01
+# an OOM killed llama-server mid-reply (llm_node saw "model runner has
+# unexpectedly stopped" 500s). Lower score => smaller processes die first.
+OOMScoreAdjust=-500
+# 2048 context is ample for <=2-sentence turns with the configured history
+# cap; halves the KV cache vs the 4096 default and saves RAM on this Jetson.
+Environment="OLLAMA_NUM_CTX=2048"
 User=ollama
 Group=ollama
 Restart=always
