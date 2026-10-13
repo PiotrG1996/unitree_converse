@@ -422,6 +422,22 @@ class STTNode(Node):
         if detected in ('pl', 'en') and probability >= self.language_detection_min_probability:
             return auto_segments, auto_info
 
+        # Skip the scored pl/en duel when the automatic pass contains no
+        # speech-quality segment: the input is ambient noise/silence, and
+        # forcing each language would only re-decode that same noise. Measured
+        # on the G1, 130 of 153 such idle turns resolved to an empty transcript
+        # anyway (the no-speech gate drops them). Bailing out here avoids two
+        # extra GPU decodes per idle turn and stops the misleading
+        # "selected=pl" log on pure noise. If the gate is unavailable we assume
+        # speech so the duel still runs (never lose a real turn to a missing
+        # import).
+        if not self._has_speech(auto_segments):
+            self.get_logger().info(
+                'No speech in auto pass '
+                f'(auto={detected or "unknown"} probability={probability:.2f}); '
+                'skipping language duel')
+            return auto_segments, auto_info
+
         candidates = {}
         for language in ('pl', 'en'):
             candidates[language] = self._transcribe(audio_data, language)
@@ -434,6 +450,27 @@ class STTNode(Node):
             f'Language fallback: auto={detected or "unknown"} '
             f'(probability={probability:.2f}), selected={best_language}')
         return best_segments, best_info
+
+    def _has_speech(self, segments) -> bool:
+        """
+        Return True when at least one segment passes the no-speech gate.
+
+        Reuses ``speech_gate.keep_segment`` so this decision uses exactly the
+        same confidence rule the transcript path applies downstream.
+        """
+        try:
+            from g1_voice.speech_gate import keep_segment
+        except Exception:
+            # Gate unavailable: assume speech so the duel still runs.
+            return True
+        for segment in segments:
+            if not (segment.text or '').strip():
+                continue
+            if keep_segment(
+                    getattr(segment, 'no_speech_prob', None),
+                    self.max_no_speech_prob):
+                return True
+        return False
 
     def _record_via_udp(self):
         self.stop_requested = False
