@@ -642,4 +642,4 @@ ros2 launch g1_voice voice_sim.launch.py
 
 ---
 
-*SMART Research Group — Saxion University of Applied Sciences, Enschede, Netherlands*
+RoboticsGap Systems - Piotr Gapski, PhD Candidate, Poland
