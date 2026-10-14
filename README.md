@@ -173,7 +173,8 @@ unitree_converse/
     │   ├── resource/g1_voice           # ament resource index marker
     │   ├── g1_voice/
     │   │   ├── __init__.py                 # (empty) marks the Python package
-    │   │   ├── wake_word_node.py           # faster-whisper wake listener (CPU int8)
+    │   │   ├── wake_word_node.py           # wake listener: Whisper phrases or custom "Aletta" openWakeWord
+    │   │   ├── wake_word_openwakeword.py   # openWakeWord detector wrapper (import-light, fallback-safe)
     │   │   ├── stt_node.py                 # faster-whisper STT on GPU + UDP mic + speech gate
     │   │   ├── speech_gate.py              # No-speech confidence filter (rclpy-free helpers)
     │   │   ├── tts_node.py                 # Piper TTS, bilingual streamed via llm_stream
@@ -306,9 +307,11 @@ binary, and both language voice models before launching. After changing source
 or configuration files, rebuild and reload the service registration before
 testing a reboot.
 
-The wake phrase is transcript-based because openWakeWord's built-in models do
-not include these phrases; changing a model name in YAML alone cannot create a
-new wake-word model.
+The default wake phrase is transcript-based because openWakeWord's built-in
+models do not include these phrases; changing a model name in YAML alone cannot
+create a new wake-word model. A **custom "Aletta" wake word** trained with
+openWakeWord is also supported — see [Custom "Aletta" wake word](#custom-aletta-wake-word)
+below.
 
 > **Mutually exclusive modes:** the wake-phrase workflow and the F1/START remote
 > workflow cannot run at the same time, because both need the single G1 UDP
@@ -326,6 +329,48 @@ For conversation turns, automatic language detection is confidence-aware:
 high-confidence Polish or English results are accepted directly. Ambiguous
 results are decoded once in each supported language and the stronger result is
 selected, avoiding accidental English-voice output for short Polish speech.
+
+### Custom "Aletta" wake word
+
+The default `wake_detector: whisper` backend transcribes the microphone and
+matches a phrase. This is flexible but keeps a full ASR decoder busy on the
+wake channel. Setting `wake_detector: aletta` in `voice_params*.yaml` switches
+`wake_word_node` to a **custom openWakeWord model** trained on the robot's real
+name, "Aletta". It scores precomputed melspectrogram/embedding features instead
+of running Whisper, so it reacts faster and uses less CPU.
+
+openWakeWord does not ship a pre-trained "Aletta" model, so you train one:
+
+1. **Synthesize positive clips** with the robot's own Piper voice:
+
+   ```bash
+   python3 scripts/generate_aletta_samples.py --count 30
+   ```
+
+   This writes 16 kHz mono WAVs of "Aletta" (several phrasings, lightly
+   augmented) to `data/aletta/positive/`. Record your own **non-"Aletta"**
+   clips (room noise, other speech) into `data/aletta/negative/` — synthetic
+   negatives overfit badly.
+
+2. **Train the model** (needs `torch`, so run it on a machine with PyTorch /
+   a GPU, not the robot):
+
+   ```bash
+   pip install openwakeword[full] torch torchvision torchaudio
+   python3 scripts/train_aletta_wakeword.py --output-dir ~/.local/share/openwakeword
+   ```
+
+   This exports `aletta_v0.1.tflite` (+ `.onnx`). The default
+   `aletta_model_path` already points at
+   `~/.local/share/openwakeword/aletta_v0.1.tflite`.
+
+3. `setup.sh` downloads openWakeWord's **base** feature models
+   (melspectrogram + embedding — not bundled with the pip package) into
+   `~/.local/share/openwakeword/` and wires their paths into both configs.
+
+If the custom model or `openwakeword` package is unavailable, `wake_word_node`
+logs the reason and **falls back to Whisper automatically** — wake detection is
+never left disabled. Tune `aletta_threshold` (higher = fewer false wakes).
 
 ### Push-to-Talk (optional)
 Hold F1 while speaking → release → robot responds → done.
@@ -569,7 +614,6 @@ ros2 launch g1_voice voice_sim.launch.py
 
 ## Future Work
 
-- Custom "Aletta" wake word model
 - Voice-controlled motion commands
 - Persistent conversation history across reboots
 - Upgrade Jetson to ROS2 Humble
