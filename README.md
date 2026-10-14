@@ -15,11 +15,23 @@ A complete voice conversation pipeline for the **Unitree G1 humanoid robot** ("A
 
 ## Quick Start
 
+Clone the repository, then run the setup script:
+
 ```bash
-git clone --recurse-submodules https://github.com/SaxionMechatronics/unitree_converse.git
+git clone https://github.com/PiotrG1996/unitree_converse.git
 cd unitree_converse
 ./setup.sh
 ```
+
+> This repository is a fork of
+> [SaxionMechatronics/unitree_converse](https://github.com/SaxionMechatronics/unitree_converse).
+> Use the fork for your own changes and push to your fork when you're ready to
+> share work:
+>
+> ```bash
+git remote add myfork https://github.com/PiotrG1996/unitree_converse.git
+git push -u myfork main
+> ```
 
 The setup script will ask whether you are setting up on the **Unitree G1 Jetson** or a **dev machine**, then handle everything automatically:
 
