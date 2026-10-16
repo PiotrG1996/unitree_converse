@@ -1,3 +1,6 @@
 [submodule "src/bob_llm"]
 	path = src/bob_llm
 	url = git@github.com:AkhileshSingh01/bob_llm.git
+[submodule "src/wakeword_training"]
+	path = src/wakeword_training
+	url = https://github.com/PiotrG1996/unitree_converse_wakeword_training.git

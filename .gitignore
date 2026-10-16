@@ -12,3 +12,6 @@ __pycache__/
 *.bak_*
 *.save
 *.orig
+
+# Wake-word training data and models live in the src/wakeword_training
+# git submodule (tracked there, not here). See src/wakeword_training/README.md.

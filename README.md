@@ -6,8 +6,9 @@ A complete voice conversation pipeline for the **Unitree G1 humanoid robot** ("A
 
 ## Demo
 
+- **Say "Aletta"** → robot wakes and opens a conversation session (turns chain automatically; closes after 15 s of silence)
 - **Hold F1** on the Unitree remote → robot listens → release F1 → robot responds
-- **Press START** → toggle continuous conversation mode (robot keeps listening after each response)
+- **Press START** → end the conversation session immediately (kill switch — sessions start only via "Aletta")
 - **Press F3** → mute/unmute the robot's spoken replies (processing continues while muted)
 - Aletta knows her battery level, orientation, network status, uptime, and software stack
 
@@ -37,6 +38,7 @@ The setup script will ask whether you are setting up on the **Unitree G1 Jetson*
 
 - Downloads Piper voice model (`en_US-lessac-medium`)
 - Downloads faster-whisper base model
+- Initializes git submodules (`src/bob_llm`, `src/wakeword_training`)
 - Installs Piper binary (Jetson) or piper-tts Python package (dev machine)
 - Installs and starts Ollama, pulls LLaMA 3.2 3B
 - Builds the ROS2 workspace
@@ -77,7 +79,7 @@ The setup script will ask whether you are setting up on the **Unitree G1 Jetson*
 | Speech-to-text | faster-whisper (`base`, **GPU** — CUDA float16) |
 | Text-to-speech | Piper TTS (`en_US-lessac-medium` for English, `pl_PL-gosia-medium` for Polish) |
 | Audio output | Unitree AudioHub API via `g1_audio_worker` (`AudioClient.PlayStream`) |
-| Wake phrase | Whisper transcript gate (`hey_robot`) over the G1 UDP microphone |
+| Wake word | **"Aletta"** — custom openWakeWord model (ONNX) over the G1 UDP microphone (pad buttons only otherwise) |
 
 ---
 
@@ -121,12 +123,10 @@ Three things make GPU-only transcription work on this Jetson:
    and re-raises — a broken GPU path is never papered over by a slow CPU run
    that would go unnoticed.
 
-> **Wake word stays on CPU by design.** The wake listener uses a *separate*
-> Whisper instance pinned to `device: "cpu"` / `compute_type: "int8"`. Wake
-> detection never overlaps transcription, and a second GPU-resident model only
-> adds unified-memory pressure (a prior OOM on this robot killed the LLM
-> mid-reply). Only switch the wake word to CUDA if its latency is measured to
-> be too slow.
+> **No second Whisper on the wake channel.** Wake detection uses the custom
+> openWakeWord "Aletta" model (TFLite/onnx, sub-watt CPU inference), not a
+> second ASR instance — so it adds no unified-memory pressure on the GPU
+> (a prior OOM on this robot killed the LLM mid-reply).
 
 ### CPU vs GPU benchmark
 
@@ -185,14 +185,14 @@ unitree_converse/
     │   ├── resource/g1_voice           # ament resource index marker
     │   ├── g1_voice/
     │   │   ├── __init__.py                 # (empty) marks the Python package
-    │   │   ├── wake_word_node.py           # wake listener: Whisper phrases or custom "Aletta" openWakeWord
-    │   │   ├── wake_word_openwakeword.py   # openWakeWord detector wrapper (import-light, fallback-safe)
+    │   │   ├── wake_word_node.py           # wake listener: "Aletta" openWakeWord only (no phrases, no keyboard)
+    │   │   ├── wake_word_openwakeword.py   # openWakeWord detector wrapper (import-light, loud-error)
     │   │   ├── stt_node.py                 # faster-whisper STT on GPU + UDP mic + speech gate
     │   │   ├── speech_gate.py              # No-speech confidence filter (rclpy-free helpers)
     │   │   ├── tts_node.py                 # Piper TTS, bilingual streamed via llm_stream
     │   │   ├── g1_audio_worker.py          # Native G1 AudioHub playback (separate process)
     │   │   ├── action_dispatcher_node.py   # (placeholder, empty) future robot-action node
-    │   │   ├── button_trigger_node.py      # F1/F3/START remote button mapping
+    │   │   ├── button_trigger_node.py      # F1/F3/START/SELECT remote button mapping
     │   │   └── robot_state_node.py         # Live robot state injection into the LLM
     │   ├── launch/
     │   │   ├── voice_sim.launch.py     # Dev machine (sounddevice mic, Python TTS)
@@ -209,6 +209,10 @@ unitree_converse/
     │       ├── test_copyright.py           # ament_copyright linter (skipped repo-wide)
     │       ├── test_flake8.py              # ament_flake8 linter
     │       └── test_pep257.py              # ament_pep257 (docstring) linter
+    ├── wakeword_training/                # Git submodule: wake-word training
+    │   ├── scripts/                      # generate / record / train / eval Aletta
+    │   ├── data/aletta/                  # Labeled training clips (WAV, 16 kHz)
+    │   └── models/                       # Trained ONNX models (aletta_v0.1.onnx)
     └── bob_llm/                        # LLM ROS2 node (submodule, Foxy-patched fork)
 ```
 
@@ -282,6 +286,7 @@ the same native audio worker.
 | `/g1/robot_state` | `std_msgs/String` | Live robot state |
 | `llm_prompt` | `std_msgs/String` | Enriched prompt (state + transcript) |
 | `llm_response` | `std_msgs/String` | LLM reply |
+| `/g1/voice/say_text` | `std_msgs/String` | Speak exact text (SELECT button / manual) |
 | `/g1/tts/status` | `std_msgs/String` | speaking/idle |
 | `/g1/button/status` | `std_msgs/String` | Button node status |
 
@@ -296,22 +301,36 @@ The `button_trigger_node` maps the Unitree wireless controller bitfield
 |--------|-----|-----------|--------|
 | **Hold F1** | bit 6 | 64 | Push-to-talk: records while held, transcribes on release |
 | **F3** (F2 on pad) | bit 7 | 128 | Toggle spoken output: mute/unmute the robot's replies |
-| **START** | bit 2 | 4 | Toggle continuous conversation mode on/off |
-
+| **START** | bit 2 | 4 | End the conversation session (kill switch — sessions start only via "Aletta") |
+| **SELECT** | bit 3 | 8 | Speak fixed custom phrase (`custom_say_text`, no STT/LLM) |
 > **Note:** There is no physical "F3" label on the pad — bit 7 is F2 in hardware
 > docs but is referred to as "F3" in older Unitree docs; this project keeps the
 > F3 name for that convention. Continuous mode was moved from F3 to START so F3
 > could be dedicated to the mute control.
 
----
+### Custom speech (SELECT)
+
+Pressing **SELECT** on the pad speaks one fixed phrase without involving speech recognition or the LLM. The text comes from the `custom_say_text` parameter (`/button_trigger_node` block in `voice_params*.yaml`) — edit the text there, no code change needed. The phrase travels on `/g1/voice/say_text`, is spoken with the correct PL/EN Piper voice, honours the F3 mute switch, and never re-triggers continuous listening. Test it without the pad:
+
+```bash
+ros2 topic pub --once /g1/voice/say_text std_msgs/msg/String "data: 'Hello! I am Aletta.'"
+```
 
 ## Conversation Modes
 
-### Wake phrase (real robot)
-The real-robot configuration currently runs in continuous conversation mode.
-It starts listening automatically after startup and listens for the next turn
-after each response. The wake listener is disabled in this profile so it cannot
-compete with STT for the UDP microphone stream.
+### Wake word (real robot) — "Aletta" only
+**By default the robot waits for the wake word "Aletta"** (or a controller-pad
+button) before it listens. It does not auto-listen at startup and there is no
+always-on mode: saying "Aletta" opens a **conversation session** — a window in
+which turns chain automatically (the end of one reply re-arms listening) — and
+the window closes itself after `session_silence_timeout` seconds (15 s by
+default) with no turn activity. START cannot open a session; it only ends one.
+
+The only voice trigger is the name **"Aletta"**, detected by a custom
+openWakeWord model on the G1 UDP microphone. There is no Whisper phrase
+matching (`hey robot` / `cześć robot` are gone) and no keyboard trigger —
+the only other way to drive the pipeline is the controller pad
+(F1 push-to-talk, SELECT custom phrase, F3 mute, START = session kill switch).
 
 The systemd service is configured with `Restart=always`, waits for the robot
 network and PulseAudio, and validates the installed ROS configuration, Piper
@@ -319,23 +338,18 @@ binary, and both language voice models before launching. After changing source
 or configuration files, rebuild and reload the service registration before
 testing a reboot.
 
-The default wake phrase is transcript-based because openWakeWord's built-in
-models do not include these phrases; changing a model name in YAML alone cannot
-create a new wake-word model. A **custom "Aletta" wake word** trained with
-openWakeWord is also supported — see [Custom "Aletta" wake word](#custom-aletta-wake-word)
-below.
+If the Aletta model file or the `openwakeword` package is missing,
+`wake_word_node` logs a loud error and **leaves wake disabled** — it never
+falls back to another backend. The pad buttons keep working, so the robot is
+still reachable (e.g. SELECT speaks the intro phrase).
 
-> **Mutually exclusive modes:** the wake-phrase workflow and the F1/START remote
-> workflow cannot run at the same time, because both need the single G1 UDP
-> microphone stream. The real profile runs purely in continuous (remote-managed)
-> mode with `wake_word_node` disabled (`use_udp_mic: false`); to use wake phrases
-> instead, enable the wake listener and drive it from the same mic rather than
-> also starting STT's UDP capture.
-
-Whisper's wake listener logs each non-empty recognition as `Wake phrase audio`.
-This makes it possible to distinguish a microphone/Whisper problem from a
-phrase-matching problem. The real-robot configuration also includes common
-accent-free Polish transcription variants such as `czesc robot`.
+> **Mic-stream note:** the wake listener and STT share the single G1 UDP
+> microphone stream by taking turns: the wake listener holds the socket while
+> the pipeline is idle, closes it when a trigger fires, and reopens it once
+> STT/LLM are done. While a conversation session is open, STT owns the
+> stream most of the time and the wake word is effectively quiet — the
+> session closes itself after 15 s of silence (or press START to end it
+> immediately), returning to wake-word-first operation.
 
 For conversation turns, automatic language detection is confidence-aware:
 high-confidence Polish or English results are accepted directly. Ambiguous
@@ -344,52 +358,127 @@ selected, avoiding accidental English-voice output for short Polish speech.
 
 ### Custom "Aletta" wake word
 
-The default `wake_detector: whisper` backend transcribes the microphone and
-matches a phrase. This is flexible but keeps a full ASR decoder busy on the
-wake channel. Setting `wake_detector: aletta` in `voice_params*.yaml` switches
-`wake_word_node` to a **custom openWakeWord model** trained on the robot's real
-name, "Aletta". It scores precomputed melspectrogram/embedding features instead
-of running Whisper, so it reacts faster and uses less CPU.
+The name **"Aletta" is the sole voice trigger.** `wake_word_node` loads a
+**custom openWakeWord model** trained on the robot's real name and streams
+80 ms frames of the UDP mic into it (no `wake_detector` switch — the Whisper
+phrase path was removed). openWakeWord scores precomputed
+melspectrogram/embedding features instead of running an ASR decoder, so it
+reacts faster and uses far less CPU.
 
-openWakeWord does not ship a pre-trained "Aletta" model, so you train one:
+openWakeWord does not ship a pre-trained "Aletta" model, so you train one.
+All training tooling lives in the **`src/wakeword_training` git submodule**
+(scripts, labeled data, trained models) — `setup.sh` initializes it
+automatically, or run `git submodule update --init --recursive` yourself.
+Run every command below from the submodule root:
 
-1. **Synthesize positive clips** with the robot's own Piper voice:
+```bash
+cd src/wakeword_training
+```
+
+1. **Synthesize clips** with the robot's own Piper voice — positives *and*
+   negatives. Negatives are mandatory: without them the model has nothing to
+   separate the wake word from and training aborts.
 
    ```bash
-   python3 scripts/generate_aletta_samples.py --count 30
+   python3 scripts/generate_aletta_samples.py --count 200 --negatives 300
    ```
 
-   This writes 16 kHz mono WAVs of "Aletta" (several phrasings, lightly
-   augmented) to `data/aletta/positive/`. Record your own **non-"Aletta"**
-   clips (room noise, other speech) into `data/aletta/negative/` — synthetic
-   negatives overfit badly.
+   Writes 16 kHz mono WAVs to `data/aletta/positive/` (several phrasings of
+   "Aletta", lightly augmented) and `data/aletta/negative/` (phonetically
+   similar words like "Alexa"/"Aleta", plus ordinary speech).
 
-2. **Train the model** (needs `torch`, so run it on a machine with PyTorch /
-   a GPU, not the robot):
+   > **Synthetic negatives only get you so far.** Every clip comes from one
+   > Piper voice, so a model trained on synthetic-only data learns "the robot's
+   > voice is speaking" as much as it learns the *name* — it wakes on ordinary
+   > speech. Record real audio (next step) and re-train.
+
+1b. **Record real audio** — this is what actually fixes the false-accept rate.
+   `record_aletta_audio.py` captures from the G1's UDP microphone into the same
+   directories, auto-trimming each take to the training window length:
+
+   ```bash
+   sudo systemctl stop unitree_converse.service   # MANDATORY, see below
+   python3 scripts/record_aletta_audio.py --label negative --count 20
+   python3 scripts/record_aletta_audio.py --label positive --count 20
+   sudo systemctl start unitree_converse.service
+   ```
+
+   For negatives, record whatever the robot really hears: room noise, your
+   voice, colleagues talking, near-misses like "Alexa"/"Aleta". For positives,
+   have several people say "Aletta" at different distances and speeds.
+
+   > **Stop the service first.** `wake_word_node` and `stt_node` bind the same
+   > multicast port with `SO_REUSEPORT`; with two sockets on one port the kernel
+   > *distributes* packets between them, so recording while the service runs
+   > corrupts both the pipeline's audio and your recordings.
+
+   Files land as `real_pos_NNNN.wav` / `real_neg_NNNN.wav`, numbered after any
+   existing clips, so synthetic and real audio coexist.
+
+2. **Train** (needs `torch` and openWakeWord's training extras):
 
    ```bash
    pip install openwakeword[full] torch torchvision torchaudio
-   python3 scripts/train_aletta_wakeword.py --output-dir ~/.local/share/openwakeword
+   python3 scripts/train_aletta_wakeword.py --steps 20000 \
+       --out ~/.local/share/openwakeword
    ```
 
-   This exports `aletta_v0.1.tflite` (+ `.onnx`). The default
-   `aletta_model_path` already points at
-   `~/.local/share/openwakeword/aletta_v0.1.tflite`.
+   Training runs on CPU (a few minutes for 20k steps); raise `--steps` once you
+   have real negatives. The script prints a **held-out** recall / false-accept
+   report at the end — read it before shipping the model.
+
+   openWakeWord 0.6.0 exports **ONNX only** (`convert_onnx_to_tflite` needs
+   `tensorflow` + `onnx_tf`, which are not installed on the robot), so the
+   output is `aletta_v0.1.onnx`. The default `aletta_model_path` and
+   `aletta_framework: "onnx"` in the configs already point at it. If you switch
+   to tflite later, keep `aletta_framework` and the model file extension in
+   sync — the base feature models must match the framework.
 
 3. `setup.sh` downloads openWakeWord's **base** feature models
    (melspectrogram + embedding — not bundled with the pip package) into
-   `~/.local/share/openwakeword/` and wires their paths into both configs.
+   `~/.local/share/openwakeword/`, where the detector finds them at runtime
+   (no paths are baked into the YAML configs). Both the `.onnx` and `.tflite`
+   variants are fetched, so either `aletta_framework` works.
 
 If the custom model or `openwakeword` package is unavailable, `wake_word_node`
-logs the reason and **falls back to Whisper automatically** — wake detection is
-never left disabled. Tune `aletta_threshold` (higher = fewer false wakes).
+logs a loud error and **leaves wake disabled — there is no fallback backend**.
+Pad buttons (F1/START/SELECT) keep working. Tune `aletta_threshold`
+(higher = fewer false wakes) using the held-out report from step 2.
+
+#### Runtime false-accept mitigations
+
+Independently of the model quality, `wake_word_node` applies two guards
+(both configurable in `voice_params*.yaml`):
+
+- **Consecutive-frame confirmation** (`min_consecutive_frames`, default 2):
+  a detection requires that many consecutive 80 ms frames at/above
+  `aletta_threshold`. Real utterances hold high scores for several frames;
+  single-spike false accepts rarely do. Costs ~80 ms per extra frame.
+- **TTS echo guard** (`echo_guard_sec`, default 1.5): while the robot is
+  speaking — and for the ring-down afterwards — the wake listener drains
+  mic audio **without scoring it**. The model is trained on the robot's own
+  Piper voice, so scoring its playback would be a guaranteed self-trigger.
+
+#### Evaluating a model before deploying it
+
+`scripts/eval_aletta_model.py` replays labeled clips through the exact
+detector the robot runs and prints recall / false-accept rates per
+threshold:
+
+```bash
+python3 scripts/eval_aletta_model.py \
+    --model ~/.local/share/openwakeword/aletta_v0.1.onnx \
+    --data data/aletta --sample 50
+```
+
+Deploy only when the negative false-accept column is ~0 at the chosen
+threshold; otherwise record real negatives and retrain (step 1b).
 
 ### Push-to-Talk (optional)
 Hold F1 while speaking → release → robot responds → done.
 
-### Continuous Mode
-Press **START** to toggle on → robot listens → responds → automatically listens again.
-Press **START** again to stop.
+### Conversation session (chained turns)
+Saying **"Aletta"** opens a session → robot listens → responds → automatically listens again, turn after turn. The session closes itself after 15 s without turn activity (`session_silence_timeout`), or immediately when you press **START**. START cannot open a session — only "Aletta" can.
 
 ### Mute (F3)
 Press **F3** at any time to mute/unmute the robot's spoken replies. While muted the
@@ -507,6 +596,17 @@ ros2 topic echo /g1/robot_state
     recording_duration: 8.0
     continuous_mode: false
 
+/wake_word_node:
+  ros__parameters:
+    aletta_model_path: "~/.local/share/openwakeword/aletta_v0.1.onnx"
+    aletta_framework: "onnx"
+    aletta_threshold: 0.85          # higher = fewer false wakes
+    min_consecutive_frames: 2       # reject single-spike false accepts
+    echo_guard_sec: 1.5             # ignore mic while TTS plays (+ ring-down)
+    session_silence_timeout: 15.0   # seconds of silence before the session closes
+    idle_listen_burst_sec: 1.5      # idle listener throttle (near-zero CPU)
+    idle_sleep_sec: 1.5
+
 /tts_node:
   ros__parameters:
     tts_mode: "binary"
@@ -617,7 +717,7 @@ ros2 launch g1_voice voice_sim.launch.py
 |-------|-----|
 | `bad_alloc` on launch | Service already running. Stop it, clear `/dev/shm/fastrtps_*`, relaunch. Or reboot. |
 | `cyclonedds.xml` must use `eth0` | If set to `wlan0` and WiFi not up at boot, DDS fails. Change `NetworkInterface` to `eth0`. |
-| openWakeWord uses ~10GB RAM | Disable with `use_wake_word: false`. Use F1 button instead. |
+| openWakeWord fails to load / wake should be off | Set `use_udp_mic: false` in `voice_params*.yaml` (or drop `wake_word_node` from the launch file). F1/START/SELECT pad buttons still work. |
 | Battery showing unknown | `BmsState` uses `unitree_hg` (not `unitree_go`) and needs QoS `RELIABLE`. |
 | Piper Python unavailable on aarch64 | Use standalone binary + sox pipeline (`g1_piper_tts`). |
 | Saxion WiFi AP isolation | Cannot SSH over WiFi. Use ethernet (`192.168.123.164`) or portable router. |

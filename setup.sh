@@ -28,7 +28,12 @@ fi
 
 # ── Common: Python deps ──────────────────────────────────────────
 echo ""
-echo "[1/6] Installing Python dependencies..."
+echo "[1/6] Initializing git submodules + installing Python dependencies..."
+# Submodules: src/bob_llm (LLM node) and src/wakeword_training (wake-word
+# training scripts/data). Non-fatal: training tooling is not needed for the
+# runtime pipeline, and a fresh clone may run before the training repo exists.
+git -C "$(dirname "$0")" submodule update --init --recursive \
+    || echo "WARNING: submodule init failed (training tools may be missing; runtime is unaffected)"
 if [ "$IS_ROBOT" == "true" ]; then
     pip3 install faster-whisper sounddevice soundfile tqdm filelock openwakeword
     sudo apt-get install -y sox portaudio19-dev
@@ -55,11 +60,21 @@ wget -q --show-progress \
     -O pl_PL-gosia-medium/pl_PL-gosia-medium.onnx.json
 cd -
 
-# ── faster-whisper base model (both machines) ────────────────────
+# ── faster-whisper base model + openWakeWord base models ───────
 echo ""
-echo "[3/6] Downloading faster-whisper base model..."
+echo "[3/6] Downloading faster-whisper + openWakeWord base models..."
 python3 -c "from faster_whisper import WhisperModel; WhisperModel('base', device='cpu', compute_type='int8')"
 echo "faster-whisper base model cached."
+
+# openWakeWord ships WITHOUT its base feature models (melspectrogram +
+# embedding) on a fresh pip install, so the custom "Aletta" wake word would
+# fail to load. Download them to a user-writable dir. The detector resolves
+# empty oww_* paths to this dir at runtime (see wake_word_openwakeword), so
+# no absolute paths are baked into the YAML configs.
+OWW_DIR="$HOME/.local/share/openwakeword"
+mkdir -p "$OWW_DIR"
+python3 -c "from openwakeword.utils import download_models; download_models(target_directory='$OWW_DIR')"
+echo "openWakeWord base models cached in $OWW_DIR"
 
 # ── Piper binary (Jetson only) ───────────────────────────────────
 if [ "$IS_ROBOT" == "true" ]; then
