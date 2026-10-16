@@ -113,9 +113,15 @@ class WakeWordNode(Node):
         self.false_accept_count = 0
         self.listening = True
         # True when the current open session was opened by a wake detection
-        # (not by a pad button). Used to detect false accepts when the
-        # session times out with no speech.
+        # (not by a pad button). Attribution survives session activity touches
+        # and is only cleared on close — the false-accept backoff needs it at
+        # close time, when deciding whether the wake session was productive.
         self.session_opened_by_wake = False
+        # True when the LLM started generating a reply during this session —
+        # proof of a real conversation (a hallucination turn with no LLM reply
+        # leaves it False, so consecutive no-reply wake sessions escalate the
+        # cooldown instead of being treated as activity).
+        self.session_had_llm_reply = False
         # Conversation session: False = idle wait (throttled listener, no
         # answers). "Aletta" opens it (START can only end it); 15 s of turn
         # silence closes it. Turn activity = trigger fired / STT/LLM/TTS busy.
@@ -163,6 +169,11 @@ class WakeWordNode(Node):
     def llm_status_callback(self, msg: String):
         self.llm_busy = msg.data == 'thinking'
         if self.llm_busy and self.session_open:
+            # A reply is being generated: this session is a real
+            # conversation, not a false accept. End the backoff streak.
+            self.session_had_llm_reply = True
+            self.false_accept_count = 0
+            self.cooldown = self.base_cooldown
             self._touch_session()
 
     def tts_status_callback(self, msg: String):
@@ -189,7 +200,6 @@ class WakeWordNode(Node):
     def _touch_session(self):
         """Mark turn activity (keeps the conversation window open)."""
         self.last_session_activity = time.time()
-        self.session_opened_by_wake = False
 
     def _open_session(self, source: str):
         """Open (or refresh) the conversation window on a valid entry."""
@@ -214,20 +224,27 @@ class WakeWordNode(Node):
             self.continuous_stop_pub.publish(msg)
         self.session_open = False
         self.last_session_activity = 0.0
-        # False-accept backoff: a wake-opened session that times out with no
-        # speech was almost certainly a false accept. Exponentially increase
-        # the cooldown so the idle storm slows down instead of firing every
-        # 8-12 s. Resets on any real session activity (_touch_session).
-        if self.session_opened_by_wake and 'silence' in reason:
+        # False-accept backoff: a wake-opened session that times out with NO
+        # LLM reply was almost certainly a false accept (or a hallucination
+        # turn nobody asked for). Exponentially increase the cooldown so the
+        # idle storm slows instead of re-firing every few seconds. A session
+        # that produced a reply is a real conversation: session_had_llm_reply
+        # stays True and no escalation happens (count was already reset when
+        # the reply started). The old condition only looked at 'no speech',
+        # but any STT/LLM/TTS busy touch cleared session_opened_by_wake
+        # within the first second — so the backoff never fired at all.
+        if (self.session_opened_by_wake and 'silence' in reason
+                and not self.session_had_llm_reply):
             self.false_accept_count += 1
             new_cooldown = self.base_cooldown * (
                 self.false_accept_backoff_multiplier ** self.false_accept_count)
             self.cooldown = min(new_cooldown, self.max_false_accept_cooldown)
             self.get_logger().warn(
                 f'False accept #{self.false_accept_count} — session timed '
-                f'out with no speech, cooldown back off to '
+                f'out with no reply, cooldown back off to '
                 f'{self.cooldown:.0f}s')
         self.session_opened_by_wake = False
+        self.session_had_llm_reply = False
         self.get_logger().info(
             f'Conversation session CLOSED ({reason}) — '
             'say "Aletta" to start again')
@@ -260,8 +277,16 @@ class WakeWordNode(Node):
                 'Trigger blocked — pipeline busy or cooldown active')
             return
         self.last_trigger_time = time.time()
-        self.cooldown = self.base_cooldown
-        self.false_accept_count = 0
+        if source != 'aletta_wake_word':
+            # Pad button = a human is present and wants the robot: clear the
+            # backoff so a manual press is never throttled. Wake fires keep
+            # the streak: consecutive no-reply wake sessions accumulate
+            # (8→16→32→60s). The old unconditional reset here restarted the
+            # streak on every false accept, so the cooldown could never
+            # exceed 16s — the observed ~25s session cadence of 2026-10-16.
+            # The streak resets on a real reply (llm_status_callback) instead.
+            self.cooldown = self.base_cooldown
+            self.false_accept_count = 0
         self._open_session(source)
         self.session_opened_by_wake = (source == 'aletta_wake_word')
         self.listening = False

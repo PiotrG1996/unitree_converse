@@ -84,6 +84,18 @@
     # confident real speech clusters at 0.90-1.00 and is unaffected.
     language_detection_min_probability: 0.75
 
+    # Duel safety (2026-10-16 incident: noise turned into Polish replies).
+    # A forced-language candidate may replace the auto pass only when its
+    # score beats the auto pass by this margin (logprob units). Evidence:
+    # 5/7 duels returned pl when auto said en (incl. en probability=0.75),
+    # because forced-pl decodes of non-speech loop long and confidently.
+    # Genuine forced-language separation on real speech far exceeds 0.25.
+    language_duel_override_margin: 0.25
+    # Publish floor: transcripts whose kept segments average below this
+    # avg_logprob are dropped (extreme Whisper garbage only). Logged on
+    # every publish — tighten from the logs once enough turns are collected.
+    min_publish_avg_logprob: -2.5
+
 
 /wake_word_node:
   ros__parameters:

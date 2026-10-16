@@ -58,6 +58,7 @@ class _FakeSttNode:
         self.max_no_speech_prob = 0.5
         self.language = 'auto'
         self.language_detection_min_probability = 0.75
+        self.language_duel_override_margin = 0.25
         self._transcribe_calls = []
         # Bind the real STTNode helpers as instance methods so
         # _transcribe_with_language_fallback exercises the production code.
@@ -65,6 +66,8 @@ class _FakeSttNode:
             _stt_module.STTNode._has_speech(self, segments))
         self._transcription_score = lambda segments: (
             _stt_module.STTNode._transcription_score(segments))
+        self._looks_like_noise = lambda text: (
+            _stt_module.STTNode._looks_like_noise(text))
 
     def get_logger(self):
         harness = self
@@ -181,6 +184,73 @@ class TestSkipDuelOnNoSpeech(unittest.TestCase):
         info = _Info('en', 0.98)
         node, _segments, _info_out = self._run_fallback(speech, info)
         self.assertEqual(node._transcribe_calls, [None])
+
+
+class TestDuelMarginAndNoiseGuard(unittest.TestCase):
+    """
+    Regression: the pl/en duel must never flip a noise/auto turn to Polish.
+
+    Two guards, both added after the 2026-10-16 incident (5/7 duels returned
+    pl when auto said en; one at en probability=0.75):
+      * hallucination-like candidates (forced-pl loops on non-speech) are
+        disqualified before scoring — the loop wins length AND avg_logprob,
+        so scoring alone can never be trusted;
+      * a clean candidate may replace the auto pass only when it beats the
+        auto score by ``language_duel_override_margin``.
+    """
+
+    def _run_fallback(self, auto_segments, auto_info, forced):
+        node = _FakeSttNode()
+
+        def _fake_transcribe(audio, language=None):
+            node._transcribe_calls.append(language)
+            if language is None:
+                return auto_segments, auto_info
+            return forced.get(language, []), _Info()
+
+        node._transcribe = _fake_transcribe
+        segments, info = _stt_module.STTNode._transcribe_with_language_fallback(
+            node, 'audio')
+        return node, segments, info
+
+    def test_noisy_pl_loop_disqualified_auto_kept(self):
+        # Auto pass: clean-ish English below the confidence gate -> duel runs.
+        auto = [_Seg('Hello there my friend', 0.10, -0.60)]
+        info = _Info('en', 0.56)
+        # Forced pl returns the classic repetition loop; forced en is empty.
+        pl_loop = [_Seg('że to jest to, że to jest to, że to jest to,', 0.10,
+                        -0.20)]
+        node, segments, _info_out = self._run_fallback(auto, info, {'pl': pl_loop})
+        self.assertEqual(node._transcribe_calls, [None, 'pl', 'en'])
+        self.assertEqual(segments, auto)
+        self.assertTrue(any('keeping auto' in m for _lvl, m in node.logged))
+
+    def test_clean_pl_beats_auto_by_margin(self):
+        # Auto picked English on real Polish-quality audio (short, low
+        # confidence); the forced pl decode is clean and scores far better.
+        auto = [_Seg('the of and', 0.10, -1.40)]
+        info = _Info('en', 0.56)
+        pl = [_Seg('Cześć, jak się masz dzisiaj?', 0.10, -0.30)]
+        node, segments, _info_out = self._run_fallback(auto, info, {'pl': pl})
+        self.assertEqual(segments, pl)
+        self.assertTrue(any('selected=pl' in m for _lvl, m in node.logged))
+
+    def test_candidate_within_margin_keeps_auto(self):
+        # A marginally better pl decode must NOT override a decent auto pass
+        # (the flip that produced Polish answers from English speech/noise).
+        auto = [_Seg('Hello there my friend', 0.10, -0.60)]
+        info = _Info('en', 0.56)
+        pl = [_Seg('Witaj, przyjacielu', 0.10, -0.70)]
+        node, segments, _info_out = self._run_fallback(auto, info, {'pl': pl})
+        self.assertEqual(segments, auto)
+        self.assertTrue(any('keeping auto' in m for _lvl, m in node.logged))
+
+    def test_all_candidates_empty_keeps_auto(self):
+        auto = [_Seg('Hello there my friend', 0.10, -0.60)]
+        info = _Info('en', 0.56)
+        node, segments, _info_out = self._run_fallback(auto, info, {})
+        self.assertEqual(segments, auto)
+        self.assertEqual(node._transcribe_calls, [None, 'pl', 'en'])
 
 
 class TestWithinWordRepetition(unittest.TestCase):

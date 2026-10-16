@@ -97,6 +97,17 @@ class STTNode(Node):
         self.declare_parameter('boot_kick_delay', 0.0)
         self.declare_parameter('max_no_speech_prob', 0.5)
         self.declare_parameter('language_detection_min_probability', 0.55)
+        # Duel override margin: a forced-language candidate may replace the
+        # automatic pass only when its score beats the auto pass by this much
+        # (logprob units). Without a margin the blind max() flips noise turns
+        # to Polish: on 2026-10-16, 5 of 7 duels returned pl even when
+        # auto said en (once at en probability=0.75). Real forced-language
+        # separation on genuine speech is far larger than 0.25.
+        self.declare_parameter('language_duel_override_margin', 0.25)
+        # Publish floor: drop transcripts whose kept segments average below
+        # this avg_logprob — only extreme Whisper garbage trips it. The value
+        # is logged on every publish so it can be tightened with data.
+        self.declare_parameter('min_publish_avg_logprob', -2.5)
 
         self.model_size = self._param('model_size')
         self.language = self._param('language')
@@ -115,6 +126,9 @@ class STTNode(Node):
         self.max_no_speech_prob = self._param('max_no_speech_prob')
         self.language_detection_min_probability = self._param(
             'language_detection_min_probability')
+        self.language_duel_override_margin = self._param(
+            'language_duel_override_margin')
+        self.min_publish_avg_logprob = self._param('min_publish_avg_logprob')
 
         self.is_recording = False
         self.stop_requested = False
@@ -388,11 +402,26 @@ class STTNode(Node):
                 self.get_logger().info(
                     f'Ignored noise/hallucination transcript: "{transcript}"')
             elif transcript:
-                self.get_logger().info(f'Transcript: "{transcript}"')
-                msg = String()
-                msg.data = f'[USER_LANGUAGE:{detected_language}]\n{transcript}'
-                self.transcript_pub.publish(msg)
-                self._transcript_published = True
+                mean_logprob = float(np.mean([
+                    getattr(s, 'avg_logprob', -10.0) for s in kept]))
+                if mean_logprob < self.min_publish_avg_logprob:
+                    # Extreme-garbage floor; the value is logged on every
+                    # publish so the threshold can be tightened from data.
+                    self.get_logger().warn(
+                        f'Dropped low-confidence transcript '
+                        f'(avg_logprob={mean_logprob:.2f} < '
+                        f'{self.min_publish_avg_logprob:.2f}): '
+                        f'"{transcript}"')
+                    transcript = ''
+                else:
+                    self.get_logger().info(
+                        f'Transcript: "{transcript}" '
+                        f'(avg_logprob={mean_logprob:.2f})')
+                    msg = String()
+                    msg.data = (
+                        f'[USER_LANGUAGE:{detected_language}]\n{transcript}')
+                    self.transcript_pub.publish(msg)
+                    self._transcript_published = True
             else:
                 self.get_logger().warn('Empty transcript — nothing detected')
 
@@ -468,13 +497,48 @@ class STTNode(Node):
         for language in ('pl', 'en'):
             candidates[language] = self._transcribe(audio_data, language)
 
-        best_language = max(
-            candidates,
-            key=lambda language: self._transcription_score(candidates[language][0]))
+        # Score the auto pass too: a forced candidate may replace it only
+        # with a clear margin (language_duel_override_margin). The old blind
+        # max() picked Polish for noise turns — forced-pl decodes of non-
+        # speech loop into long, confident (high-avg_logprob) text that beat
+        # short English garbage on BOTH terms of _transcription_score
+        # (observed 2026-10-16: 5/7 duels returned pl when auto said en).
+        auto_score = self._transcription_score(auto_segments)
+
+        scored = {}
+        for language, (segments, _info) in candidates.items():
+            joined = ' '.join(s.text.strip() for s in segments).strip()
+            if self._looks_like_noise(joined):
+                # Hallucination loops never win — they would win on length
+                # and predictability, exactly the noise-vs-en failure mode.
+                scored[language] = None
+                continue
+            scored[language] = self._transcription_score(segments)
+
+        best_language = None
+        best_score = float('-inf')
+        for language, score in scored.items():
+            if score is not None and score > best_score:
+                best_language, best_score = language, score
+
+        scores_desc = ' | '.join(
+            f'{language}=' + ('disqualified' if score is None
+                              else f'{score:.2f}')
+            for language, score in scored.items())
+        margin = self.language_duel_override_margin
+
+        if best_language is None or best_score < auto_score + margin:
+            self.get_logger().info(
+                f'Duel: auto={detected or "unknown"} '
+                f'(probability={probability:.2f}) score={auto_score:.2f} | '
+                f'{scores_desc} -> keeping auto (margin {margin:.2f})')
+            return auto_segments, auto_info
+
         best_segments, best_info = candidates[best_language]
         self.get_logger().info(
-            f'Language fallback: auto={detected or "unknown"} '
-            f'(probability={probability:.2f}), selected={best_language}')
+            f'Duel: auto={detected or "unknown"} '
+            f'(probability={probability:.2f}) score={auto_score:.2f} | '
+            f'{scores_desc} -> selected={best_language}')
         return best_segments, best_info
 
     def _has_speech(self, segments) -> bool:
