@@ -1,0 +1,9 @@
+# Workspace-wide colcon defaults.
+#
+# Force the pytest runner for `colcon test`. The automatic runner selection
+# (colcon_core.task.python.test.pytest) matches on setup.py `tests_require`,
+# but setuptools >= 60 (installed in user site) silently drops that keyword,
+# so colcon would fall back to `python -m unittest`, which discovers 0 tests
+# in this pytest-style suite and reports success vacuously.
+test:
+  python-testing: pytest
