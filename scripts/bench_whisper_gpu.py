@@ -66,7 +66,7 @@ def load_audio_duration(path):
 
 
 def _parse_child_output(stdout):
-    """Parse the single 'RESULT\\t...' line printed by run_child()."""
+    r"""Parse the single 'RESULT\t...' line printed by run_child()."""
     for line in stdout.splitlines():
         if line.startswith('RESULT\t'):
             parts = line.split('\t')

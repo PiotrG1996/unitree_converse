@@ -54,6 +54,16 @@ def generate_launch_description():
             parameters=[params_file],
         ),
 
+        # Gamepad SELECT → fixed-phrase speech via /g1/voice/say_text.
+        # Same wiring as voice_real so SELECT is testable in sim.
+        Node(
+            package='g1_voice',
+            executable='button_trigger_node',
+            name='button_trigger_node',
+            output='screen',
+            parameters=[params_file],
+        ),
+
         # Robot state - enriches transcripts with battery/IMU/network context.
         # Degrades safely to "unknown" when the Unitree state topics are absent
         # (as on a dev machine), matching the real-robot pipeline wiring.

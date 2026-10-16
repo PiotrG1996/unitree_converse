@@ -94,7 +94,9 @@ class TTSNode(Node):
                 '~/.local/share/piper/pl_PL-gosia-medium/pl_PL-gosia-medium.onnx'))
         self.declare_parameter('use_cuda', True)
         self.declare_parameter('output_device', -1)
-        self.declare_parameter('continuous_mode', True)
+        # Default OFF to match stt_node: after a reply the pipeline goes back
+        # to waiting for "Aletta" (or a pad press). START re-arms the loop.
+        self.declare_parameter('continuous_mode', False)
         self.declare_parameter('output_sample_rate', 44100)
         self.declare_parameter('network_interface', 'eth0')
         self.declare_parameter('tts_mode', 'binary')  # 'python' or 'binary'
@@ -177,6 +179,7 @@ class TTSNode(Node):
         # after that is ignored so a late chunk can never leak into the
         # next turn (which would speak stale text, in either language).
         self._turn_open = False
+        self._turn_had_transcript = False
 
         self.voice = None
         self.polish_voice = None
@@ -203,6 +206,8 @@ class TTSNode(Node):
         self.create_subscription(Bool, '/g1/voice/continuous_start', self._continuous_start_cb, 10)
         self.create_subscription(Bool, '/g1/voice/continuous_stop', self._continuous_stop_cb, 10)
         self.create_subscription(Bool, '/g1/voice/speak_enable', self._speak_enable_cb, 10)
+        self.say_sub = self.create_subscription(
+            String, '/g1/voice/say_text', self.say_text_callback, 10)
 
         self.status_pub = self.create_publisher(String, '/g1/tts/status', 10)
         self.trigger_pub = self.create_publisher(Bool, '/g1/voice/trigger', 10)
@@ -316,6 +321,27 @@ class TTSNode(Node):
             self._speech_queue.put((language, reply))
             self._speech_queue.put(_TURN_END)
 
+    def say_text_callback(self, msg: String):
+        """
+        Speak exact text published on /g1/voice/say_text.
+
+        Manual speech path (e.g. SELECT pad button): bypasses STT/LLM and the
+        streaming turn state entirely. The line is queued behind any in-flight
+        reply and never emits _TURN_END, so continuous mode is not retriggered.
+        Mute (F3 / speak_enable) is honoured downstream in _speak().
+        """
+        text = (msg.data or '').strip()
+        if not text:
+            return
+        language, text = self._language_and_text(text)
+        if not text:
+            self.get_logger().warning('Ignoring empty say_text after language marker')
+            return
+        self._warn_on_language_mismatch(text, language)
+        preview = f'"{text[:80]}..."' if len(text) > 80 else f'"{text}"'
+        self.get_logger().info(f'Speaking custom say_text: {preview}')
+        self._speech_queue.put((language, text))
+
     def _normalize(self, audio: np.ndarray, target: float = 0.9) -> np.ndarray:
         """
         Scale audio so its peak sits at `target`.
@@ -394,13 +420,17 @@ class TTSNode(Node):
     def _process_queue_item(self, item) -> bool:
         """Consume one speech-queue item. Returns True if it was _TURN_END."""
         if item is _TURN_END:
-            # End of turn: re-trigger continuous listening once.
-            if self.continuous_mode:
+            # End of turn: re-trigger continuous listening once, but only if
+            # the previous turn actually had a valid user transcript. This
+            # prevents the infinite noise-recording loop when a false accept
+            # opens a session and STT gets only silence/ambient noise.
+            if self.continuous_mode and self._turn_had_transcript:
                 time.sleep(0.5)
                 trigger = Bool()
                 trigger.data = True
                 self.trigger_pub.publish(trigger)
                 self.get_logger().info('Continuous mode — auto-triggering next turn')
+            self._turn_had_transcript = False
             return True
         language, text = item
         self._speak(text, language)
@@ -462,6 +492,7 @@ class TTSNode(Node):
             # the first streamed sentence(s) of each turn are spoken with the
             # PREVIOUS turn's language voice.
             self._turn_language = language
+            self._turn_had_transcript = True
             self._reset_turn()
 
     def _language_and_text(self, text: str):
@@ -516,6 +547,7 @@ class TTSNode(Node):
         self._stream_saw_chunk = False
         self._stream_spoken = 0
         self._turn_open = True
+        self._turn_had_transcript = False
 
     def stream_callback(self, msg: String):
         """

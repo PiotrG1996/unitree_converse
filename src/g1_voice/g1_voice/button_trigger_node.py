@@ -1,7 +1,6 @@
 import rclpy
 from rclpy.node import Node
 from std_msgs.msg import Bool, String
-import threading
 import time
 
 # Unitree WirelessController bitfield (from unitree_sdk2 advanced_gamepad):
@@ -14,9 +13,12 @@ import time
 F1_KEY = 64
 # bit 7 F2 (called "F3" in older Unitree docs): toggle speaking enabled/muted
 F3_KEY = 128
-# bit 2 START: toggle continuous listening mode (moved off F3 so F3 can be
-# dedicated to the speaking mute control)
+# bit 2 START: end the conversation session (kill switch — sessions open only
+# via "Aletta"; moved off F3 so F3 could be dedicated to the mute control)
 START_KEY = 4
+# bit 3 SELECT: speak one fixed custom phrase (custom_say_text) via TTS,
+# bypassing STT/LLM. Free in this pipeline (F1/F3/START are taken).
+SELECT_KEY = 8
 
 DEBOUNCE_TIME = 0.25  # seconds — de-bounce the switch but allow fast double-taps
 
@@ -30,10 +32,29 @@ class ButtonTriggerNode(Node):
         self.f1_pressed = False
         self.f3_pressed = False
         self.start_pressed = False
+        self.select_pressed = False
         self.recording_active = False
         self.prev_keys = 0
         self.last_f3_time = 0.0    # for debouncing the speaking mute toggle
         self.last_start_time = 0.0  # for debouncing the continuous-mode toggle
+        self.last_select_time = 0.0  # for debouncing the custom-say trigger
+
+        # Long default split across string literals to stay under the 99-col
+        # flake8 limit; the YAML configs override it anyway.
+        self.declare_parameter(
+            'custom_say_text',
+            'Hello! I am Aletta, a humanoid robot assistant at '
+            'Poznan University of Technology. I am here to support '
+            'researchers, students, and academic staff in their daily '
+            'activities. I can assist with research-related tasks, provide '
+            'information, answer questions, and help you explore new ideas '
+            'in science and technology. Whether you are conducting research, '
+            'working on a project, or simply curious about robotics and '
+            'artificial intelligence, I am happy to help. My goal is to make '
+            'your work easier, support scientific collaboration, and contribute '
+            'to an innovative research environment. Welcome to Poznan '
+            'University of Technology! How can I assist you today?')
+        self.custom_say_text = self.get_parameter('custom_say_text').value
 
         # Publishers
         self.trigger_pub = self.create_publisher(Bool, '/g1/voice/trigger', 10)
@@ -41,6 +62,7 @@ class ButtonTriggerNode(Node):
         self.continuous_start_pub = self.create_publisher(Bool, '/g1/voice/continuous_start', 10)
         self.continuous_stop_pub = self.create_publisher(Bool, '/g1/voice/continuous_stop', 10)
         self.speak_enable_pub = self.create_publisher(Bool, '/g1/voice/speak_enable', 10)
+        self.say_pub = self.create_publisher(String, '/g1/voice/say_text', 10)
         self.status_pub = self.create_publisher(String, '/g1/button/status', 10)
 
         from unitree_go.msg import WirelessController
@@ -54,7 +76,8 @@ class ButtonTriggerNode(Node):
         self.get_logger().info('Button trigger node ready')
         self.get_logger().info('Hold F1 → push-to-talk (release to send)')
         self.get_logger().info('F3 → toggle speaking enabled/muted (robot TTS output)')
-        self.get_logger().info('START → toggle continuous listening mode')
+        self.get_logger().info('START → end conversation session (kill switch)')
+        self.get_logger().info('SELECT → speak custom phrase (custom_say_text)')
 
         # Publish the initial speaking-enabled state so subscribers can sync
         # (TTS defaults to enabled too, so this is belt-and-suspenders).
@@ -68,21 +91,33 @@ class ButtonTriggerNode(Node):
         f1_now = bool(keys & F1_KEY)
         f3_now = bool(keys & F3_KEY)
         start_now = bool(keys & START_KEY)
+        select_now = bool(keys & SELECT_KEY)
         f1_prev = bool(prev & F1_KEY)
         f3_prev = bool(prev & F3_KEY)
         start_prev = bool(prev & START_KEY)
+        select_prev = bool(prev & SELECT_KEY)
 
         self.f1_pressed = f1_now
         self.f3_pressed = f3_now
         self.start_pressed = start_now
+        self.select_pressed = select_now
 
-        # START rising edge with debounce → toggle continuous listening mode. The
-        # toggle runs synchronously so a press is never dropped by a slow worker.
+        # START rising edge with debounce → end the session (kill switch: the
+        # press only stops, never starts). Handled synchronously so it is
+        # never dropped by a slow worker.
         if start_now and not start_prev:
             now = time.time()
             if now - self.last_start_time > DEBOUNCE_TIME:
                 self.last_start_time = now
                 self._toggle_continuous()
+            return
+
+        # SELECT rising edge with debounce → speak the fixed custom phrase.
+        if select_now and not select_prev:
+            now = time.time()
+            if now - self.last_select_time > DEBOUNCE_TIME:
+                self.last_select_time = now
+                self._publish_say_text()
             return
 
         # F3 rising edge with debounce → toggle speaking enabled/muted.
@@ -108,26 +143,20 @@ class ButtonTriggerNode(Node):
             self._publish_status('transcribing')
 
     def _toggle_continuous(self):
+        # Continuous conversation is Aletta-only (wake_word_node owns
+        # /g1/voice/continuous_start). START can no longer START a session —
+        # it only ends one, acting as a manual kill switch mid-conversation.
         if self.continuous_mode:
             self.continuous_mode = False
             msg = Bool()
             msg.data = True
             self.continuous_stop_pub.publish(msg)
-            self.get_logger().info('Continuous mode OFF')
+            self.get_logger().info('Continuous mode OFF (manual stop)')
             self._publish_status('continuous_off')
         else:
-            self.continuous_mode = True
-            msg = Bool()
-            msg.data = True
-            self.continuous_start_pub.publish(msg)
-            self.get_logger().info('Continuous mode ON')
-            self._publish_status('continuous_on')
-            # Fire the first trigger shortly after, off the ROS callback thread.
-            threading.Thread(target=self._delayed_first_trigger, daemon=True).start()
-
-    def _delayed_first_trigger(self):
-        time.sleep(0.5)
-        self._publish_trigger(True)
+            self.get_logger().info(
+                'START ignored — continuous mode starts only via "Aletta"')
+            self._publish_status('continuous_blocked')
 
     def _toggle_speak_enable(self):
         self.speak_enabled = not self.speak_enabled
@@ -143,6 +172,17 @@ class ButtonTriggerNode(Node):
         msg = Bool()
         msg.data = value
         self.trigger_pub.publish(msg)
+
+    def _publish_say_text(self):
+        text = (self.custom_say_text or '').strip()
+        if not text:
+            self.get_logger().warning('SELECT pressed but custom_say_text is empty')
+            return
+        msg = String()
+        msg.data = text
+        self.say_pub.publish(msg)
+        self.get_logger().info(f'SELECT → speaking custom phrase ({len(text)} chars)')
+        self._publish_status('custom_say')
 
     def _publish_speak_enable(self, value: bool):
         msg = Bool()

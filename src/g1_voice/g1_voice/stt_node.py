@@ -83,9 +83,18 @@ class STTNode(Node):
         self.declare_parameter('udp_multicast_group', '239.168.123.161')
         self.declare_parameter('udp_port', 5555)
         self.declare_parameter('udp_local_ip', '192.168.123.164')
-        self.declare_parameter('continuous_mode', True)
-        self.declare_parameter('watchdog_interval', 2.0)
-        self.declare_parameter('boot_kick_delay', 6.0)
+        # WAKE-WORD GATED BY DEFAULT: the robot waits for "Aletta"
+        # (wake_word_node) or an explicit pad press (F1/START). It must NOT
+        # auto-listen on boot and must NOT answer background speech.
+        # Continuous always-on listening is opt-in at runtime via START.
+        self.declare_parameter('continuous_mode', False)
+        # Idle watchdog interval (continuous mode only). In gated mode no
+        # watchdog is armed, so the wait costs ~zero CPU.
+        self.declare_parameter('watchdog_interval', 15.0)
+        # Boot auto-listen delay. 0/disabled by default so the robot boots
+        # into "waiting for Aletta" instead of recording immediately.
+        # Only honoured when continuous_mode is True at startup.
+        self.declare_parameter('boot_kick_delay', 0.0)
         self.declare_parameter('max_no_speech_prob', 0.5)
         self.declare_parameter('language_detection_min_probability', 0.55)
 
@@ -155,14 +164,15 @@ class STTNode(Node):
         self.get_logger().info(f'STT node ready — mic: {mic_mode}')
         self.get_logger().info(f'Continuous mode: {self.continuous_mode}')
 
-        # Always-on (continuous) machinery is OPT-IN and only armed when
-        # continuous_mode is True (e.g. enabled at runtime via the START button).
-        # In the default push-to-talk mode (continuous_mode False) the robot only
-        # listens after F1 is held, and never re-arms itself -- so it will NOT
-        # answer on its own, which is the desired default behaviour.
+        # Always-on (continuous) machinery is strictly OPT-IN: it is armed ONLY
+        # when continuous_mode is True (e.g. enabled at runtime via the START
+        # button). In the default wake-word-gated mode (False) the robot only
+        # listens after "Aletta" or F1 is held, and NEVER re-arms itself — so
+        # it will NOT answer on its own. Boot auto-listen is disabled unless
+        # boot_kick_delay > 0 AND continuous_mode is True.
         self._watchdog = None
         self._watchdog_lock = threading.Lock()
-        if self.continuous_mode:
+        if self.continuous_mode and self.boot_kick_delay > 0:
             # Keep the always-on conversation loop alive: after each recording
             # pass, if nobody advanced the loop (no reply came back through the
             # TTS node), re-trigger ourselves so the robot keeps listening. This
@@ -171,7 +181,8 @@ class STTNode(Node):
             self._schedule_self_retrigger(self.watchdog_interval)
 
             # Kick off the very first turn shortly after startup so the robot
-            # starts answering immediately, without waiting for any button press.
+            # starts answering immediately, without waiting for any button press
+            # (continuous mode only — never in wake-gated mode).
             self._start_kick = self.create_timer(
                 self.boot_kick_delay, self._boot_kick_cb)
         else:
@@ -398,7 +409,7 @@ class STTNode(Node):
         # TTS owns the healthy continuous-mode handoff after a valid transcript.
         # Do not let the watchdog start a second turn while the LLM is still
         # generating the response for this turn.
-        if self.continuous_mode and not self._transcript_published:
+        if self.continuous_mode and self._transcript_published:
             self._schedule_self_retrigger()
 
     def _transcribe(self, audio_data, language=None):
