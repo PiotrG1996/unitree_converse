@@ -98,10 +98,13 @@ def _resolve_path(value, default_filename=''):
         if not default_filename:
             return ''
         return os.path.join(DEFAULT_MODEL_DIR, default_filename)
-    expanded = os.path.expandvars(os.path.expanduser(str(value)))
-    if not os.path.isabs(expanded):
-        return os.path.join(DEFAULT_MODEL_DIR, expanded)
-    return expanded
+    # An explicit path (even relative) is honoured as given: it is resolved
+    # against the CWD by openWakeWord/the caller. Only EMPTY paths fall back to
+    # the default dir — prepending it to relative paths broke
+    # `eval_aletta_model.py --model models/aletta_v0.1.onnx`, which silently
+    # rewrote the path to ~/.local/share/openwakeword/models/... and made the
+    # eval error out with "model not found" (so nothing got deploy-gated).
+    return os.path.expandvars(os.path.expanduser(str(value)))
 
 
 def base_model_paths(framework, melspec_path='', embedding_path=''):

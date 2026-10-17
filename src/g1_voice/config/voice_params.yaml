@@ -19,12 +19,17 @@
     recording_duration: 5.0
     silence_threshold: 0.01
     silence_duration: 1.5
-    max_no_speech_prob: 0.5
+    # Raised 0.5 -> 0.7: live logs show real uncertain English speech at
+    # no_speech_prob ~0.52 being dropped. 0.7 keeps those while still
+    # blocking high-confidence noise (>0.7).
+    max_no_speech_prob: 0.7
     language_detection_min_probability: 0.55
     # See voice_params_real.yaml for the rationale (duel margin + publish
     # floor — guard against noise being decoded as Polish/English replies).
     language_duel_override_margin: 0.25
-    min_publish_avg_logprob: -2.5
+    # Raised from -2.5 to -11.0: real speech on a noisy mic feed decodes at
+    # low avg_logprob (~-10). Keep it; block only extreme garbage (< -11).
+    min_publish_avg_logprob: -11.0
 
 /wake_word_node:
   ros__parameters:
@@ -63,11 +68,6 @@
     # activity. Slows the idle storm from ~1/8-12s to ~1/min+.
     false_accept_backoff_multiplier: 2.0
     max_false_accept_cooldown: 60.0
-    # Session behaviour: "Aletta" (only trigger) opens a continuous
-    # conversation window; it closes after session_silence_timeout seconds
-    # with no turn activity. Raised from 8 to 20 so the full STT->LLM->TTS
-    # pipeline completes before the window closes.
-    session_silence_timeout: 20.0
 
 /button_trigger_node:
   ros__parameters:
@@ -87,3 +87,4 @@
     # word node enables the listen-again loop when a session opens.
     continuous_mode: false
     tts_mode: "python"                        # 'python' (piper pip pkg) or 'binary' (standalone piper)
+

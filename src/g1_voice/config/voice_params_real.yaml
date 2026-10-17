@@ -71,11 +71,20 @@
     recording_duration: 8.0
     silence_threshold: 0.008
 
-    # Benchmark 0.45 against 0.60 seconds for turn-taking.
-    silence_duration: 0.45
+    # Turn-taking: stop early on trailing silence so the pipeline answers
+    # promptly. 1.0s (was 0.45s) so mid-utterance pauses between words do
+    # not truncate the clip into a fragment Whisper decodes as no-speech.
+    # Cost of the longer tail on a pure-noise turn is ~0.5s of extra audio.
+    silence_duration: 1.0
 
     # Tune with recorded speech and silence samples.
-    max_no_speech_prob: 0.5
+    # Raised 0.5 -> 0.7: live logs show real uncertain English speech at
+    # no_speech_prob ~0.52 being dropped ("But accessification was accessible
+    # to me.", "Well, only smart engineers."). 0.7 keeps those while still
+    # blocking high-confidence noise (>0.7). The min_publish_avg_logprob
+    # floor (-2.5) and language duel provide a second line of defence against
+    # pure noise leaking through.
+    max_no_speech_prob: 0.7
     # 0.55 was too permissive: Whisper's silence/noise floor is en@0.55-0.57
     # (observed 153x on 2026-10-13), and real uncertain speech lands in
     # 0.55-0.74 too. Anything at/above the gate skips the pl/en duel, so
@@ -92,9 +101,14 @@
     # Genuine forced-language separation on real speech far exceeds 0.25.
     language_duel_override_margin: 0.25
     # Publish floor: transcripts whose kept segments average below this
-    # avg_logprob are dropped (extreme Whisper garbage only). Logged on
-    # every publish — tighten from the logs once enough turns are collected.
-    min_publish_avg_logprob: -2.5
+    # avg_logprob are dropped. Raised from -2.5 to -11.0: live logs show real
+    # English speech ("That's nice warm...", "That piece went into the next one.")
+    # at avg_logprob ~-10.0 being dropped because the UDP mic feed is noisy and
+    # Whisper is uncertain. -11.0 keeps noisy-but-real speech while still
+    # blocking extreme garbage (avg_logprob < -11, e.g. -15, -20 on pure noise).
+    # The _looks_like_noise gate and language duel provide a second line of
+    # defence against noise leaking through.
+    min_publish_avg_logprob: -11.0
 
 
 /wake_word_node:
@@ -131,14 +145,7 @@
     udp_multicast_group: "239.168.123.161"
     udp_port: 5555
     udp_local_ip: "192.168.123.164"
-    # Session behaviour: "Aletta" (only trigger) opens a continuous
-    # conversation window; it closes after session_silence_timeout seconds
-    # with no turn activity. Raised from 8 to 20 so the full STT->LLM->TTS
-    # pipeline completes before the window closes.
-    session_silence_timeout: 20.0
-    # Idle (session closed) listener throttle: score a short burst, sleep,
-    # repeat — keeps the wait state near zero CPU.
-    idle_listen_burst_sec: 1.5
+
     idle_sleep_sec: 1.5
     # RMS energy gate: frames below this int16 RMS are skipped before ONNX
     # scoring. 300 rejects quiet room noise/HVAC that the synthetic model
@@ -188,4 +195,5 @@
     piper_lib_dir: "/home/unitree/.local/piper-bin"
 
     network_interface: "eth0"
+
 

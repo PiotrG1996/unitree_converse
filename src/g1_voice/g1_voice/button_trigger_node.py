@@ -65,6 +65,17 @@ class ButtonTriggerNode(Node):
         self.say_pub = self.create_publisher(String, '/g1/voice/say_text', 10)
         self.status_pub = self.create_publisher(String, '/g1/button/status', 10)
 
+        # Track the real session state that wake_word_node owns. It publishes
+        # /g1/voice/continuous_start when "Aletta" opens a session, and any
+        # close (START kill-switch, empty-turn limit, duration cap) publishes
+        # /g1/voice/continuous_stop. Before this, the button node's own
+        # continuous_mode flag stayed False forever, so START was always
+        # "ignored" and could never end an open Aletta session.
+        self.create_subscription(
+            Bool, '/g1/voice/continuous_start', self._on_continuous_start, 10)
+        self.create_subscription(
+            Bool, '/g1/voice/continuous_stop', self._on_continuous_stop, 10)
+
         from unitree_go.msg import WirelessController
         self.controller_sub = self.create_subscription(
             WirelessController,
@@ -141,6 +152,20 @@ class ButtonTriggerNode(Node):
             self.recording_active = False
             self._publish_stop()
             self._publish_status('transcribing')
+
+    def _on_continuous_start(self, msg: Bool):
+        """Session opened (e.g. via \"Aletta\") — suppress F1 push-to-talk."""
+        if msg.data:
+            self.continuous_mode = True
+            self.get_logger().info(
+                'Continuous mode ON (session opened) — F1 push-to-talk disabled')
+
+    def _on_continuous_stop(self, msg: Bool):
+        """Session ended — re-enable F1 push-to-talk."""
+        if msg.data:
+            self.continuous_mode = False
+            self.get_logger().info(
+                'Continuous mode OFF (session closed) — F1 push-to-talk re-enabled')
 
     def _toggle_continuous(self):
         # Continuous conversation is Aletta-only (wake_word_node owns

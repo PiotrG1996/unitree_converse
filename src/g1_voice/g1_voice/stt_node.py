@@ -306,11 +306,19 @@ class STTNode(Node):
         # Immediate phrase repetition: a run of >=2 words that is immediately
         # repeated (e.g. "thank you very much thank you very much", "it's a
         # mouthful it's a mouthful"). This is the classic Whisper hallucination
-        # loop and the single-word ratio check above misses it.
+        # loop and the single-word ratio check above misses it. Only flag when
+        # the repetition dominates the transcript (>=70% of words): real speech
+        # can contain a repeated phrase for emphasis without being noise.
         for p in range(2, len(words) // 2 + 1):
             for i in range(0, len(words) - 2 * p + 1):
                 if words[i:i + p] == words[i + p:i + 2 * p]:
-                    return True
+                    repeated_words = 2 * p
+                    j = i + 2 * p
+                    while j + p <= len(words) and words[j:j + p] == words[i:i + p]:
+                        repeated_words += p
+                        j += p
+                    if repeated_words / len(words) >= 0.70:
+                        return True
 
         # Repetition ratio: (occurrences of most common word) / total words.
         # Loops like "sorry sorry sorry sorry" score high. Require >=4 words so a
@@ -346,6 +354,7 @@ class STTNode(Node):
     def _record_and_transcribe(self):
         self.is_recording = True
         self._transcript_published = False
+        self._turn_had_transcript = False
         self._publish_status('recording')
 
         if self.use_udp_mic:
@@ -355,6 +364,9 @@ class STTNode(Node):
 
         if audio_data is None or len(audio_data) == 0:
             self.get_logger().warn('No audio recorded')
+            # Contract with wake_word_node.stt_status_callback: a turn with
+            # no audio is an empty turn (counts toward max_empty_turns).
+            self._publish_status('empty_turn')
             self._publish_status('idle')
             self.is_recording = False
             if self.continuous_mode:
@@ -393,10 +405,15 @@ class STTNode(Node):
                 f'Whisper detected language: {detected_language} '
                 f'(probability={language_probability:.2f})')
             if detected_language not in ('pl', 'en'):
+                # Whisper's auto language detection is unreliable on noisy
+                # mic audio (e.g. 'es' at probability=0.54 for real English
+                # speech). Don't throw away a valid transcript: default to
+                # English for TTS/LTS routing. The text itself is what the
+                # LLM sees.
                 self.get_logger().warn(
-                    f'Ignoring speech detected as unsupported language: '
-                    f'{detected_language or "unknown"}')
-                transcript = ''
+                    f'Unsupported language {detected_language or "unknown"}, '
+                    f'defaulting to English')
+                detected_language = 'en'
 
             if transcript and self._looks_like_noise(transcript):
                 self.get_logger().info(
@@ -422,23 +439,48 @@ class STTNode(Node):
                         f'[USER_LANGUAGE:{detected_language}]\n{transcript}')
                     self.transcript_pub.publish(msg)
                     self._transcript_published = True
+                    # Continuous-mode handoff: a valid user transcript
+                    # (not a noise/empty turn) lets the continuous-loop
+                    # re-arm. The LLM/TTS path closes the turn via
+                    # _TURN_END, which re-triggers listening.
+                    self._turn_had_transcript = True
             else:
                 self.get_logger().warn('Empty transcript — nothing detected')
 
         except Exception as e:
             self.get_logger().error(f'Transcription error: {e}')
             self._publish_status('error')
+            # No transcript came out of this turn — report it as empty so
+            # the session can still close crisply via max_empty_turns
+            # instead of lingering until the duration cap.
+            self._publish_status('empty_turn')
             self.is_recording = False
             if self.continuous_mode:
                 self._schedule_self_retrigger()
             return
 
+        if not self._transcript_published:
+            # Contract with wake_word_node.stt_status_callback: every turn
+            # with no published transcript (silence, noise, unsupported
+            # language, dropped low-confidence decode) reports 'empty_turn'
+            # so the max_empty_turns close can function. Without this the
+            # wake node's empty-turn counter never increments and sessions
+            # only die on the 300s duration cap.
+            self._publish_status('empty_turn')
         self._publish_status('idle')
         self.is_recording = False
-        # TTS owns the healthy continuous-mode handoff after a valid transcript.
-        # Do not let the watchdog start a second turn while the LLM is still
-        # generating the response for this turn.
-        if self.continuous_mode and self._transcript_published:
+        # Re-arm continuous listening after the turn ends.
+        #
+        # TTS owns the healthy handoff after a valid transcript (it publishes
+        # _TURN_END -> /g1/voice/trigger once the reply finishes speaking).
+        # The watchdog below is the safety net: after an empty/noise turn
+        # there is no LLM reply coming, so nothing else will re-trigger
+        # listening. Without this the node goes deaf after one empty turn
+        # and the wake loop keeps firing wake-detects with no recording.
+        # After a valid transcript we still arm the watchdog so a muted/
+        # failed TTS turn cannot stall the loop either; the external
+        # trigger_callback cancels it when TTS drives the next turn normally.
+        if self.continuous_mode:
             self._schedule_self_retrigger()
 
     def _transcribe(self, audio_data, language=None):
@@ -473,7 +515,6 @@ class STTNode(Node):
         auto_segments, auto_info = self._transcribe(audio_data)
         detected = (getattr(auto_info, 'language', '') or '').lower()
         probability = getattr(auto_info, 'language_probability', 0.0)
-
         if detected in ('pl', 'en') and probability >= self.language_detection_min_probability:
             return auto_segments, auto_info
 
@@ -542,23 +583,26 @@ class STTNode(Node):
         return best_segments, best_info
 
     def _has_speech(self, segments) -> bool:
-        """
-        Return True when at least one segment passes the no-speech gate.
+        """Return True when at least one segment is genuine speech, not noise.
 
         Reuses ``speech_gate.keep_segment`` so this decision uses exactly the
-        same confidence rule the transcript path applies downstream.
+        same confidence rule the transcript path applies downstream. A segment
+        passes the no-speech gate when its no_speech_prob is at/below threshold.
         """
         try:
             from g1_voice.speech_gate import keep_segment
         except Exception:
-            # Gate unavailable: assume speech so the duel still runs.
+            # Gate unavailable: err on the side of speech so the duel runs.
             return True
         for segment in segments:
             if not (segment.text or '').strip():
                 continue
-            if keep_segment(
-                    getattr(segment, 'no_speech_prob', None),
-                    self.max_no_speech_prob):
+            nsp = getattr(segment, 'no_speech_prob', None)
+            if nsp is None:
+                # Missing score: keep_segment keeps it (err on the side of
+                # speech so the duel runs and a real turn isn't lost).
+                return True
+            if keep_segment(nsp, self.max_no_speech_prob):
                 return True
         return False
 
@@ -584,6 +628,17 @@ class STTNode(Node):
         total_bytes = 0
         silence_bytes = 0
         speech_detected = False
+        # Mic diagnostic (2026-10-17, live G1): room floor sits at RMS
+        # ~0.0069 with speech peaks only ~0.013 (6/76 packets above the
+        # 0.008 threshold in a 12s spoken capture). A single above-threshold
+        # packet therefore means noise, not speech: require SUSTAINED
+        # energy (min_speech_bytes above threshold) before the early-stop
+        # can arm, and smooth RMS over a short sliding window so one hot
+        # packet cannot latch speech_detected on its own.
+        min_speech_bytes = int(0.4 * self.sample_rate * BYTES_PER_SAMPLE)
+        speech_bytes = 0
+        rms_window = []
+        rms_window_max = 5
 
         self.get_logger().info(f'Recording via UDP {self.udp_multicast_group}:{self.udp_port}...')
 
@@ -596,11 +651,23 @@ class STTNode(Node):
 
                     samples = np.frombuffer(data, dtype=np.int16).astype(np.float32) / 32768.0
                     rms = np.sqrt(np.mean(samples**2))
+                    rms_window.append(float(rms))
+                    if len(rms_window) > rms_window_max:
+                        rms_window.pop(0)
+                    # Median (not mean): a single loud packet cannot drag the
+                    # window over threshold on its own; sustained energy is
+                    # required. Measured floor 0.0069 vs blips 0.013: a mean
+                    # window crosses at 0.0081 on one blip, a median window
+                    # stays at floor until 3+ of 5 packets are hot.
+                    smooth_rms = float(np.median(rms_window))
 
-                    if rms >= self.silence_threshold:
-                        speech_detected = True
+                    if smooth_rms >= self.silence_threshold:
+                        speech_bytes += len(data)
+                        if speech_bytes >= min_speech_bytes:
+                            speech_detected = True
                         silence_bytes = 0
                     else:
+                        speech_bytes = 0
                         if speech_detected:
                             silence_bytes += len(data)
 
@@ -642,6 +709,10 @@ class STTNode(Node):
         silence_limit = int(self.silence_duration * self.sample_rate)
         chunk_size = 1024
         speech_detected = False
+        # Mirror the UDP path: require sustained (not single-chunk) energy
+        # before the early-stop can arm (see _record_via_udp).
+        min_speech_frames = int(0.4 * self.sample_rate)
+        speech_frames = 0
 
         def audio_callback(indata, frames, time, status):
             audio_frames.append(indata.copy())
@@ -667,9 +738,12 @@ class STTNode(Node):
                         recent = np.concatenate(tail)
                         rms = np.sqrt(np.mean(recent**2))
                         if rms >= self.silence_threshold:
-                            speech_detected = True
+                            speech_frames += chunk_size
+                            if speech_frames >= min_speech_frames:
+                                speech_detected = True
                             silence_frames = 0
                         else:
+                            speech_frames = 0
                             if speech_detected:
                                 silence_frames += chunk_size
 

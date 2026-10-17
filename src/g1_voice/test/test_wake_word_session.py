@@ -59,6 +59,13 @@ class _FakePub:
         self.published.append(msg)
 
 
+class _FakeDetector:
+    """Minimal openWakeWord stand-in: only last_score is observed."""
+
+    def __init__(self, peak=0.0):
+        self.last_score = peak
+
+
 class _FakeWakeNode:
     """Minimal harness binding WakeWordNode's real session helpers (no ROS)."""
 
@@ -70,6 +77,9 @@ class _FakeWakeNode:
         self.session_had_llm_reply = False
         self.last_session_activity = 0.0
         self.session_silence_timeout = 20.0
+        # Duration cap + empty-turn limit (session-close conditions).
+        self.session_max_duration_sec = 300.0
+        self.max_empty_turns = 4
         # Backoff state
         self.base_cooldown = 8.0
         self.cooldown = 8.0
@@ -83,6 +93,13 @@ class _FakeWakeNode:
         self.llm_busy = False
         self.tts_busy = False
         self._wake_socket = None
+        # Missed-wake telemetry state (mirrors WakeWordNode.__init__)
+        self.aletta_threshold = 0.85
+        self.telemetry_log_interval_sec = 30.0
+        self._last_telemetry_log = 0.0
+        self._blocked_by_cooldown_log = 0.0
+        self.oww_detector = _FakeDetector()
+        self.oww_detector = _FakeDetector()
         self.trigger_pub = _FakePub()
         self.status_pub = _FakePub()
         self.continuous_start_pub = _FakePub()
@@ -94,6 +111,14 @@ class _FakeWakeNode:
         self._close_session = lambda reason: cls._close_session(self, reason)
         self._can_trigger = lambda: cls._can_trigger(self)
         self._fire_trigger = lambda source: cls._fire_trigger(self, source)
+        self._in_session_refresh = (
+            lambda score: cls._in_session_refresh(self, score))
+        self._log_burst_telemetry = lambda: cls._log_burst_telemetry(self)
+        self._resume_when_idle = lambda: cls._resume_when_idle(self)
+        self._check_session_timeout = (
+            lambda: cls._check_session_timeout(self))
+        self._check_session_timeout = (
+            lambda: cls._check_session_timeout(self))
         self.llm_status_callback = (
             lambda msg: cls.llm_status_callback(self, msg))
 
@@ -214,6 +239,51 @@ class TestBackoffEscalation(unittest.TestCase):
         # re-trigger (this is the slowdown that was missing entirely).
         node.last_trigger_time = time.time()
         self.assertFalse(node._can_trigger())
+
+    def test_in_session_refresh_extends_window(self):
+        node = _FakeWakeNode()
+        node._wake_open()
+        node.last_session_activity = time.time() - 15.0
+        node._in_session_refresh(0.99)
+        self.assertTrue(node.session_open)
+        self.assertAlmostEqual(
+            node.last_session_activity, time.time(), delta=2.0)
+        self.assertTrue(any('refreshed' in m for _lvl, m in node.logged))
+
+    def test_resume_ignores_cooldown_listens_immediately(self):
+        # Missed-wake regression: after a phantom timeout the escalated
+        # cooldown must not keep the mic closed. The listener resumes at
+        # once; only firing stays gated.
+        node = _FakeWakeNode()
+        node._wake_open()  # last_trigger_time = now
+        node._touch_session()
+        node._close_session('20s of silence (>20s)')  # cooldown -> 16
+        self.assertEqual(node.cooldown, 16.0)
+        node.listening = False
+        node._resume_when_idle()
+        self.assertTrue(node.listening)
+
+    def test_resume_keeps_session_closed_state(self):
+        node = _FakeWakeNode()
+        node._wake_open()
+        node.listening = False
+        node._resume_when_idle()  # session still open -> stays down
+        self.assertFalse(node.listening)
+
+    def test_fire_still_gated_by_cooldown(self):
+        node = _FakeWakeNode()
+        node._wake_open()  # last_trigger_time = now, cooldown 8
+        triggered_before = len(node.trigger_pub.published)
+        node._fire_trigger('aletta_wake_word')  # must be blocked
+        self.assertEqual(len(node.trigger_pub.published), triggered_before)
+
+    def test_telemetry_throttles_bursts(self):
+        node = _FakeWakeNode()
+        node.oww_detector.last_score = 0.3
+        node._log_burst_telemetry()
+        first = len(node.logged)
+        node._log_burst_telemetry()  # within interval -> silent
+        self.assertEqual(len(node.logged), first)
 
 
 if __name__ == '__main__':
