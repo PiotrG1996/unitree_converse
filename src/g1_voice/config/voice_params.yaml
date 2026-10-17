@@ -18,12 +18,20 @@
     sample_rate: 16000
     recording_duration: 5.0
     silence_threshold: 0.01
-    silence_duration: 1.5
-    # Raised 0.5 -> 0.7: live logs show real uncertain English speech at
-    # no_speech_prob ~0.52 being dropped. 0.7 keeps those while still
-    # blocking high-confidence noise (>0.7).
-    max_no_speech_prob: 0.7
-    language_detection_min_probability: 0.55
+    silence_duration: 2.5
+    # Raised 0.5 -> 0.85: live logs show real uncertain English speech at
+    # no_speech_prob ~0.75 being dropped on the noisy UDP mic feed. 0.85
+    # keeps those while still blocking high-confidence noise (>0.85). The
+    # _looks_like_noise gate and min_publish_avg_logprob floor (-11.0)
+    # provide a second line of defence.
+    max_no_speech_prob: 0.85
+    # Lowered 0.55 -> 0.50: Whisper's auto language detection on the noisy
+    # UDP mic feed rarely exceeds ~0.55-0.74 even for clear English speech.
+    # Above ~0.55 almost every turn goes to the pl/en duel, where Polish can
+    # wrongly override English (the wake word "Aletta" is English). At 0.50,
+    # moderately-confident English auto detections are accepted directly,
+    # avoiding Polish flips.
+    language_detection_min_probability: 0.50
     # See voice_params_real.yaml for the rationale (duel margin + publish
     # floor — guard against noise being decoded as Polish/English replies).
     language_duel_override_margin: 0.25

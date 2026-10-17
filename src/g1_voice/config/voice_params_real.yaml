@@ -72,26 +72,27 @@
     silence_threshold: 0.008
 
     # Turn-taking: stop early on trailing silence so the pipeline answers
-    # promptly. 1.0s (was 0.45s) so mid-utterance pauses between words do
-    # not truncate the clip into a fragment Whisper decodes as no-speech.
-    # Cost of the longer tail on a pure-noise turn is ~0.5s of extra audio.
-    silence_duration: 1.0
+    # promptly. 2.5s (was 1.0s) so users have time to finish short phrases
+    # before the clip is cut. Whisper needs enough speech context to produce
+    # confident segments; cutting at 1.0s of silence left mostly-silent clips
+    # that decoded to empty transcripts.
+    silence_duration: 2.5
 
     # Tune with recorded speech and silence samples.
-    # Raised 0.5 -> 0.7: live logs show real uncertain English speech at
-    # no_speech_prob ~0.52 being dropped ("But accessification was accessible
-    # to me.", "Well, only smart engineers."). 0.7 keeps those while still
-    # blocking high-confidence noise (>0.7). The min_publish_avg_logprob
-    # floor (-2.5) and language duel provide a second line of defence against
-    # pure noise leaking through.
-    max_no_speech_prob: 0.7
-    # 0.55 was too permissive: Whisper's silence/noise floor is en@0.55-0.57
-    # (observed 153x on 2026-10-13), and real uncertain speech lands in
-    # 0.55-0.74 too. Anything at/above the gate skips the pl/en duel, so
-    # short/noisy Polish could auto-detect as English and get an English
-    # reply. 0.75 routes those windows through the scored duel (robust);
-    # confident real speech clusters at 0.90-1.00 and is unaffected.
-    language_detection_min_probability: 0.75
+    # Raised 0.5 -> 0.85: live logs show real uncertain English speech at
+    # no_speech_prob ~0.75 being dropped ("So, we're going to start with the
+    # first one."). 0.85 keeps those while still blocking high-confidence
+    # noise (>0.85). The _looks_like_noise gate and min_publish_avg_logprob
+    # floor (-11.0) provide a second line of defence against noise leaking
+    # through.
+    max_no_speech_prob: 0.85
+    # Lowered 0.75 -> 0.50: Whisper's auto language detection on the noisy
+    # UDP mic feed rarely exceeds ~0.55-0.74 even for clear English speech.
+    # At 0.75 almost every turn skips the early-accept path and goes to the
+    # pl/en duel, where Polish can wrongly override English (the wake word
+    # "Aletta" is English). At 0.50, moderately-confident English auto
+    # detections are accepted directly, avoiding Polish flips.
+    language_detection_min_probability: 0.50
 
     # Duel safety (2026-10-16 incident: noise turned into Polish replies).
     # A forced-language candidate may replace the auto pass only when its

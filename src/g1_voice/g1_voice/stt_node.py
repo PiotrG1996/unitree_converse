@@ -544,7 +544,15 @@ class STTNode(Node):
         # speech loop into long, confident (high-avg_logprob) text that beat
         # short English garbage on BOTH terms of _transcription_score
         # (observed 2026-10-16: 5/7 duels returned pl when auto said en).
+        #
+        # English-locked duel: when Whisper's auto pass detected English,
+        # Polish must never override it. The user spoke English ("Aletta"
+        # is English); on noisy mic audio Whisper often confuses English
+        # for Polish. Only an auto detection of Polish or unknown can
+        # produce a Polish winner.
         auto_score = self._transcription_score(auto_segments)
+
+        allow_pl_win = detected != 'en'
 
         scored = {}
         for language, (segments, _info) in candidates.items():
@@ -552,6 +560,10 @@ class STTNode(Node):
             if self._looks_like_noise(joined):
                 # Hallucination loops never win — they would win on length
                 # and predictability, exactly the noise-vs-en failure mode.
+                scored[language] = None
+                continue
+            if language == 'pl' and not allow_pl_win:
+                # Polish cannot win when auto said English.
                 scored[language] = None
                 continue
             scored[language] = self._transcription_score(segments)
@@ -635,7 +647,7 @@ class STTNode(Node):
         # energy (min_speech_bytes above threshold) before the early-stop
         # can arm, and smooth RMS over a short sliding window so one hot
         # packet cannot latch speech_detected on its own.
-        min_speech_bytes = int(0.4 * self.sample_rate * BYTES_PER_SAMPLE)
+        min_speech_bytes = int(0.2 * self.sample_rate * BYTES_PER_SAMPLE)
         speech_bytes = 0
         rms_window = []
         rms_window_max = 5
@@ -711,7 +723,7 @@ class STTNode(Node):
         speech_detected = False
         # Mirror the UDP path: require sustained (not single-chunk) energy
         # before the early-stop can arm (see _record_via_udp).
-        min_speech_frames = int(0.4 * self.sample_rate)
+        min_speech_frames = int(0.2 * self.sample_rate)
         speech_frames = 0
 
         def audio_callback(indata, frames, time, status):

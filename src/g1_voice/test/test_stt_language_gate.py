@@ -226,14 +226,15 @@ class TestDuelMarginAndNoiseGuard(unittest.TestCase):
         self.assertTrue(any('keeping auto' in m for _lvl, m in node.logged))
 
     def test_clean_pl_beats_auto_by_margin(self):
-        # Auto picked English on real Polish-quality audio (short, low
-        # confidence); the forced pl decode is clean and scores far better.
+        # Even a clean Polish decode must NOT override an English auto
+        # detection: "Aletta" is English, and Whisper on noisy mic audio
+        # often confuses English for Polish. English is kept.
         auto = [_Seg('the of and', 0.10, -1.40)]
         info = _Info('en', 0.56)
         pl = [_Seg('Cześć, jak się masz dzisiaj?', 0.10, -0.30)]
         node, segments, _info_out = self._run_fallback(auto, info, {'pl': pl})
-        self.assertEqual(segments, pl)
-        self.assertTrue(any('selected=pl' in m for _lvl, m in node.logged))
+        self.assertEqual(segments, auto)
+        self.assertTrue(any('keeping auto' in m for _lvl, m in node.logged))
 
     def test_candidate_within_margin_keeps_auto(self):
         # A marginally better pl decode must NOT override a decent auto pass
