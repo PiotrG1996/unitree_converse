@@ -50,6 +50,8 @@ class _FakeNode:
         self._stream_text = ''
         self._stream_remaining = ''
         self._stream_saw_chunk = False
+        self._turn_seq = 0
+        self._stream_seq = -1
         self._turn_language = 'en'
         self.continuous_mode = False
         self.trigger_pub = None

@@ -170,6 +170,12 @@ class TTSNode(Node):
         self._stream_text = ''
         self._stream_remaining = ''
         self._stream_saw_chunk = False
+        # Turn generation counter: bumped on every transcript reset. Each
+        # streamed chunk stamps the current generation, so response_callback
+        # can tell live chunks of THIS turn apart from a stale buffer left
+        # by a previous turn (which must be discarded, not re-spoken).
+        self._turn_seq = 0
+        self._stream_seq = -1
         # Count of complete sentences already enqueued this turn, so a
         # cumulative re-split only speaks the not-yet-spoken tail.
         self._stream_spoken = 0
@@ -274,7 +280,9 @@ class TTSNode(Node):
         if src_rate != self.output_sample_rate:
             audio = self._resample(audio, src_rate, self.output_sample_rate)
 
-        self._play_audio(audio, self.output_sample_rate)
+        timeout = 30.0 + 3.0 * len(audio) / float(self.output_sample_rate)
+        self._play_audio_with_timeout(
+            audio, self.output_sample_rate, timeout_sec=timeout)
 
     def response_callback(self, msg: String):
         try:
@@ -291,6 +299,15 @@ class TTSNode(Node):
             self.get_logger().warning('Ignoring empty response after language marker')
             return
 
+        # Only trust previously streamed chunks when they belong to THIS
+        # turn: the transcript reset bumps _turn_seq, and stream_callback
+        # stamps each chunk with it. A final reply arriving without a
+        # transcript reset (re-prompt, missed transcript, out-of-order
+        # delivery) must NOT re-split a stale buffer from a previous turn —
+        # that spoke the old reply again.
+        streamed_this_turn = (self._stream_saw_chunk and
+                              self._stream_seq == self._turn_seq)
+
         # Latch the turn language FIRST: live llm_stream deltas carry plain
         # text (no marker), so stream_callback speaks them with whatever
         # language is latched for this turn. Close the turn after flushing so
@@ -304,9 +321,15 @@ class TTSNode(Node):
         # reply here so the turn is still spoken exactly once, in the
         # language latched from the STT USER_LANGUAGE marker.
         if self._streaming_enabled:
-            if not self._stream_saw_chunk:
+            if not streamed_this_turn:
+                # No live chunks for THIS turn (or stale chunks from a past
+                # turn): speak the full reply exactly once, discarding any
+                # stale buffer.
                 self._stream_text = ''
                 self._stream_remaining = ''
+                self._stream_saw_chunk = False
+                self._stream_spoken = 0
+                self._turn_open = True
                 self._on_stream_chunk(reply, language)
             else:
                 # Reconcile tail: the buffer already reflects every live
@@ -328,12 +351,16 @@ class TTSNode(Node):
         Manual speech path (e.g. SELECT pad button): bypasses STT/LLM and the
         streaming turn state entirely. The line is queued behind any in-flight
         reply and never emits _TURN_END, so continuous mode is not retriggered.
-        Mute (F3 / speak_enable) is honoured downstream in _speak().
+        Mute (F3 / speak_enable) is honoured downstream in _speak(). The
+        latched reply language is left untouched: consuming it here would
+        steal the voice routing of an in-flight LLM reply.
         """
         text = (msg.data or '').strip()
         if not text:
             return
-        language, text = self._language_and_text(text)
+        # Non-consuming read: SELECT must not steal the voice routing of an
+        # in-flight LLM reply (see _language_and_text).
+        language, text = self._language_and_text(text, consume_latched=False)
         if not text:
             self.get_logger().warning('Ignoring empty say_text after language marker')
             return
@@ -498,8 +525,17 @@ class TTSNode(Node):
             # _TURN_END auto-trigger never fired and chained turns stalled.
             self._turn_had_transcript = True
 
-    def _language_and_text(self, text: str):
-        """Return the explicit or remembered language and clean response text."""
+    def _language_and_text(self, text: str, consume_latched: bool = True):
+        """Return the explicit or remembered language and clean response text.
+
+        Args:
+            text: Raw reply, optionally prefixed with a [USER_LANGUAGE:xx]
+                marker.
+            consume_latched: When True (LLM reply path), a previously latched
+                language is consumed (one-shot). When False (SELECT say_text
+                path), the latch is left intact so an in-flight reply keeps
+                its voice routing.
+        """
         match = re.match(
             r'^\s*\[USER_LANGUAGE:(pl|en)\]\s*\n',
             text,
@@ -512,13 +548,48 @@ class TTSNode(Node):
 
         with self._response_language_lock:
             language = self._response_language
-            self._response_language = None
+            if consume_latched:
+                self._response_language = None
 
         if language is None:
             language = "pl" if self._is_polish_text(text) else "en"
         self.get_logger().info(
             f'TTS language selected from latest user turn: {language}')
         return language, text.strip()
+
+    # Backwards-compatible alias used by older call sites/tests.
+    def _language_and_text_preserve(self, text: str):
+        return self._language_and_text(text, consume_latched=False)
+
+    def _play_audio_with_timeout(self, audio, src_rate, timeout_sec: float = 60.0) -> bool:
+        """Run _play_audio in a worker and bound its wall-clock time.
+
+        _play_audio blocks on the audio worker's stdout with no timeout: one
+        stuck playback would stall the single speech-queue thread forever
+        (no further sentence speaks, continuous mode never re-triggers).
+        Returns True on clean playback, False on timeout/failure.
+        """
+        done = threading.Event()
+        outcome = {'ok': False}
+
+        def _run():
+            try:
+                self._play_audio(audio, src_rate)
+                outcome['ok'] = True
+            except Exception:
+                outcome['ok'] = False
+            finally:
+                done.set()
+
+        worker = threading.Thread(target=_run, daemon=True)
+        worker.start()
+        if not done.wait(timeout=timeout_sec):
+            self.get_logger().error(
+                f'TTS playback timed out after {timeout_sec:.0f}s — '
+                'skipping to next queue item')
+            self._publish_status('error')
+            return False
+        return outcome['ok']
 
     def _warn_on_language_mismatch(self, reply: str, language: str):
         """
@@ -551,6 +622,21 @@ class TTSNode(Node):
         self._stream_spoken = 0
         self._turn_open = True
         self._turn_had_transcript = False
+        self._turn_seq += 1
+        self._stream_seq = -1
+
+    def _reset_turn_state_only(self):
+        """Clear stream buffers without touching the transcript flag.
+
+        Kept for the unit-test harness and external callers that need a
+        buffer-only reset. Production turn flow uses the _turn_seq
+        generation counter (see response_callback) instead.
+        """
+        self._stream_text = ''
+        self._stream_remaining = ''
+        self._stream_saw_chunk = False
+        self._stream_spoken = 0
+        self._turn_open = True
 
     def stream_callback(self, msg: String):
         """
@@ -586,6 +672,7 @@ class TTSNode(Node):
             return
         self._turn_language = language
         self._stream_saw_chunk = True
+        self._stream_seq = self._turn_seq
 
         # Drop a leading language marker if it somehow arrives in-stream.
         if not self._stream_text and chunk.startswith('[USER_LANGUAGE:'):
@@ -642,7 +729,10 @@ class TTSNode(Node):
             return
 
         audio = np.concatenate(chunks).astype(np.float32)
-        self._play_audio(audio, native_sr)
+        # Bound playback time: a stuck audio worker must not stall the
+        # single speech-queue thread forever (see _play_audio_with_timeout).
+        timeout = 30.0 + 3.0 * len(audio) / float(native_sr)
+        self._play_audio_with_timeout(audio, native_sr, timeout_sec=timeout)
 
     @staticmethod
     def _is_polish_text(text: str) -> bool:

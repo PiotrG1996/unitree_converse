@@ -88,6 +88,10 @@ class WakeWordNode(Node):
         self.declare_parameter('udp_multicast_group', '239.168.123.161')
         self.declare_parameter('udp_port', 5555)
         self.declare_parameter('udp_local_ip', '192.168.123.164')
+        # Base cooldown between trigger firings. False accepts escalate it
+        # exponentially (up to max_false_accept_cooldown); a real LLM reply
+        # resets it here. Was a hardcoded 8.0 s — now tunable.
+        self.declare_parameter('base_cooldown_sec', 8.0)
 
         self.sample_rate = self._param('sample_rate')
         self.aletta_model_path = os.path.expanduser(
@@ -129,10 +133,11 @@ class WakeWordNode(Node):
         self._blocked_by_cooldown_log = 0.0
 
         self.last_trigger_time = 0.0
-        self.base_cooldown = 8.0
-        self.cooldown = 8.0
+        self.base_cooldown = float(self._param('base_cooldown_sec'))
+        self.cooldown = self.base_cooldown
         self.false_accept_count = 0
-        self.listening = True
+        # NOTE: the historic `listening` pause flag was removed — the mic
+        # stays open during sessions by design (see _wake_word_loop).
         # True when the current open session was opened by a wake detection
         # (not by a pad button). Attribution survives session activity touches
         # and is only cleared on close — the false-accept backoff needs it at
@@ -427,14 +432,16 @@ class WakeWordNode(Node):
         # the ONNX score. Configurable via silence_rms parameter (default 300
         # int16 LSB ≈ quiet room; speech is 10-100x louder).
         while rclpy.ok():
-            if not self.listening:
-                self._resume_when_idle()
-                time.sleep(0.5)
-                continue
+            # NOTE: the socket intentionally stays open during sessions too
+            # (missed-wake fix, 2026-10-16): a repeated "Aletta" refreshes the
+            # window via _in_session_refresh instead of hitting a closed
+            # socket. There is no paused state — the old `listening` flag was
+            # write-only (always True) and its pause branch dead code.
             sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
             self._wake_socket = sock
             sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-            sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEPORT, 1)
+            # NOTE: no SO_REUSEPORT — on Linux it load-balances datagrams
+            # across same-port sockets, starving the STT socket (see stt_node).
             sock.bind(('', self.udp_port))
             mreq = struct.pack(
                 '4s4s', socket.inet_aton(self.udp_multicast_group),
@@ -446,7 +453,7 @@ class WakeWordNode(Node):
                 'Aletta mic open on UDP '
                 f'{self.udp_multicast_group}:{self.udp_port}')
             try:
-                while rclpy.ok() and self.listening:
+                while rclpy.ok():
                     try:
                         data, _ = sock.recvfrom(65535)
                     except socket.timeout:
@@ -472,8 +479,13 @@ class WakeWordNode(Node):
                         audio.extend(burst)
                         scored = self._score_buffered_audio(
                             audio, oww_frame_bytes)
+                        # Always discard the scored burst: scored frames are
+                        # consumed inside, and leftovers are stale by the next
+                        # burst (after idle_sleep_sec). The old code only
+                        # cleared on detection, leaking ~13 KB/s of idle audio
+                        # into an ever-growing buffer.
+                        audio.clear()
                         if scored:
-                            audio.clear()
                             break
                         # Firing itself stays gated inside _fire_trigger's
                         # _can_trigger check (cooldown + pipeline-busy): the
@@ -518,9 +530,8 @@ class WakeWordNode(Node):
                             audio.clear()
                             break
             except OSError:
-                if self.listening:
-                    self.get_logger().error(
-                        'Aletta UDP socket closed unexpectedly')
+                self.get_logger().error(
+                    'Aletta UDP socket closed unexpectedly')
             except Exception as e:
                 self.get_logger().error(f'Aletta UDP listener error: {e}')
             finally:
@@ -586,7 +597,11 @@ class WakeWordNode(Node):
             f'(peak score={peak:.2f} vs threshold={self.aletta_threshold:.2f})')
 
     def _resume_when_idle(self):
-        if self.listening or self.stt_busy or self.llm_busy:
+        # Kept for the unit-test harness (test_wake_word_session drives the
+        # session/timeout logic through it). The live listener loop no longer
+        # pauses — the mic stays open during sessions (see _wake_word_loop) —
+        # so this only enforces the duration cap and logs the idle prompt.
+        if self.stt_busy or self.llm_busy:
             return
         # Enforce the session duration cap so a wake-opened session
         # closes even if the mic path stalls, and the listener can resume.
@@ -597,7 +612,6 @@ class WakeWordNode(Node):
         # NOTE (missed-wake, 2026-10-16): only *firing* is
         # cooldown-gated (in _fire_trigger); the mic resumes immediately
         # so a real "Aletta" held past expiry fires at expiry.
-        self.listening = True
         self.get_logger().info('Pipeline idle — say "Aletta" or use pad')
 
 

@@ -40,7 +40,12 @@ def main():
 
             path = command["path"]
             app_name = "unitree_converse"
-            stream_id = str(int(time.time() * 1000))
+            # Monotonic per-process counter: wall-clock ms collided for
+            # back-to-back sentences, mixing two playbacks in one stream.
+            if not hasattr(main, "_stream_seq"):
+                main._stream_seq = 0
+            main._stream_seq += 1
+            stream_id = f"{int(time.time() * 1000)}-{main._stream_seq}"
 
             with open(path, "rb") as audio_file:
                 pcm_data = audio_file.read()
@@ -66,7 +71,12 @@ def main():
                             f"PlayStream returned code {ret_code}"
                         )
 
-                    sleep_time = len(chunk) / 32000.0
+                    # Pace to realtime: PlayStream already consumed
+                    # send_time, so only sleep the remainder. The old code
+                    # slept the full chunk duration AFTER the blocking
+                    # call, running slower than realtime with gaps.
+                    sleep_time = max(
+                        0.0, len(chunk) / 32000.0 - send_time)
                     print(
                         f"Audio chunk: {len(chunk) / 32000.0:.2f}s; "
                         f"PlayStream call: {send_time:.2f}s; "

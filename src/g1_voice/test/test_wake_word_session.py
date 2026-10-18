@@ -253,22 +253,23 @@ class TestBackoffEscalation(unittest.TestCase):
     def test_resume_ignores_cooldown_listens_immediately(self):
         # Missed-wake regression: after a phantom timeout the escalated
         # cooldown must not keep the mic closed. The listener resumes at
-        # once; only firing stays gated.
+        # once; only firing stays gated. (The historic `listening` pause
+        # flag was removed — the mic now stays open by design — so this
+        # asserts the session/timeout bookkeeping instead.)
         node = _FakeWakeNode()
         node._wake_open()  # last_trigger_time = now
         node._touch_session()
         node._close_session('20s of silence (>20s)')  # cooldown -> 16
         self.assertEqual(node.cooldown, 16.0)
-        node.listening = False
+        self.assertFalse(node.session_open)
         node._resume_when_idle()
-        self.assertTrue(node.listening)
+        self.assertFalse(node.session_open)
 
     def test_resume_keeps_session_closed_state(self):
         node = _FakeWakeNode()
         node._wake_open()
-        node.listening = False
-        node._resume_when_idle()  # session still open -> stays down
-        self.assertFalse(node.listening)
+        node._resume_when_idle()  # session still open -> stays open
+        self.assertTrue(node.session_open)
 
     def test_fire_still_gated_by_cooldown(self):
         node = _FakeWakeNode()

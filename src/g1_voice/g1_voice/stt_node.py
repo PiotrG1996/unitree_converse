@@ -5,6 +5,7 @@ import numpy as np
 import socket
 import struct
 import threading
+import time
 import re
 import os
 import ctypes
@@ -252,6 +253,14 @@ class STTNode(Node):
                 self._watchdog.cancel()
             self._watchdog = self.create_timer(delay, self._watchdog_fire)
 
+    def _echo_guard_remaining(self) -> float:
+        """Seconds until the TTS echo guard expires (0 when inactive)."""
+        if self.tts_busy:
+            return self.tts_echo_guard_sec
+        remaining = (self.tts_echo_guard_sec -
+                     (time.time() - self._last_tts_speaking_time))
+        return max(0.0, remaining)
+
     def _watchdog_fire(self):
         self._watchdog.cancel()
         if self.llm_busy:
@@ -262,21 +271,51 @@ class STTNode(Node):
             # TTS is speaking (or its ring-down is still on the mic): opening
             # the mic now would transcribe the robot's own reply as a new
             # user turn and the LLM would answer it again (repetition loop).
+            # Re-check at guard expiry instead of waiting a full interval —
+            # otherwise every healthy TTS handoff stalls ~15 s.
+            delay = self._echo_guard_remaining() + 0.2
             self.get_logger().info(
-                'Continuous watchdog deferred while TTS is speaking')
-            self._schedule_self_retrigger(self.watchdog_interval)
+                f'Continuous watchdog deferred while TTS is speaking '
+                f'(retry in {delay:.1f}s)')
+            self._schedule_self_retrigger(delay)
         elif not self.is_recording:
             self.get_logger().info('Always-on watchdog — no reply received, listening again')
             self._retrigger()
+
+    def _delayed_trigger(self, delay: float):
+        """Start recording after `delay` unless something else got there first."""
+        time.sleep(delay)
+        if self.is_recording:
+            return
+        if self._tts_echo_active():
+            # Playback restarted (e.g. next sentence) — wait for the new guard.
+            self.get_logger().info(
+                'Delayed trigger still guarded — re-waiting for TTS')
+            self._delayed_trigger(self._echo_guard_remaining() + 0.2)
+            return
+        self.get_logger().info('Trigger received — starting recording '
+                               '(after echo guard)')
+        # A watchdog may have been re-armed while we waited out the guard;
+        # cancel it so it cannot open a second overlapping recording.
+        with self._watchdog_lock:
+            if self._watchdog is not None:
+                self._watchdog.cancel()
+        threading.Thread(target=self._record_and_transcribe, daemon=True).start()
 
     def trigger_callback(self, msg: Bool):
         """Handle an external /g1/voice/trigger message to start recording."""
         if msg.data and not self.is_recording:
             if self._tts_echo_active():
-                # TTS-driven turn handoff can race playback start: drop the
-                # trigger rather than record our own voice (see _watchdog_fire).
+                # The TTS _TURN_END handoff races playback start: queue a
+                # delayed start at guard expiry rather than dropping the
+                # trigger (dropping stalls chained turns until the 15 s
+                # watchdog fires).
+                delay = self._echo_guard_remaining() + 0.2
                 self.get_logger().info(
-                    'Trigger deferred — TTS echo guard active')
+                    f'Trigger deferred — TTS echo guard active '
+                    f'(starting in {delay:.1f}s)')
+                threading.Thread(target=self._delayed_trigger,
+                                 args=(delay,), daemon=True).start()
                 return
             self.get_logger().info('Trigger received — starting recording')
             # An external trigger means the loop is being driven normally; cancel
@@ -306,7 +345,6 @@ class STTNode(Node):
 
     def _tts_status_callback(self, msg: String):
         """Track TTS playback so the mic never opens on the robot's voice."""
-        import time
         if msg.data == 'speaking':
             self.tts_busy = True
             self._last_tts_speaking_time = time.time()
@@ -316,7 +354,6 @@ class STTNode(Node):
 
     def _tts_echo_active(self) -> bool:
         """True while TTS is speaking or within the post-playback guard."""
-        import time
         if self.tts_busy:
             return True
         return (time.time() - self._last_tts_speaking_time) < self.tts_echo_guard_sec
@@ -684,7 +721,10 @@ class STTNode(Node):
 
         sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEPORT, 1)
+        # NOTE: no SO_REUSEPORT here. On Linux REUSEPORT load-balances
+        # datagrams across same-port sockets instead of copying to each, so
+        # the STT and wake-word sockets would each miss packets the other
+        # received. REUSEADDR alone is enough for shared multicast receive.
         sock.bind(('', self.udp_port))
 
         mreq = struct.pack(
@@ -741,13 +781,14 @@ class STTNode(Node):
                         if speech_detected:
                             silence_bytes += len(data)
 
-                    # Early silence-stop ONLY in continuous mode.
-                    # In push-to-talk (F1) the user controls the endpoint by
-                    # releasing the button, so we must keep recording until the
-                    # release (or the recording_duration cap) — otherwise a brief
-                    # pause between words truncates the clip and yields an empty
-                    # transcript.
-                    if (self.continuous_mode and speech_detected
+                    # Early silence-stop in every mode. The old
+                    # continuous_mode-only gate forced wake-gated turns to
+                    # capture the full recording_duration (8 s) even for a
+                    # one-second utterance. F1 push-to-talk still owns its
+                    # endpoint via stop_recording (release cuts the loop
+                    # first); a 2.5 s mid-hold pause ending the clip early is
+                    # the accepted tradeoff for not recording dead air.
+                    if (speech_detected
                             and silence_bytes >= silence_limit):
                         self.get_logger().info('Silence detected — stopping early')
                         break
