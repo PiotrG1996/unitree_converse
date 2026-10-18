@@ -282,16 +282,32 @@ class STTNode(Node):
             self.get_logger().info('Always-on watchdog — no reply received, listening again')
             self._retrigger()
 
-    def _delayed_trigger(self, delay: float):
-        """Start recording after `delay` unless something else got there first."""
+    def _delayed_trigger(self, delay: float,
+                         deadline: float = None):
+        """Start recording after `delay` unless something else got there first.
+
+        Iterative with a hard cap: chained TTS sentences each re-arm the
+        echo guard, and the old recursive form re-slept forever (one stack
+        frame per re-arm) while holding a daemon thread. On cap expiry we
+        give up and let the periodic watchdog re-open the mic instead.
+        """
+        # Total wait budget from first call; re-entry passes the remainder.
+        if deadline is None:
+            deadline = time.monotonic() + delay + self.tts_echo_guard_sec * 2
         time.sleep(delay)
         if self.is_recording:
             return
         if self._tts_echo_active():
+            remaining = self._echo_guard_remaining() + 0.2
+            if time.monotonic() + remaining > deadline:
+                self.get_logger().info(
+                    'Delayed trigger exceeded wait budget — yielding to '
+                    'the watchdog')
+                return
             # Playback restarted (e.g. next sentence) — wait for the new guard.
             self.get_logger().info(
                 'Delayed trigger still guarded — re-waiting for TTS')
-            self._delayed_trigger(self._echo_guard_remaining() + 0.2)
+            self._delayed_trigger(remaining, deadline)
             return
         self.get_logger().info('Trigger received — starting recording '
                                '(after echo guard)')

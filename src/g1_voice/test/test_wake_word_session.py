@@ -99,7 +99,6 @@ class _FakeWakeNode:
         self._last_telemetry_log = 0.0
         self._blocked_by_cooldown_log = 0.0
         self.oww_detector = _FakeDetector()
-        self.oww_detector = _FakeDetector()
         self.trigger_pub = _FakePub()
         self.status_pub = _FakePub()
         self.continuous_start_pub = _FakePub()

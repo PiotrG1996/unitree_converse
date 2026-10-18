@@ -41,11 +41,14 @@ def main():
             path = command["path"]
             app_name = "unitree_converse"
             # Monotonic per-process counter: wall-clock ms collided for
-            # back-to-back sentences, mixing two playbacks in one stream.
+            # back-to-back sentences (same ms + same seq within one
+            # process restart), mixing two playbacks in one stream handle.
+            # time_ns() alone can still collide across rapid calls, so the
+            # process counter guarantees uniqueness for every play command.
             if not hasattr(main, "_stream_seq"):
                 main._stream_seq = 0
             main._stream_seq += 1
-            stream_id = f"{int(time.time() * 1000)}-{main._stream_seq}"
+            stream_id = f"{time.time_ns()}-{main._stream_seq}"
 
             with open(path, "rb") as audio_file:
                 pcm_data = audio_file.read()
