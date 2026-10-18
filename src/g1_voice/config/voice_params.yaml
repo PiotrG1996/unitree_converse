@@ -38,6 +38,9 @@
     # Raised from -2.5 to -11.0: real speech on a noisy mic feed decodes at
     # low avg_logprob (~-10). Keep it; block only extreme garbage (< -11).
     min_publish_avg_logprob: -11.0
+    # TTS echo guard (see voice_params_real.yaml): STT defers mic opens
+    # while the robot's own voice is on the air.
+    tts_echo_guard_sec: 2.0
 
 /wake_word_node:
   ros__parameters:

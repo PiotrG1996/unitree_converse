@@ -108,6 +108,10 @@ class STTNode(Node):
         # this avg_logprob — only extreme Whisper garbage trips it. The value
         # is logged on every publish so it can be tightened with data.
         self.declare_parameter('min_publish_avg_logprob', -2.5)
+        # TTS echo guard: while the robot is speaking (and for this long
+        # after), the mic hears its own Piper voice. The watchdog defers and
+        # new triggers wait, mirroring the wake-word node's echo_guard_sec.
+        self.declare_parameter('tts_echo_guard_sec', 2.0)
 
         self.model_size = self._param('model_size')
         self.language = self._param('language')
@@ -129,11 +133,18 @@ class STTNode(Node):
         self.language_duel_override_margin = self._param(
             'language_duel_override_margin')
         self.min_publish_avg_logprob = self._param('min_publish_avg_logprob')
+        self.tts_echo_guard_sec = float(self._param('tts_echo_guard_sec'))
 
         self.is_recording = False
         self.stop_requested = False
         self._transcript_published = False
         self.llm_busy = False
+        # TTS echo tracking: timestamp of the last 'speaking' status and a
+        # latched busy flag. The mic must not open while the robot's own
+        # voice is on the air, or STT transcribes its own reply as a new
+        # user turn and the LLM answers it again (sentence repetition).
+        self.tts_busy = False
+        self._last_tts_speaking_time = 0.0
 
         # Pick a compute_type that is valid for the selected device. On CUDA,
         # plain 'int8' is not a supported quantisation; faster-whisper wants
@@ -170,6 +181,8 @@ class STTNode(Node):
             Bool, '/g1/voice/continuous_stop', self._continuous_stop_cb, 10)
         self.create_subscription(
             String, '/g1/llm/status', self._llm_status_callback, 10)
+        self.create_subscription(
+            String, '/g1/tts/status', self._tts_status_callback, 10)
 
         self.transcript_pub = self.create_publisher(String, '/g1/stt/transcript', 10)
         self.status_pub = self.create_publisher(String, '/g1/stt/status', 10)
@@ -245,6 +258,13 @@ class STTNode(Node):
             self.get_logger().info(
                 'Continuous watchdog deferred while LLM is generating')
             self._schedule_self_retrigger(self.watchdog_interval)
+        elif self._tts_echo_active():
+            # TTS is speaking (or its ring-down is still on the mic): opening
+            # the mic now would transcribe the robot's own reply as a new
+            # user turn and the LLM would answer it again (repetition loop).
+            self.get_logger().info(
+                'Continuous watchdog deferred while TTS is speaking')
+            self._schedule_self_retrigger(self.watchdog_interval)
         elif not self.is_recording:
             self.get_logger().info('Always-on watchdog — no reply received, listening again')
             self._retrigger()
@@ -252,6 +272,12 @@ class STTNode(Node):
     def trigger_callback(self, msg: Bool):
         """Handle an external /g1/voice/trigger message to start recording."""
         if msg.data and not self.is_recording:
+            if self._tts_echo_active():
+                # TTS-driven turn handoff can race playback start: drop the
+                # trigger rather than record our own voice (see _watchdog_fire).
+                self.get_logger().info(
+                    'Trigger deferred — TTS echo guard active')
+                return
             self.get_logger().info('Trigger received — starting recording')
             # An external trigger means the loop is being driven normally; cancel
             # the self-retrigger watchdog for this turn.
@@ -277,6 +303,23 @@ class STTNode(Node):
 
     def _llm_status_callback(self, msg: String):
         self.llm_busy = msg.data == 'thinking'
+
+    def _tts_status_callback(self, msg: String):
+        """Track TTS playback so the mic never opens on the robot's voice."""
+        import time
+        if msg.data == 'speaking':
+            self.tts_busy = True
+            self._last_tts_speaking_time = time.time()
+        elif msg.data in ('idle', 'error'):
+            self.tts_busy = False
+            self._last_tts_speaking_time = time.time()
+
+    def _tts_echo_active(self) -> bool:
+        """True while TTS is speaking or within the post-playback guard."""
+        import time
+        if self.tts_busy:
+            return True
+        return (time.time() - self._last_tts_speaking_time) < self.tts_echo_guard_sec
 
     @staticmethod
     def _looks_like_noise(text: str) -> bool:
@@ -348,6 +391,21 @@ class STTNode(Node):
                 unit = word[:unit_len]
                 if word[:unit_len * 3] == unit * 3:
                     return True
+
+        # Sentence-level repetition: Whisper often repeats the same sentence
+        # with minor word variation (e.g. "What's up everyone? What's up
+        # everybody? What's up everybody?"). Exact-phrase matching above
+        # misses this because "everyone" != "everybody". Split into
+        # sentences, normalize, and flag when repeated sentences dominate the
+        # transcript.
+        sentence_parts = re.split(r'[.!?;]+', t)
+        sentences = [s.strip().lower() for s in sentence_parts if s.strip()]
+        if len(sentences) >= 2:
+            from collections import Counter
+            sent_counts = Counter(sentences)
+            repeated = sum(c for c in sent_counts.values() if c > 1)
+            if repeated / len(sentences) >= 0.50:
+                return True
 
         return False
 

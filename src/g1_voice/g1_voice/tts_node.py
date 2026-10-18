@@ -492,8 +492,11 @@ class TTSNode(Node):
             # the first streamed sentence(s) of each turn are spoken with the
             # PREVIOUS turn's language voice.
             self._turn_language = language
-            self._turn_had_transcript = True
             self._reset_turn()
+            # Set AFTER _reset_turn(): the reset clears this flag, and setting
+            # it first (the old order) left it False, so the continuous-mode
+            # _TURN_END auto-trigger never fired and chained turns stalled.
+            self._turn_had_transcript = True
 
     def _language_and_text(self, text: str):
         """Return the explicit or remembered language and clean response text."""
