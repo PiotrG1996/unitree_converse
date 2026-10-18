@@ -80,6 +80,8 @@ class _FakeWakeNode:
         # Duration cap + empty-turn limit (session-close conditions).
         self.session_max_duration_sec = 300.0
         self.max_empty_turns = 4
+        # Session state observability (mirrors WakeWordNode.__init__)
+        self._session_state = 'idle'
         # Backoff state
         self.base_cooldown = 8.0
         self.cooldown = 8.0
@@ -101,6 +103,7 @@ class _FakeWakeNode:
         self.oww_detector = _FakeDetector()
         self.trigger_pub = _FakePub()
         self.status_pub = _FakePub()
+        self.session_state_pub = _FakePub()
         self.continuous_start_pub = _FakePub()
         self.continuous_stop_pub = _FakePub()
         # Bind the real production helpers.
@@ -110,6 +113,7 @@ class _FakeWakeNode:
         self._close_session = lambda reason: cls._close_session(self, reason)
         self._can_trigger = lambda: cls._can_trigger(self)
         self._fire_trigger = lambda source: cls._fire_trigger(self, source)
+        self._publish_session_state = lambda: cls._publish_session_state(self)
         self._in_session_refresh = (
             lambda score: cls._in_session_refresh(self, score))
         self._log_burst_telemetry = lambda: cls._log_burst_telemetry(self)
@@ -243,6 +247,8 @@ class TestBackoffEscalation(unittest.TestCase):
         node = _FakeWakeNode()
         node._wake_open()
         node.last_session_activity = time.time() - 15.0
+        # Pipeline busy -> refresh-only path (no new turn)
+        node.tts_busy = True
         node._in_session_refresh(0.99)
         self.assertTrue(node.session_open)
         self.assertAlmostEqual(

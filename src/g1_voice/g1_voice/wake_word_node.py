@@ -152,6 +152,8 @@ class WakeWordNode(Node):
         # answers). "Aletta" opens it (START can only end it); 15 s of turn
         # silence closes it. Turn activity = trigger fired / STT/LLM/TTS busy.
         self.session_open = False
+        self._session_state = 'idle'
+        self._publish_session_state()
         self.last_session_activity = 0.0
         self.session_opened_at = 0.0
         self.empty_turns = 0
@@ -170,6 +172,12 @@ class WakeWordNode(Node):
             Bool, '/g1/voice/continuous_start', 10)
         self.continuous_stop_pub = self.create_publisher(
             Bool, '/g1/voice/continuous_stop', 10)
+        # Session-state observability: idle / opening / refreshing / closed.
+        # Operators can query this to tell whether "Aletta" is actually
+        # opening a new session or just refreshing an open one.
+        self.session_state_pub = self.create_publisher(
+            String, '/g1/wake/session_state', 10)
+        self._session_state = 'idle'
 
         self.stt_busy = False
         self.llm_busy = False
@@ -261,6 +269,12 @@ class WakeWordNode(Node):
             return True
         return (time.time() - self._last_tts_busy) < self.echo_guard_sec
 
+    def _publish_session_state(self):
+        """Publish the current session state for observability."""
+        msg = String()
+        msg.data = self._session_state
+        self.session_state_pub.publish(msg)
+
     def _touch_session(self):
         """Mark turn activity (keeps the conversation window open)."""
         self.last_session_activity = time.time()
@@ -273,6 +287,8 @@ class WakeWordNode(Node):
         if not was_open:
             self.session_opened_at = time.time()
             self.empty_turns = 0
+            self._session_state = 'opening'
+            self._publish_session_state()
             # Enable chained turns downstream (STT continuous_mode + TTS
             # _TURN_END auto-trigger). Without this the window is local-only.
             msg = Bool()
@@ -282,9 +298,14 @@ class WakeWordNode(Node):
                 f'Conversation session OPEN ({source}) — closes on START, '
                 f'{self.max_empty_turns} empty turns, or '
                 f'{self.session_max_duration_sec:.0f}s max duration')
+        else:
+            # Session already open: this is a refresh, not a new opening.
+            self._session_state = 'refreshing'
+            self._publish_session_state()
 
     def _close_session(self, reason: str):
         """Close the window: back to throttled wait, no answers."""
+        was_open = self.session_open
         if self.session_open:
             msg = Bool()
             msg.data = True
@@ -293,6 +314,9 @@ class WakeWordNode(Node):
         self.last_session_activity = 0.0
         self.session_opened_at = 0.0
         self.empty_turns = 0
+        if was_open:
+            self._session_state = 'closed'
+            self._publish_session_state()
         # False-accept backoff: a wake-opened session that ends with NO LLM
         # reply was almost certainly a false accept (or hallucination turns
         # nobody asked for). Exponentially increase the cooldown so the idle
@@ -345,11 +369,25 @@ class WakeWordNode(Node):
                 f'{self.session_max_duration_sec:.0f}s)')
 
     def _in_session_refresh(self, score):
-        """Refresh an open session on a fresh wake-word detection."""
+        """Refresh an open session on a fresh wake-word detection.
+
+        When the pipeline is free (not recording / transcribing / thinking /
+            speaking),
+        "Aletta" during an open session starts a fresh STT turn — just like F1
+        push-to-talk. When the pipeline is busy, we only refresh the session
+        window and log it, avoiding a race with the TTS _TURN_END chain.
+        """
         self._touch_session()
-        self.get_logger().info(
-            'Aletta heard during open session '
-            f'(score={score:.2f}) - session refreshed')
+        if not (self.stt_busy or self.llm_busy or self.tts_busy):
+            self.get_logger().info(
+                'Aletta during open session — starting new turn '
+                f'(score={score:.2f})')
+            self._fire_trigger('aletta_wake_word')
+        else:
+            self.get_logger().info(
+                'Aletta heard during open session '
+                f'(score={score:.2f}) - session refreshed '
+                '(pipeline busy, no new turn)')
 
     def _fire_trigger(self, source: str):
         if not self._can_trigger():

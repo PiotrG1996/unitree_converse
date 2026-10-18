@@ -136,6 +136,8 @@ class _FakeWakeNode:
         self.false_accept_count = 0
         self.false_accept_backoff_multiplier = 2.0
         self.max_false_accept_cooldown = 60.0
+        # Session state observability (mirrors WakeWordNode.__init__)
+        self._session_state = 'idle'
         # Trigger/pipeline state
         self.last_trigger_time = 0.0
         self.stt_busy = False
@@ -144,6 +146,7 @@ class _FakeWakeNode:
         # Publishers observed by the tests
         self.trigger_pub = _FakePub()
         self.status_pub = _FakePub()
+        self.session_state_pub = _FakePub()
         self.continuous_start_pub = _FakePub()
         self.continuous_stop_pub = _FakePub()
         cls = _wake_module.WakeWordNode
@@ -152,6 +155,7 @@ class _FakeWakeNode:
         self._close_session = lambda reason: cls._close_session(self, reason)
         self._can_trigger = lambda: cls._can_trigger(self)
         self._fire_trigger = lambda source: cls._fire_trigger(self, source)
+        self._publish_session_state = lambda: cls._publish_session_state(self)
         self.manual_stop_callback = (
             lambda msg: cls.manual_stop_callback(self, msg))
 
