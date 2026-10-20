@@ -81,6 +81,12 @@ class STTNode(Node):
         self.declare_parameter('silence_threshold', 0.008)
         self.declare_parameter('silence_duration', 2.0)
         self.declare_parameter('use_udp_mic', True)
+        # Log the mic path that will actually be used at startup, so a
+        # session-open with zero recording/transcription lines in the logs
+        # is diagnosable: it is either the UDP multicast path (points to a
+        # wire/delivery or socket-binding problem) or the sounddevice path
+        # (points to a device/driver problem).
+        self._mic_path_logged = False
         self.declare_parameter('udp_multicast_group', '239.168.123.161')
         self.declare_parameter('udp_port', 5555)
         self.declare_parameter('udp_local_ip', '192.168.123.164')
@@ -334,12 +340,35 @@ class STTNode(Node):
                                  args=(delay,), daemon=True).start()
                 return
             self.get_logger().info('Trigger received — starting recording')
+            if not self._mic_path_logged:
+                self._mic_path_logged = True
+                self.get_logger().info(
+                    f'Mic path = {"UDP multicast" if self.use_udp_mic else "sounddevice"} '
+                    f'(multicast_group={self.udp_multicast_group}, '
+                    f'port={self.udp_port}, local_ip={self.udp_local_ip})')
             # An external trigger means the loop is being driven normally; cancel
             # the self-retrigger watchdog for this turn.
             with self._watchdog_lock:
                 if self._watchdog is not None:
                     self._watchdog.cancel()
             threading.Thread(target=self._record_and_transcribe, daemon=True).start()
+        else:
+            # Explicit visibility into dropped/wasted trigger firings so a
+            # stalled loop can be diagnosed from the logs:
+            #   - a second trigger while already recording means the session
+            #     was reopened but the previous turn's thread was still alive;
+            #   - a false trigger during idle means a wake-word or pad
+            #     event fired while nothing is listening.
+            # NOTE: INFO (not DEBUG) so a session-open with zero
+            # recording/transcription lines is diagnosable from journalctl,
+            # which only shows INFO and above by default.
+            if msg.data:
+                self.get_logger().warn(
+                    'Trigger received but ignored — already '
+                    f'recording ({self.is_recording})')
+            else:
+                self.get_logger().warn(
+                    'Trigger received with data=False — no-op')
 
     def stop_callback(self, msg: Bool):
         if msg.data:
@@ -467,6 +496,7 @@ class STTNode(Node):
         self._transcript_published = False
         self._turn_had_transcript = False
         self._publish_status('recording')
+        self.get_logger().info('Recording started — capturing audio...')
 
         if self.use_udp_mic:
             audio_data = self._record_via_udp()
@@ -545,6 +575,9 @@ class STTNode(Node):
                     self.get_logger().info(
                         f'Transcript: "{transcript}" '
                         f'(avg_logprob={mean_logprob:.2f})')
+                    self.get_logger().info(
+                        'PUBLISHING /g1/stt/transcript with digest: '
+                        f'"{transcript[:80]}..."')
                     msg = String()
                     msg.data = (
                         f'[USER_LANGUAGE:{detected_language}]\n{transcript}')

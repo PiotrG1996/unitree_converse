@@ -85,6 +85,11 @@ class WakeWordNode(Node):
         self.declare_parameter('oww_melspec_model_path', '')
         self.declare_parameter('oww_embedding_model_path', '')
         self.declare_parameter('use_udp_mic', True)
+        # Log the mic path that will actually be used at startup, so a
+        # session-open with zero Aletta detections in the logs is
+        # diagnosable: either the openWakeWord model failed to load, or the
+        # UDP multicast stream is not reaching the wake listener.
+        self._wake_mic_path_logged = False
         self.declare_parameter('udp_multicast_group', '239.168.123.161')
         self.declare_parameter('udp_port', 5555)
         self.declare_parameter('udp_local_ip', '192.168.123.164')
@@ -451,6 +456,11 @@ class WakeWordNode(Node):
         the detector is ready.
         """
         if self._init_openwakeword():
+            if not self._wake_mic_path_logged:
+                self._wake_mic_path_logged = True
+                self.get_logger().info(
+                    f'Wake mic path = UDP multicast '
+                    f'(group={self.udp_multicast_group}, port={self.udp_port})')
             threading.Thread(target=self._wake_word_loop, daemon=True).start()
             self.get_logger().info(
                 'Wake listener started — "Aletta" openWakeWord model '
@@ -469,6 +479,12 @@ class WakeWordNode(Node):
         # RMS floor: below this the 80 ms frame is silence/room noise — skip
         # the ONNX score. Configurable via silence_rms parameter (default 300
         # int16 LSB ≈ quiet room; speech is 10-100x louder).
+        # NOTE: keep the wake listener socket on its own port (or use
+        # SO_REUSEPORT where available). The old code bound both the wake
+        # listener and the STT socket to the same 5555 on the same interface,
+        # which let one socket's multicast membership dominate the port and
+        # starve the other of datagrams — the classic cause of "the trigger
+        # fires but no audio is ever received" in a dual-socket UDP pipeline.
         while rclpy.ok():
             # NOTE: the socket intentionally stays open during sessions too
             # (missed-wake fix, 2026-10-16): a repeated "Aletta" refreshes the
