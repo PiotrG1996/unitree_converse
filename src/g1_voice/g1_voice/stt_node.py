@@ -565,6 +565,8 @@ class STTNode(Node):
                     f'Unsupported language {detected_language or "unknown"}, '
                     f'defaulting to English')
                 detected_language = 'en'
+                if best_language is None:
+                    best_language = detected_language
 
             if transcript and self._looks_like_noise(transcript):
                 self.get_logger().info(
@@ -590,7 +592,7 @@ class STTNode(Node):
                         f'"{transcript[:80]}..."')
                     msg = String()
                     msg.data = (
-                        f'[USER_LANGUAGE:{detected_language}]\n{transcript}')
+                        f'[USER_LANGUAGE:{best_language}]\n{transcript}')
                     self.transcript_pub.publish(msg)
                     self._transcript_published = True
                     # Continuous-mode handoff: a valid user transcript

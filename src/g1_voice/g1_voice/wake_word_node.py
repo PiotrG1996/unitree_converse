@@ -359,6 +359,11 @@ class WakeWordNode(Node):
 
     def _can_trigger(self):
         now = time.time()
+        # Allow trigger if session is open AND cooldown has passed — wake word
+        # must be able to refresh the session window (missed-wake prevention,
+        # 2026-10-17), but respect the cooldown to avoid rapid-firing.
+        if self.session_open and (now - self.last_trigger_time) >= self.cooldown:
+            return True
         if self.stt_busy or self.llm_busy or self.tts_busy:
             return False
         if (now - self.last_trigger_time) < self.cooldown:
