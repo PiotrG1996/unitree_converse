@@ -6,7 +6,7 @@ A complete voice conversation pipeline for the **Unitree G1 humanoid robot** ("A
 
 ## Demo
 
-- **Say "Aletta"** → robot wakes and opens a conversation session (turns chain automatically; closes after 15 s of silence)
+- **Say "Aletta"** → robot wakes and opens a conversation session (turns chain automatically; closes after 15 s of silence). Saying "Aletta" *during* an open session starts a fresh STT turn when the pipeline is free; otherwise it just refreshes the session window.
 - **Hold F1** on the Unitree remote → robot listens → release F1 → robot responds
 - **Press START** → end the conversation session immediately (kill switch — sessions start only via "Aletta")
 - **Press F3** → mute/unmute the robot's spoken replies (processing continues while muted)
@@ -281,6 +281,7 @@ the same native audio worker.
 | `/g1/voice/stop_recording` | `std_msgs/Bool` | Stop recording (F1 released) |
 | `/g1/voice/continuous_start` | `std_msgs/Bool` | Enable continuous mode |
 | `/g1/voice/continuous_stop` | `std_msgs/Bool` | Disable continuous mode |
+| `/g1/wake/session_state` | `std_msgs/String` | Session state: idle/opening/refreshing/closed |
 | `/g1/stt/transcript` | `std_msgs/String` | Raw transcribed speech |
 | `/g1/stt/status` | `std_msgs/String` | recording/transcribing/idle |
 | `/g1/robot_state` | `std_msgs/String` | Live robot state |
@@ -325,6 +326,14 @@ always-on mode: saying "Aletta" opens a **conversation session** — a window in
 which turns chain automatically (the end of one reply re-arms listening) — and
 the window closes itself after `session_silence_timeout` seconds (15 s by
 default) with no turn activity. START cannot open a session; it only ends one.
+
+Session state is published on `/g1/wake/session_state` (`std_msgs/String`) as one of
+`idle`, `opening`, `refreshing`, `closed` so operators can tell whether "Aletta"
+opened a new session or merely refreshed an open one. When the pipeline is free
+(not recording/transcribing/thinking/speaking), saying "Aletta" *during* an open
+session starts a fresh STT turn — just like holding F1. When the pipeline is busy,
+"Aletta" only refreshes the session window (avoiding a race with the TTS turn-end
+chain).
 
 The only voice trigger is the name **"Aletta"**, detected by a custom
 openWakeWord model on the G1 UDP microphone. There is no Whisper phrase

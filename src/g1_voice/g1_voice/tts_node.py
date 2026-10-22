@@ -118,6 +118,47 @@ class TTSNode(Node):
         self.output_device = self._param('output_device')
         self.output_sample_rate = self._param('output_sample_rate')
         self.network_interface = self._param('network_interface')
+        # Ask the main loop to spawn the native G1 audio worker subprocess.
+        # The worker is a separate long-lived process; if it dies (or is
+        # never present), the speech pipeline is un-blocked and continues
+        # to work, while replay/backlog is handled by re-launching the
+        # worker. This is done asynchronously so a dead worker can never
+        # stall the single speech-queue thread.
+        self._audio_worker = None
+        self._worker_relaunch_requested = True
+        self.create_timer(0.5, self._maybe_launch_worker)
+        # Remaining init (params, streaming state, subscriptions) needs
+        # get_logger()/create_* so it stays in the node lifecycle, just
+        # after the worker hand-off above.
+        self._init_after_worker()
+
+    def _maybe_launch_worker(self):
+        """Spawn the native G1 audio worker if it is missing/dead.
+
+        The speech thread (_play_audio) only reads/writes an already
+        installed handle; installing or replacing the subprocess happens
+        exclusively here, on the executor thread, so two threads can
+        never race to spawn workers.
+        """
+        if not self._worker_relaunch_requested:
+            return
+        # A worker is considered alive if it has been spawned and is
+        # still running (hasn't been replaced). If it is None or dead,
+        # relaunch it now.
+        if self._audio_worker is not None and self._audio_worker.poll() is None:
+            self._worker_relaunch_requested = False
+            return
+
+        self._worker_relaunch_requested = False
+        # Drop the dead handle's pipes so repeated failures don't leak fds.
+        old = self._audio_worker
+        if old is not None:
+            for pipe in (old.stdin, old.stdout):
+                if pipe is not None:
+                    try:
+                        pipe.close()
+                    except Exception:
+                        pass
         worker_path = os.path.join(
             os.path.dirname(os.path.abspath(__file__)),
             'g1_audio_worker.py'
@@ -130,21 +171,47 @@ class TTSNode(Node):
             text=True,
             bufsize=1
         )
-        ready_line = self._audio_worker.stdout.readline()
-        if not ready_line:
-            raise RuntimeError(
-                'G1 audio worker exited during startup; check its error output'
+        # Confirm the worker is up before returning. If it dies during
+        # startup the next _maybe_launch_worker pass catches it (poll() !=
+        # None) and relaunch again instead of stalling on a broken pipe.
+        try:
+            ready_line = self._audio_worker.stdout.readline()
+            if not ready_line:
+                self.get_logger().error(
+                    'G1 audio worker exited during startup; check its error output'
+                )
+                self._audio_worker = None
+                self._worker_relaunch_requested = True
+                return
+            ready = json.loads(ready_line)
+            if not ready.get('ready'):
+                self.get_logger().error(
+                    'G1 audio worker initialization failed: '
+                    + ready.get('error', 'unknown error')
+                )
+                try:
+                    self._audio_worker.terminate()
+                except Exception:
+                    pass
+                self._audio_worker = None
+                self._worker_relaunch_requested = True
+                return
+            self.get_logger().info(
+                f'Native G1 audio worker initialized on {self.network_interface}'
             )
-        ready = json.loads(ready_line)
-        if not ready.get('ready'):
-            self._audio_worker.terminate()
-            raise RuntimeError(
-                'G1 audio worker initialization failed: '
-                + ready.get('error', 'unknown error')
+        except Exception as e:
+            self.get_logger().error(
+                f'Failed to read G1 audio worker startup message: {e}'
             )
-        self.get_logger().info(
-            f'Native G1 audio worker initialized on {self.network_interface}'
-        )
+            try:
+                self._audio_worker.terminate()
+            except Exception:
+                pass
+            self._audio_worker = None
+            self._worker_relaunch_requested = True
+
+    def _init_after_worker(self):
+        """Finish TTSNode setup once the audio-worker hand-off is staged."""
         self.tts_mode = self._param('tts_mode')
         self.piper_binary = self._param('piper_binary')
         self.piper_lib_dir = self._param('piper_lib_dir')
@@ -170,6 +237,12 @@ class TTSNode(Node):
         self._stream_text = ''
         self._stream_remaining = ''
         self._stream_saw_chunk = False
+        # Turn generation counter: bumped on every transcript reset. Each
+        # streamed chunk stamps the current generation, so response_callback
+        # can tell live chunks of THIS turn apart from a stale buffer left
+        # by a previous turn (which must be discarded, not re-spoken).
+        self._turn_seq = 0
+        self._stream_seq = -1
         # Count of complete sentences already enqueued this turn, so a
         # cumulative re-split only speaks the not-yet-spoken tail.
         self._stream_spoken = 0
@@ -274,7 +347,9 @@ class TTSNode(Node):
         if src_rate != self.output_sample_rate:
             audio = self._resample(audio, src_rate, self.output_sample_rate)
 
-        self._play_audio(audio, self.output_sample_rate)
+        timeout = 30.0 + 3.0 * len(audio) / float(self.output_sample_rate)
+        self._play_audio_with_timeout(
+            audio, self.output_sample_rate, timeout_sec=timeout)
 
     def response_callback(self, msg: String):
         try:
@@ -291,6 +366,15 @@ class TTSNode(Node):
             self.get_logger().warning('Ignoring empty response after language marker')
             return
 
+        # Only trust previously streamed chunks when they belong to THIS
+        # turn: the transcript reset bumps _turn_seq, and stream_callback
+        # stamps each chunk with it. A final reply arriving without a
+        # transcript reset (re-prompt, missed transcript, out-of-order
+        # delivery) must NOT re-split a stale buffer from a previous turn —
+        # that spoke the old reply again.
+        streamed_this_turn = (self._stream_saw_chunk and
+                              self._stream_seq == self._turn_seq)
+
         # Latch the turn language FIRST: live llm_stream deltas carry plain
         # text (no marker), so stream_callback speaks them with whatever
         # language is latched for this turn. Close the turn after flushing so
@@ -304,9 +388,15 @@ class TTSNode(Node):
         # reply here so the turn is still spoken exactly once, in the
         # language latched from the STT USER_LANGUAGE marker.
         if self._streaming_enabled:
-            if not self._stream_saw_chunk:
+            if not streamed_this_turn:
+                # No live chunks for THIS turn (or stale chunks from a past
+                # turn): speak the full reply exactly once, discarding any
+                # stale buffer.
                 self._stream_text = ''
                 self._stream_remaining = ''
+                self._stream_saw_chunk = False
+                self._stream_spoken = 0
+                self._turn_open = True
                 self._on_stream_chunk(reply, language)
             else:
                 # Reconcile tail: the buffer already reflects every live
@@ -328,12 +418,16 @@ class TTSNode(Node):
         Manual speech path (e.g. SELECT pad button): bypasses STT/LLM and the
         streaming turn state entirely. The line is queued behind any in-flight
         reply and never emits _TURN_END, so continuous mode is not retriggered.
-        Mute (F3 / speak_enable) is honoured downstream in _speak().
+        Mute (F3 / speak_enable) is honoured downstream in _speak(). The
+        latched reply language is left untouched: consuming it here would
+        steal the voice routing of an in-flight LLM reply.
         """
         text = (msg.data or '').strip()
         if not text:
             return
-        language, text = self._language_and_text(text)
+        # Non-consuming read: SELECT must not steal the voice routing of an
+        # in-flight LLM reply (see _language_and_text).
+        language, text = self._language_and_text(text, consume_latched=False)
         if not text:
             self.get_logger().warning('Ignoring empty say_text after language marker')
             return
@@ -368,8 +462,17 @@ class TTSNode(Node):
         ).astype(np.float32)
 
     def _play_audio(self, audio: np.ndarray, src_rate: int):
-        """Send synthesized PCM to the separate native G1 audio worker."""
+        """Send synthesized PCM to the separate native G1 audio worker.
+
+        On any failure (dead worker, closed pipe, error reply) this method
+        tears down only the worker handle IT was using and asks the node's
+        timer to spawn a fresh one, so a stale thread can never kill a
+        newer worker. A dead worker closes the pipe, so readline() returns
+        immediately; a worker that hangs alive is bounded by the caller's
+        _play_audio_with_timeout() deadline.
+        """
         temp_path = None
+        worker = None
         try:
             audio = np.asarray(audio, dtype=np.float32).reshape(-1)
             if src_rate != 16000:
@@ -387,18 +490,30 @@ class TTSNode(Node):
                 temp_file.write(pcm_data)
                 temp_path = temp_file.name
 
-            if self._audio_worker.poll() is not None:
-                raise RuntimeError("G1 audio worker is no longer running")
+            # Pin the handle: a late failure below must tear down exactly
+            # this worker, not a newer one spawned in the meantime.
+            worker = self._audio_worker
+            if worker is None or worker.poll() is not None:
+                self.get_logger().error(
+                    "G1 audio worker is not running — relaunching")
+                raise RuntimeError("G1 audio worker not running")
 
-            self._audio_worker.stdin.write(json.dumps({
+            worker.stdin.write(json.dumps({
                 "command": "play",
                 "path": temp_path
             }) + "\n")
-            self._audio_worker.stdin.flush()
+            worker.stdin.flush()
 
-            response_line = self._audio_worker.stdout.readline()
+            # Block on the worker's single completion line. The worker
+            # plays the whole utterance paced to realtime and only then
+            # writes {"ok": true}, so this wait is sentence-length by
+            # design. A dead worker closes the pipe -> readline() returns
+            # "" immediately -> handled below. A worker that hangs alive
+            # is bounded by _play_audio_with_timeout()'s outer deadline.
+            response_line = worker.stdout.readline()
             if not response_line:
-                raise RuntimeError("G1 audio worker closed its response pipe")
+                raise RuntimeError(
+                    "G1 audio worker closed its response pipe")
 
             response = json.loads(response_line)
             if not response.get("ok"):
@@ -409,7 +524,30 @@ class TTSNode(Node):
             self.get_logger().info("Playback complete via native G1 speaker")
 
         except Exception as e:
-            self.get_logger().error(f"Native G1 audio playback failed: {e}")
+            self.get_logger().error(
+                f"Native G1 audio playback failed: {e}")
+            # Tear down exactly the handle this call pinned, and flag the
+            # node's timer to spawn a fresh worker. Without the flag, the
+            # (gated) _maybe_launch_worker() would never run and TTS would
+            # stay dead until the whole node restarts. If a newer worker
+            # was already installed, leave it alone (only ours dies).
+            if worker is not None:
+                if self._audio_worker is worker:
+                    self._audio_worker = None
+                self._worker_relaunch_requested = True
+                # Closing stdin ends the worker's command loop cleanly; the
+                # pipes are closed too so we don't leak fds across failures.
+                for pipe in (worker.stdin, worker.stdout):
+                    if pipe is not None:
+                        try:
+                            pipe.close()
+                        except Exception:
+                            pass
+                try:
+                    worker.terminate()
+                except Exception:
+                    pass
+            raise
         finally:
             if temp_path and os.path.exists(temp_path):
                 try:
@@ -492,11 +630,23 @@ class TTSNode(Node):
             # the first streamed sentence(s) of each turn are spoken with the
             # PREVIOUS turn's language voice.
             self._turn_language = language
-            self._turn_had_transcript = True
             self._reset_turn()
+            # Set AFTER _reset_turn(): the reset clears this flag, and setting
+            # it first (the old order) left it False, so the continuous-mode
+            # _TURN_END auto-trigger never fired and chained turns stalled.
+            self._turn_had_transcript = True
 
-    def _language_and_text(self, text: str):
-        """Return the explicit or remembered language and clean response text."""
+    def _language_and_text(self, text: str, consume_latched: bool = True):
+        """Return the explicit or remembered language and clean response text.
+
+        Args:
+            text: Raw reply, optionally prefixed with a [USER_LANGUAGE:xx]
+                marker.
+            consume_latched: When True (LLM reply path), a previously latched
+                language is consumed (one-shot). When False (SELECT say_text
+                path), the latch is left intact so an in-flight reply keeps
+                its voice routing.
+        """
         match = re.match(
             r'^\s*\[USER_LANGUAGE:(pl|en)\]\s*\n',
             text,
@@ -509,13 +659,48 @@ class TTSNode(Node):
 
         with self._response_language_lock:
             language = self._response_language
-            self._response_language = None
+            if consume_latched:
+                self._response_language = None
 
         if language is None:
             language = "pl" if self._is_polish_text(text) else "en"
         self.get_logger().info(
             f'TTS language selected from latest user turn: {language}')
         return language, text.strip()
+
+    # Backwards-compatible alias used by older call sites/tests.
+    def _language_and_text_preserve(self, text: str):
+        return self._language_and_text(text, consume_latched=False)
+
+    def _play_audio_with_timeout(self, audio, src_rate, timeout_sec: float = 60.0) -> bool:
+        """Run _play_audio in a bounded thread and bound its wall-clock time.
+
+        _play_audio blocks on the audio worker's stdout with no timeout: a
+        dead worker would block the speech-queue thread forever. Running it
+        in a daemon thread lets us enforce timeout_sec and skip ahead.
+        Returns True on clean playback, False on timeout/failure.
+        """
+        done = threading.Event()
+        outcome = {'ok': False}
+
+        def _run():
+            try:
+                self._play_audio(audio, src_rate)
+                outcome['ok'] = True
+            except Exception:
+                outcome['ok'] = False
+            finally:
+                done.set()
+
+        worker = threading.Thread(target=_run, daemon=True)
+        worker.start()
+        if not done.wait(timeout=timeout_sec):
+            self.get_logger().error(
+                f'TTS playback timed out after {timeout_sec:.0f}s — '
+                'skipping to next queue item')
+            self._publish_status('error')
+            return False
+        return outcome['ok']
 
     def _warn_on_language_mismatch(self, reply: str, language: str):
         """
@@ -548,6 +733,25 @@ class TTSNode(Node):
         self._stream_spoken = 0
         self._turn_open = True
         self._turn_had_transcript = False
+        self._turn_seq += 1
+        self._stream_seq = -1
+
+    def _reset_turn_state_only(self):
+        """Clear stream buffers without touching the transcript flag.
+
+        Kept for the unit-test harness and external callers that need a
+        buffer-only reset. Bumps the generation counter exactly like
+        _reset_turn() so stale llm_stream chunks of the previous turn are
+        still detected and discarded (differing only in the transcript
+        bookkeeping flag).
+        """
+        self._stream_text = ''
+        self._stream_remaining = ''
+        self._stream_saw_chunk = False
+        self._stream_spoken = 0
+        self._turn_open = True
+        self._turn_seq += 1
+        self._stream_seq = -1
 
     def stream_callback(self, msg: String):
         """
@@ -583,6 +787,7 @@ class TTSNode(Node):
             return
         self._turn_language = language
         self._stream_saw_chunk = True
+        self._stream_seq = self._turn_seq
 
         # Drop a leading language marker if it somehow arrives in-stream.
         if not self._stream_text and chunk.startswith('[USER_LANGUAGE:'):
@@ -639,7 +844,10 @@ class TTSNode(Node):
             return
 
         audio = np.concatenate(chunks).astype(np.float32)
-        self._play_audio(audio, native_sr)
+        # Bound playback time: a stuck audio worker must not stall the
+        # single speech-queue thread forever (see _play_audio_with_timeout).
+        timeout = 30.0 + 3.0 * len(audio) / float(native_sr)
+        self._play_audio_with_timeout(audio, native_sr, timeout_sec=timeout)
 
     @staticmethod
     def _is_polish_text(text: str) -> bool:
@@ -887,6 +1095,9 @@ class TTSNode(Node):
 
 
 def main(args=None):
+    # args=None lets rclpy parse sys.argv, which is how launch files pass
+    # --ros-args/--params-file into the node; forcing [] would silently
+    # drop every parameter override from voice_real.launch.py.
     rclpy.init(args=args)
     node = TTSNode()
     try:

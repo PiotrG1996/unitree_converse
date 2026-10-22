@@ -5,6 +5,7 @@ import numpy as np
 import socket
 import struct
 import threading
+import time
 import re
 import os
 import ctypes
@@ -80,6 +81,12 @@ class STTNode(Node):
         self.declare_parameter('silence_threshold', 0.008)
         self.declare_parameter('silence_duration', 2.0)
         self.declare_parameter('use_udp_mic', True)
+        # Log the mic path that will actually be used at startup, so a
+        # session-open with zero recording/transcription lines in the logs
+        # is diagnosable: it is either the UDP multicast path (points to a
+        # wire/delivery or socket-binding problem) or the sounddevice path
+        # (points to a device/driver problem).
+        self._mic_path_logged = False
         self.declare_parameter('udp_multicast_group', '239.168.123.161')
         self.declare_parameter('udp_port', 5555)
         self.declare_parameter('udp_local_ip', '192.168.123.164')
@@ -108,6 +115,10 @@ class STTNode(Node):
         # this avg_logprob — only extreme Whisper garbage trips it. The value
         # is logged on every publish so it can be tightened with data.
         self.declare_parameter('min_publish_avg_logprob', -2.5)
+        # TTS echo guard: while the robot is speaking (and for this long
+        # after), the mic hears its own Piper voice. The watchdog defers and
+        # new triggers wait, mirroring the wake-word node's echo_guard_sec.
+        self.declare_parameter('tts_echo_guard_sec', 2.0)
 
         self.model_size = self._param('model_size')
         self.language = self._param('language')
@@ -129,11 +140,18 @@ class STTNode(Node):
         self.language_duel_override_margin = self._param(
             'language_duel_override_margin')
         self.min_publish_avg_logprob = self._param('min_publish_avg_logprob')
+        self.tts_echo_guard_sec = float(self._param('tts_echo_guard_sec'))
 
         self.is_recording = False
         self.stop_requested = False
         self._transcript_published = False
         self.llm_busy = False
+        # TTS echo tracking: timestamp of the last 'speaking' status and a
+        # latched busy flag. The mic must not open while the robot's own
+        # voice is on the air, or STT transcribes its own reply as a new
+        # user turn and the LLM answers it again (sentence repetition).
+        self.tts_busy = False
+        self._last_tts_speaking_time = 0.0
 
         # Pick a compute_type that is valid for the selected device. On CUDA,
         # plain 'int8' is not a supported quantisation; faster-whisper wants
@@ -170,6 +188,8 @@ class STTNode(Node):
             Bool, '/g1/voice/continuous_stop', self._continuous_stop_cb, 10)
         self.create_subscription(
             String, '/g1/llm/status', self._llm_status_callback, 10)
+        self.create_subscription(
+            String, '/g1/tts/status', self._tts_status_callback, 10)
 
         self.transcript_pub = self.create_publisher(String, '/g1/stt/transcript', 10)
         self.status_pub = self.create_publisher(String, '/g1/stt/status', 10)
@@ -239,26 +259,126 @@ class STTNode(Node):
                 self._watchdog.cancel()
             self._watchdog = self.create_timer(delay, self._watchdog_fire)
 
+    def _echo_guard_remaining(self) -> float:
+        """Seconds until the TTS echo guard expires (0 when inactive)."""
+        if self.tts_busy:
+            return self.tts_echo_guard_sec
+        remaining = (self.tts_echo_guard_sec -
+                     (time.time() - self._last_tts_speaking_time))
+        return max(0.0, remaining)
+
     def _watchdog_fire(self):
         self._watchdog.cancel()
         if self.llm_busy:
             self.get_logger().info(
                 'Continuous watchdog deferred while LLM is generating')
             self._schedule_self_retrigger(self.watchdog_interval)
+        elif self._tts_echo_active():
+            # TTS is speaking (or its ring-down is still on the mic): opening
+            # the mic now would transcribe the robot's own reply as a new
+            # user turn and the LLM would answer it again (repetition loop).
+            # Re-check at guard expiry instead of waiting a full interval —
+            # otherwise every healthy TTS handoff stalls ~15 s.
+            delay = self._echo_guard_remaining() + 0.2
+            self.get_logger().info(
+                f'Continuous watchdog deferred while TTS is speaking '
+                f'(retry in {delay:.1f}s)')
+            self._schedule_self_retrigger(delay)
         elif not self.is_recording:
             self.get_logger().info('Always-on watchdog — no reply received, listening again')
             self._retrigger()
 
+    def _delayed_trigger(self, delay: float,
+                         deadline: float = None):
+        """
+        Start recording after `delay` unless something else got there first.
+
+        Iterative: chained TTS sentences each re-arm the echo guard, and the
+        old recursive form re-slept forever (one stack frame per re-arm)
+        while holding a daemon thread.
+
+        In wake-word-gated mode (continuous_mode=False) we never give up on
+        the trigger: keep waiting for the echo guard to expire, then record.
+        In continuous mode the watchdog is the backstop, so a deadline cap is
+        acceptable there.
+        """
+        # Total wait budget from first call; re-entry passes the remainder.
+        if deadline is None:
+            # Non-continuous mode: no deadline — wait for the guard to expire.
+            # Continuous mode: cap at delay + 2x guard, then yield to watchdog.
+            if self.continuous_mode:
+                deadline = time.monotonic() + delay + self.tts_echo_guard_sec * 2
+            else:
+                deadline = None  # no cap
+        time.sleep(delay)
+        if self.is_recording:
+            return
+        if self._tts_echo_active():
+            remaining = self._echo_guard_remaining() + 0.2
+            if deadline is not None and time.monotonic() + remaining > deadline:
+                self.get_logger().info(
+                    'Delayed trigger exceeded wait budget — yielding to '
+                    'the watchdog')
+                return
+            # Playback restarted (e.g. next sentence) — wait for the new guard.
+            self.get_logger().info(
+                'Delayed trigger still guarded — re-waiting for TTS')
+            self._delayed_trigger(remaining, deadline)
+            return
+        self.get_logger().info('Trigger received — starting recording '
+                               '(after echo guard)')
+        # A watchdog may have been re-armed while we waited out the guard;
+        # cancel it so it cannot open a second overlapping recording.
+        with self._watchdog_lock:
+            if self._watchdog is not None:
+                self._watchdog.cancel()
+        threading.Thread(target=self._record_and_transcribe, daemon=True).start()
+
     def trigger_callback(self, msg: Bool):
         """Handle an external /g1/voice/trigger message to start recording."""
         if msg.data and not self.is_recording:
+            if self._tts_echo_active():
+                # The TTS _TURN_END handoff races playback start: queue a
+                # delayed start at guard expiry rather than dropping the
+                # trigger (dropping stalls chained turns until the 15 s
+                # watchdog fires).
+                delay = self._echo_guard_remaining() + 0.2
+                self.get_logger().info(
+                    f'Trigger deferred — TTS echo guard active '
+                    f'(starting in {delay:.1f}s)')
+                threading.Thread(target=self._delayed_trigger,
+                                 args=(delay,), daemon=True).start()
+                return
             self.get_logger().info('Trigger received — starting recording')
+            if not self._mic_path_logged:
+                self._mic_path_logged = True
+                self.get_logger().info(
+                    f'Mic path = {"UDP multicast" if self.use_udp_mic else "sounddevice"} '
+                    f'(multicast_group={self.udp_multicast_group}, '
+                    f'port={self.udp_port}, local_ip={self.udp_local_ip})')
             # An external trigger means the loop is being driven normally; cancel
             # the self-retrigger watchdog for this turn.
             with self._watchdog_lock:
                 if self._watchdog is not None:
                     self._watchdog.cancel()
             threading.Thread(target=self._record_and_transcribe, daemon=True).start()
+        else:
+            # Explicit visibility into dropped/wasted trigger firings so a
+            # stalled loop can be diagnosed from the logs:
+            #   - a second trigger while already recording means the session
+            #     was reopened but the previous turn's thread was still alive;
+            #   - a false trigger during idle means a wake-word or pad
+            #     event fired while nothing is listening.
+            # NOTE: INFO (not DEBUG) so a session-open with zero
+            # recording/transcription lines is diagnosable from journalctl,
+            # which only shows INFO and above by default.
+            if msg.data:
+                self.get_logger().warn(
+                    'Trigger received but ignored — already '
+                    f'recording ({self.is_recording})')
+            else:
+                self.get_logger().warn(
+                    'Trigger received with data=False — no-op')
 
     def stop_callback(self, msg: Bool):
         if msg.data:
@@ -277,6 +397,21 @@ class STTNode(Node):
 
     def _llm_status_callback(self, msg: String):
         self.llm_busy = msg.data == 'thinking'
+
+    def _tts_status_callback(self, msg: String):
+        """Track TTS playback so the mic never opens on the robot's voice."""
+        if msg.data == 'speaking':
+            self.tts_busy = True
+            self._last_tts_speaking_time = time.time()
+        elif msg.data in ('idle', 'error'):
+            self.tts_busy = False
+            self._last_tts_speaking_time = time.time()
+
+    def _tts_echo_active(self) -> bool:
+        """True while TTS is speaking or within the post-playback guard."""
+        if self.tts_busy:
+            return True
+        return (time.time() - self._last_tts_speaking_time) < self.tts_echo_guard_sec
 
     @staticmethod
     def _looks_like_noise(text: str) -> bool:
@@ -306,11 +441,19 @@ class STTNode(Node):
         # Immediate phrase repetition: a run of >=2 words that is immediately
         # repeated (e.g. "thank you very much thank you very much", "it's a
         # mouthful it's a mouthful"). This is the classic Whisper hallucination
-        # loop and the single-word ratio check above misses it.
+        # loop and the single-word ratio check above misses it. Only flag when
+        # the repetition dominates the transcript (>=70% of words): real speech
+        # can contain a repeated phrase for emphasis without being noise.
         for p in range(2, len(words) // 2 + 1):
             for i in range(0, len(words) - 2 * p + 1):
                 if words[i:i + p] == words[i + p:i + 2 * p]:
-                    return True
+                    repeated_words = 2 * p
+                    j = i + 2 * p
+                    while j + p <= len(words) and words[j:j + p] == words[i:i + p]:
+                        repeated_words += p
+                        j += p
+                    if repeated_words / len(words) >= 0.70:
+                        return True
 
         # Repetition ratio: (occurrences of most common word) / total words.
         # Loops like "sorry sorry sorry sorry" score high. Require >=4 words so a
@@ -341,12 +484,29 @@ class STTNode(Node):
                 if word[:unit_len * 3] == unit * 3:
                     return True
 
+        # Sentence-level repetition: Whisper often repeats the same sentence
+        # with minor word variation (e.g. "What's up everyone? What's up
+        # everybody? What's up everybody?"). Exact-phrase matching above
+        # misses this because "everyone" != "everybody". Split into
+        # sentences, normalize, and flag when repeated sentences dominate the
+        # transcript.
+        sentence_parts = re.split(r'[.!?;]+', t)
+        sentences = [s.strip().lower() for s in sentence_parts if s.strip()]
+        if len(sentences) >= 2:
+            from collections import Counter
+            sent_counts = Counter(sentences)
+            repeated = sum(c for c in sent_counts.values() if c > 1)
+            if repeated / len(sentences) >= 0.50:
+                return True
+
         return False
 
     def _record_and_transcribe(self):
         self.is_recording = True
         self._transcript_published = False
+        self._turn_had_transcript = False
         self._publish_status('recording')
+        self.get_logger().info('Recording started — capturing audio...')
 
         if self.use_udp_mic:
             audio_data = self._record_via_udp()
@@ -355,6 +515,9 @@ class STTNode(Node):
 
         if audio_data is None or len(audio_data) == 0:
             self.get_logger().warn('No audio recorded')
+            # Contract with wake_word_node.stt_status_callback: a turn with
+            # no audio is an empty turn (counts toward max_empty_turns).
+            self._publish_status('empty_turn')
             self._publish_status('idle')
             self.is_recording = False
             if self.continuous_mode:
@@ -393,10 +556,17 @@ class STTNode(Node):
                 f'Whisper detected language: {detected_language} '
                 f'(probability={language_probability:.2f})')
             if detected_language not in ('pl', 'en'):
+                # Whisper's auto language detection is unreliable on noisy
+                # mic audio (e.g. 'es' at probability=0.54 for real English
+                # speech). Don't throw away a valid transcript: default to
+                # English for TTS/LTS routing. The text itself is what the
+                # LLM sees.
                 self.get_logger().warn(
-                    f'Ignoring speech detected as unsupported language: '
-                    f'{detected_language or "unknown"}')
-                transcript = ''
+                    f'Unsupported language {detected_language or "unknown"}, '
+                    f'defaulting to English')
+                detected_language = 'en'
+                if best_language is None:
+                    best_language = detected_language
 
             if transcript and self._looks_like_noise(transcript):
                 self.get_logger().info(
@@ -417,28 +587,56 @@ class STTNode(Node):
                     self.get_logger().info(
                         f'Transcript: "{transcript}" '
                         f'(avg_logprob={mean_logprob:.2f})')
+                    self.get_logger().info(
+                        'PUBLISHING /g1/stt/transcript with digest: '
+                        f'"{transcript[:80]}..."')
                     msg = String()
                     msg.data = (
-                        f'[USER_LANGUAGE:{detected_language}]\n{transcript}')
+                        f'[USER_LANGUAGE:{best_language}]\n{transcript}')
                     self.transcript_pub.publish(msg)
                     self._transcript_published = True
+                    # Continuous-mode handoff: a valid user transcript
+                    # (not a noise/empty turn) lets the continuous-loop
+                    # re-arm. The LLM/TTS path closes the turn via
+                    # _TURN_END, which re-triggers listening.
+                    self._turn_had_transcript = True
             else:
                 self.get_logger().warn('Empty transcript — nothing detected')
 
         except Exception as e:
             self.get_logger().error(f'Transcription error: {e}')
             self._publish_status('error')
+            # No transcript came out of this turn — report it as empty so
+            # the session can still close crisply via max_empty_turns
+            # instead of lingering until the duration cap.
+            self._publish_status('empty_turn')
             self.is_recording = False
             if self.continuous_mode:
                 self._schedule_self_retrigger()
             return
 
+        if not self._transcript_published:
+            # Contract with wake_word_node.stt_status_callback: every turn
+            # with no published transcript (silence, noise, unsupported
+            # language, dropped low-confidence decode) reports 'empty_turn'
+            # so the max_empty_turns close can function. Without this the
+            # wake node's empty-turn counter never increments and sessions
+            # only die on the 300s duration cap.
+            self._publish_status('empty_turn')
         self._publish_status('idle')
         self.is_recording = False
-        # TTS owns the healthy continuous-mode handoff after a valid transcript.
-        # Do not let the watchdog start a second turn while the LLM is still
-        # generating the response for this turn.
-        if self.continuous_mode and self._transcript_published:
+        # Re-arm continuous listening after the turn ends.
+        #
+        # TTS owns the healthy handoff after a valid transcript (it publishes
+        # _TURN_END -> /g1/voice/trigger once the reply finishes speaking).
+        # The watchdog below is the safety net: after an empty/noise turn
+        # there is no LLM reply coming, so nothing else will re-trigger
+        # listening. Without this the node goes deaf after one empty turn
+        # and the wake loop keeps firing wake-detects with no recording.
+        # After a valid transcript we still arm the watchdog so a muted/
+        # failed TTS turn cannot stall the loop either; the external
+        # trigger_callback cancels it when TTS drives the next turn normally.
+        if self.continuous_mode:
             self._schedule_self_retrigger()
 
     def _transcribe(self, audio_data, language=None):
@@ -473,7 +671,6 @@ class STTNode(Node):
         auto_segments, auto_info = self._transcribe(audio_data)
         detected = (getattr(auto_info, 'language', '') or '').lower()
         probability = getattr(auto_info, 'language_probability', 0.0)
-
         if detected in ('pl', 'en') and probability >= self.language_detection_min_probability:
             return auto_segments, auto_info
 
@@ -503,7 +700,15 @@ class STTNode(Node):
         # speech loop into long, confident (high-avg_logprob) text that beat
         # short English garbage on BOTH terms of _transcription_score
         # (observed 2026-10-16: 5/7 duels returned pl when auto said en).
+        #
+        # English-locked duel: when Whisper's auto pass detected English,
+        # Polish must never override it. The user spoke English ("Aletta"
+        # is English); on noisy mic audio Whisper often confuses English
+        # for Polish. Only an auto detection of Polish or unknown can
+        # produce a Polish winner.
         auto_score = self._transcription_score(auto_segments)
+
+        allow_pl_win = detected != 'en'
 
         scored = {}
         for language, (segments, _info) in candidates.items():
@@ -511,6 +716,10 @@ class STTNode(Node):
             if self._looks_like_noise(joined):
                 # Hallucination loops never win — they would win on length
                 # and predictability, exactly the noise-vs-en failure mode.
+                scored[language] = None
+                continue
+            if language == 'pl' and not allow_pl_win:
+                # Polish cannot win when auto said English.
                 scored[language] = None
                 continue
             scored[language] = self._transcription_score(segments)
@@ -542,23 +751,26 @@ class STTNode(Node):
         return best_segments, best_info
 
     def _has_speech(self, segments) -> bool:
-        """
-        Return True when at least one segment passes the no-speech gate.
+        """Return True when at least one segment is genuine speech, not noise.
 
         Reuses ``speech_gate.keep_segment`` so this decision uses exactly the
-        same confidence rule the transcript path applies downstream.
+        same confidence rule the transcript path applies downstream. A segment
+        passes the no-speech gate when its no_speech_prob is at/below threshold.
         """
         try:
             from g1_voice.speech_gate import keep_segment
         except Exception:
-            # Gate unavailable: assume speech so the duel still runs.
+            # Gate unavailable: err on the side of speech so the duel runs.
             return True
         for segment in segments:
             if not (segment.text or '').strip():
                 continue
-            if keep_segment(
-                    getattr(segment, 'no_speech_prob', None),
-                    self.max_no_speech_prob):
+            nsp = getattr(segment, 'no_speech_prob', None)
+            if nsp is None:
+                # Missing score: keep_segment keeps it (err on the side of
+                # speech so the duel runs and a real turn isn't lost).
+                return True
+            if keep_segment(nsp, self.max_no_speech_prob):
                 return True
         return False
 
@@ -570,7 +782,10 @@ class STTNode(Node):
 
         sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEPORT, 1)
+        # NOTE: no SO_REUSEPORT here. On Linux REUSEPORT load-balances
+        # datagrams across same-port sockets instead of copying to each, so
+        # the STT and wake-word sockets would each miss packets the other
+        # received. REUSEADDR alone is enough for shared multicast receive.
         sock.bind(('', self.udp_port))
 
         mreq = struct.pack(
@@ -584,6 +799,17 @@ class STTNode(Node):
         total_bytes = 0
         silence_bytes = 0
         speech_detected = False
+        # Mic diagnostic (2026-10-17, live G1): room floor sits at RMS
+        # ~0.0069 with speech peaks only ~0.013 (6/76 packets above the
+        # 0.008 threshold in a 12s spoken capture). A single above-threshold
+        # packet therefore means noise, not speech: require SUSTAINED
+        # energy (min_speech_bytes above threshold) before the early-stop
+        # can arm, and smooth RMS over a short sliding window so one hot
+        # packet cannot latch speech_detected on its own.
+        min_speech_bytes = int(0.2 * self.sample_rate * BYTES_PER_SAMPLE)
+        speech_bytes = 0
+        rms_window = []
+        rms_window_max = 5
 
         self.get_logger().info(f'Recording via UDP {self.udp_multicast_group}:{self.udp_port}...')
 
@@ -596,21 +822,34 @@ class STTNode(Node):
 
                     samples = np.frombuffer(data, dtype=np.int16).astype(np.float32) / 32768.0
                     rms = np.sqrt(np.mean(samples**2))
+                    rms_window.append(float(rms))
+                    if len(rms_window) > rms_window_max:
+                        rms_window.pop(0)
+                    # Median (not mean): a single loud packet cannot drag the
+                    # window over threshold on its own; sustained energy is
+                    # required. Measured floor 0.0069 vs blips 0.013: a mean
+                    # window crosses at 0.0081 on one blip, a median window
+                    # stays at floor until 3+ of 5 packets are hot.
+                    smooth_rms = float(np.median(rms_window))
 
-                    if rms >= self.silence_threshold:
-                        speech_detected = True
+                    if smooth_rms >= self.silence_threshold:
+                        speech_bytes += len(data)
+                        if speech_bytes >= min_speech_bytes:
+                            speech_detected = True
                         silence_bytes = 0
                     else:
+                        speech_bytes = 0
                         if speech_detected:
                             silence_bytes += len(data)
 
-                    # Early silence-stop ONLY in continuous mode.
-                    # In push-to-talk (F1) the user controls the endpoint by
-                    # releasing the button, so we must keep recording until the
-                    # release (or the recording_duration cap) — otherwise a brief
-                    # pause between words truncates the clip and yields an empty
-                    # transcript.
-                    if (self.continuous_mode and speech_detected
+                    # Early silence-stop in every mode. The old
+                    # continuous_mode-only gate forced wake-gated turns to
+                    # capture the full recording_duration (8 s) even for a
+                    # one-second utterance. F1 push-to-talk still owns its
+                    # endpoint via stop_recording (release cuts the loop
+                    # first); a 2.5 s mid-hold pause ending the clip early is
+                    # the accepted tradeoff for not recording dead air.
+                    if (speech_detected
                             and silence_bytes >= silence_limit):
                         self.get_logger().info('Silence detected — stopping early')
                         break
@@ -642,6 +881,10 @@ class STTNode(Node):
         silence_limit = int(self.silence_duration * self.sample_rate)
         chunk_size = 1024
         speech_detected = False
+        # Mirror the UDP path: require sustained (not single-chunk) energy
+        # before the early-stop can arm (see _record_via_udp).
+        min_speech_frames = int(0.2 * self.sample_rate)
+        speech_frames = 0
 
         def audio_callback(indata, frames, time, status):
             audio_frames.append(indata.copy())
@@ -667,9 +910,12 @@ class STTNode(Node):
                         recent = np.concatenate(tail)
                         rms = np.sqrt(np.mean(recent**2))
                         if rms >= self.silence_threshold:
-                            speech_detected = True
+                            speech_frames += chunk_size
+                            if speech_frames >= min_speech_frames:
+                                speech_detected = True
                             silence_frames = 0
                         else:
+                            speech_frames = 0
                             if speech_detected:
                                 silence_frames += chunk_size
 

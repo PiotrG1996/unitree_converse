@@ -71,18 +71,28 @@
     recording_duration: 8.0
     silence_threshold: 0.008
 
-    # Benchmark 0.45 against 0.60 seconds for turn-taking.
-    silence_duration: 0.45
+    # Turn-taking: stop early on trailing silence so the pipeline answers
+    # promptly. 2.5s (was 1.0s) so users have time to finish short phrases
+    # before the clip is cut. Whisper needs enough speech context to produce
+    # confident segments; cutting at 1.0s of silence left mostly-silent clips
+    # that decoded to empty transcripts.
+    silence_duration: 2.5
 
     # Tune with recorded speech and silence samples.
-    max_no_speech_prob: 0.5
-    # 0.55 was too permissive: Whisper's silence/noise floor is en@0.55-0.57
-    # (observed 153x on 2026-10-13), and real uncertain speech lands in
-    # 0.55-0.74 too. Anything at/above the gate skips the pl/en duel, so
-    # short/noisy Polish could auto-detect as English and get an English
-    # reply. 0.75 routes those windows through the scored duel (robust);
-    # confident real speech clusters at 0.90-1.00 and is unaffected.
-    language_detection_min_probability: 0.75
+    # Raised 0.5 -> 0.85: live logs show real uncertain English speech at
+    # no_speech_prob ~0.75 being dropped ("So, we're going to start with the
+    # first one."). 0.85 keeps those while still blocking high-confidence
+    # noise (>0.85). The _looks_like_noise gate and min_publish_avg_logprob
+    # floor (-11.0) provide a second line of defence against noise leaking
+    # through.
+    max_no_speech_prob: 0.85
+    # Lowered 0.75 -> 0.50: Whisper's auto language detection on the noisy
+    # UDP mic feed rarely exceeds ~0.55-0.74 even for clear English speech.
+    # At 0.75 almost every turn skips the early-accept path and goes to the
+    # pl/en duel, where Polish can wrongly override English (the wake word
+    # "Aletta" is English). At 0.50, moderately-confident English auto
+    # detections are accepted directly, avoiding Polish flips.
+    language_detection_min_probability: 0.50
 
     # Duel safety (2026-10-16 incident: noise turned into Polish replies).
     # A forced-language candidate may replace the auto pass only when its
@@ -92,9 +102,19 @@
     # Genuine forced-language separation on real speech far exceeds 0.25.
     language_duel_override_margin: 0.25
     # Publish floor: transcripts whose kept segments average below this
-    # avg_logprob are dropped (extreme Whisper garbage only). Logged on
-    # every publish — tighten from the logs once enough turns are collected.
-    min_publish_avg_logprob: -2.5
+    # avg_logprob are dropped. Raised from -2.5 to -11.0: live logs show real
+    # English speech ("That's nice warm...", "That piece went into the next one.")
+    # at avg_logprob ~-10.0 being dropped because the UDP mic feed is noisy and
+    # Whisper is uncertain. -11.0 keeps noisy-but-real speech while still
+    # blocking extreme garbage (avg_logprob < -11, e.g. -15, -20 on pure noise).
+    # The _looks_like_noise gate and language duel provide a second line of
+    # defence against noise leaking through.
+    min_publish_avg_logprob: -11.0
+    # TTS echo guard: while the robot speaks (and this long after), the mic
+    # hears its own Piper voice on the head-mounted speaker. STT defers
+    # watchdog/trigger opens during the guard so it never transcribes its
+    # own reply as a new user turn (sentence-repetition loop).
+    tts_echo_guard_sec: 2.5
 
 
 /wake_word_node:
@@ -113,16 +133,16 @@
     # Raised from 0.85 — synthetic-only model keys on Piper voice timbre,
     # so ambient/noise frames still cross 0.85 (~46% false-accept). 0.95
     # rejects most noise while keeping strong real "Aletta" utterances.
-    aletta_threshold: 0.95
+    aletta_threshold: 0.98
     # Raised from 2 to 4 — requires ~320 ms of sustained above-threshold
     # frames instead of 160 ms. Real speech holds high scores; noise spikes
     # rarely persist across four consecutive 80 ms frames.
-    min_consecutive_frames: 4
+    min_consecutive_frames: 5
     # Echo guard: while TTS speaks (and for this long after) the mic hears
     # the robot's own Piper voice — drain audio without scoring so the model
     # cannot self-trigger on playback. Extended to 2.0 s for the synthetic
     # model which is especially prone to self-trigger on its own playback.
-    echo_guard_sec: 2.0
+    echo_guard_sec: 2.5
     # Base openWakeWord feature models (resolved at runtime to
     # ~/.local/share/openwakeword/ when empty). Empty = portable default.
     oww_melspec_model_path: ""
@@ -131,19 +151,12 @@
     udp_multicast_group: "239.168.123.161"
     udp_port: 5555
     udp_local_ip: "192.168.123.164"
-    # Session behaviour: "Aletta" (only trigger) opens a continuous
-    # conversation window; it closes after session_silence_timeout seconds
-    # with no turn activity. Raised from 8 to 20 so the full STT->LLM->TTS
-    # pipeline completes before the window closes.
-    session_silence_timeout: 20.0
-    # Idle (session closed) listener throttle: score a short burst, sleep,
-    # repeat — keeps the wait state near zero CPU.
-    idle_listen_burst_sec: 1.5
+
     idle_sleep_sec: 1.5
     # RMS energy gate: frames below this int16 RMS are skipped before ONNX
     # scoring. 300 rejects quiet room noise/HVAC that the synthetic model
     # scores ~0.99.
-    silence_rms: 300.0
+    silence_rms: 350.0
     # False-accept backoff: when a wake-opened session times out with no
     # speech, multiply cooldown by this factor (caps at 60s). Resets on real
     # activity. Slows the idle storm from ~1/8-12s to ~1/min+.
@@ -188,4 +201,5 @@
     piper_lib_dir: "/home/unitree/.local/piper-bin"
 
     network_interface: "eth0"
+
 
