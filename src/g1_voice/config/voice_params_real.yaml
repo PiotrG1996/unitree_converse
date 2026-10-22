@@ -114,7 +114,7 @@
     # hears its own Piper voice on the head-mounted speaker. STT defers
     # watchdog/trigger opens during the guard so it never transcribes its
     # own reply as a new user turn (sentence-repetition loop).
-    tts_echo_guard_sec: 2.0
+    tts_echo_guard_sec: 2.5
 
 
 /wake_word_node:
@@ -133,16 +133,16 @@
     # Raised from 0.85 — synthetic-only model keys on Piper voice timbre,
     # so ambient/noise frames still cross 0.85 (~46% false-accept). 0.95
     # rejects most noise while keeping strong real "Aletta" utterances.
-    aletta_threshold: 0.95
+    aletta_threshold: 0.98
     # Raised from 2 to 4 — requires ~320 ms of sustained above-threshold
     # frames instead of 160 ms. Real speech holds high scores; noise spikes
     # rarely persist across four consecutive 80 ms frames.
-    min_consecutive_frames: 4
+    min_consecutive_frames: 5
     # Echo guard: while TTS speaks (and for this long after) the mic hears
     # the robot's own Piper voice — drain audio without scoring so the model
     # cannot self-trigger on playback. Extended to 2.0 s for the synthetic
     # model which is especially prone to self-trigger on its own playback.
-    echo_guard_sec: 2.0
+    echo_guard_sec: 2.5
     # Base openWakeWord feature models (resolved at runtime to
     # ~/.local/share/openwakeword/ when empty). Empty = portable default.
     oww_melspec_model_path: ""
@@ -156,7 +156,7 @@
     # RMS energy gate: frames below this int16 RMS are skipped before ONNX
     # scoring. 300 rejects quiet room noise/HVAC that the synthetic model
     # scores ~0.99.
-    silence_rms: 300.0
+    silence_rms: 350.0
     # False-accept backoff: when a wake-opened session times out with no
     # speech, multiply cooldown by this factor (caps at 60s). Resets on real
     # activity. Slows the idle storm from ~1/8-12s to ~1/min+.

@@ -218,6 +218,12 @@ class _FakeSttTriggerNode:
         self.tts_busy = False
         self._last_tts_speaking_time = 0.0
         self.tts_echo_guard_sec = 0.05
+        # Mic path logging flag (mirrors STTNode.__init__)
+        self._mic_path_logged = False
+        self.use_udp_mic = True
+        self.udp_multicast_group = '239.168.123.161'
+        self.udp_port = 5555
+        self.udp_local_ip = '192.168.123.164'
         # Thread-target fakes: record invocations instead of running them.
         self.record_calls = []
         self.delayed_calls = []
