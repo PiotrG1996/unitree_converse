@@ -16,14 +16,14 @@
     language: "en"
     device: "cpu"
     beam_size: 5
-    initial_prompt: "Aletta, robot assistant. Hello, how can I help?"
-    vad_threshold: 0.5
+    initial_prompt: ""
+    vad_threshold: 0.3
     vad_min_silence_ms: 500
-    vad_speech_pad_ms: 200
-    normalize_audio: false
+    vad_speech_pad_ms: 400
+    normalize_audio: true
     sample_rate: 16000
     recording_duration: 8.0
-    silence_threshold: 0.01
+    silence_threshold: 0.005
     silence_duration: 2.5
     # Raised 0.5 -> 0.85: live logs show real uncertain English speech at
     # no_speech_prob ~0.75 being dropped on the noisy UDP mic feed. 0.85
@@ -43,7 +43,7 @@
     language_duel_override_margin: 0.25
     # Raised from -2.5 to -11.0: real speech on a noisy mic feed decodes at
     # low avg_logprob (~-10). Keep it; block only extreme garbage (< -11).
-    min_publish_avg_logprob: -11.0
+    min_publish_avg_logprob: -2.5
     # TTS echo guard (see voice_params_real.yaml): STT defers mic opens
     # while the robot's own voice is on the air.
     tts_echo_guard_sec: 2.0

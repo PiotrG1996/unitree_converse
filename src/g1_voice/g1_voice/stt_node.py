@@ -131,6 +131,7 @@ class STTNode(Node):
         # this avg_logprob — only extreme Whisper garbage trips it. The value
         # is logged on every publish so it can be tightened with data.
         self.declare_parameter('min_publish_avg_logprob', -2.5)
+        self.declare_parameter('dump_audio_dir', '')
         # STT accuracy tuning (beam search, vocabulary prompt, VAD).
         self.declare_parameter('beam_size', 5)
         self.declare_parameter('initial_prompt', '')
@@ -163,6 +164,7 @@ class STTNode(Node):
         self.language_duel_override_margin = self._param(
             'language_duel_override_margin')
         self.min_publish_avg_logprob = self._param('min_publish_avg_logprob')
+        self.dump_audio_dir = self._param('dump_audio_dir')
         self.beam_size = int(self._param('beam_size'))
         self.initial_prompt = self._param('initial_prompt')
         self.vad_threshold = float(self._param('vad_threshold'))
@@ -556,6 +558,27 @@ class STTNode(Node):
             audio_data = self._record_via_udp()
         else:
             audio_data = self._record_via_sounddevice()
+
+        if (audio_data is not None and len(audio_data) > 0
+                and self.dump_audio_dir):
+            try:
+                import os as _os
+                import wave as _wave
+                import time as _time
+                _os.makedirs(self.dump_audio_dir, exist_ok=True)
+                _path = _os.path.join(
+                    self.dump_audio_dir,
+                    f'stt_{int(_time.time())}.wav')
+                with _wave.open(_path, 'wb') as _w:
+                    _w.setnchannels(1)
+                    _w.setsampwidth(2)
+                    _w.setframerate(self.sample_rate)
+                    _pcm = (np.clip(audio_data, -1.0, 1.0) * 32767.0
+                            ).astype(np.int16)
+                    _w.writeframes(_pcm.tobytes())
+                log_info(self, f'Dumped recorded audio to {_path}')
+            except Exception as _e:
+                log_warn(self, f'Audio dump failed: {_e}')
 
         if audio_data is None or len(audio_data) == 0:
             log_warn(self, 'No audio recorded')

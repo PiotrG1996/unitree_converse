@@ -64,18 +64,18 @@
 
     # Baseline: benchmark against small on the target Jetson.
     model_size: "base"
-    language: "auto"
+    language: "en"
     device: "cuda"
     beam_size: 5
-    initial_prompt: "Aletta, robot assistant. Hello, how can I help? Czesc, jak moge pomoc?"
-    vad_threshold: 0.5
+    initial_prompt: ""
+    vad_threshold: 0.3
     vad_min_silence_ms: 500
-    vad_speech_pad_ms: 200
-    normalize_audio: false
+    vad_speech_pad_ms: 400
+    normalize_audio: true
 
     sample_rate: 16000
     recording_duration: 10.0
-    silence_threshold: 0.008
+    silence_threshold: 0.005
 
     # Turn-taking: stop early on trailing silence so the pipeline answers
     # promptly. 2.5s (was 1.0s) so users have time to finish short phrases
@@ -115,7 +115,7 @@
     # blocking extreme garbage (avg_logprob < -11, e.g. -15, -20 on pure noise).
     # The _looks_like_noise gate and language duel provide a second line of
     # defence against noise leaking through.
-    min_publish_avg_logprob: -11.0
+    min_publish_avg_logprob: -2.5
     # TTS echo guard: while the robot speaks (and this long after), the mic
     # hears its own Piper voice on the head-mounted speaker. STT defers
     # watchdog/trigger opens during the guard so it never transcribes its
