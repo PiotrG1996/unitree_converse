@@ -10,7 +10,6 @@ import re
 import os
 import ctypes
 
-
 # Directories searched for a hand-built (CUDA-enabled) libctranslate2. The pip
 # ctranslate2 wheel on this Jetson ships without the native shared library, so
 # the user compiled CTranslate2 from source and installed it here. The dynamic
@@ -65,6 +64,23 @@ def _preload_ctranslate2(logger=None):
     # Nothing to preload — assume the system-provided library is resolvable.
 
 
+try:
+    from .node_logging import info as log_info, error as log_error, warn as log_warn
+except ImportError:
+    try:
+        from g1_voice.node_logging import info as log_info, error as log_error, warn as log_warn
+    except ImportError:
+        import os as _os
+        import sys as _sys
+
+        _sys.path.insert(0, _os.path.dirname(_os.path.abspath(__file__)))
+        import node_logging as _node_logging
+
+        log_info = _node_logging.info
+        log_error = _node_logging.error
+        log_warn = _node_logging.warn
+
+
 class STTNode(Node):
     def _param(self, name):
         """Return a declared parameter's value (short form of get_parameter)."""
@@ -77,7 +93,7 @@ class STTNode(Node):
         self.declare_parameter('language', 'auto')
         self.declare_parameter('device', 'cpu')
         self.declare_parameter('sample_rate', 16000)
-        self.declare_parameter('recording_duration', 8.0)
+        self.declare_parameter('recording_duration', 10.0)
         self.declare_parameter('silence_threshold', 0.008)
         self.declare_parameter('silence_duration', 2.0)
         self.declare_parameter('use_udp_mic', True)
@@ -115,6 +131,13 @@ class STTNode(Node):
         # this avg_logprob — only extreme Whisper garbage trips it. The value
         # is logged on every publish so it can be tightened with data.
         self.declare_parameter('min_publish_avg_logprob', -2.5)
+        # STT accuracy tuning (beam search, vocabulary prompt, VAD).
+        self.declare_parameter('beam_size', 5)
+        self.declare_parameter('initial_prompt', '')
+        self.declare_parameter('vad_threshold', 0.5)
+        self.declare_parameter('vad_min_silence_ms', 500)
+        self.declare_parameter('vad_speech_pad_ms', 200)
+        self.declare_parameter('normalize_audio', False)
         # TTS echo guard: while the robot is speaking (and for this long
         # after), the mic hears its own Piper voice. The watchdog defers and
         # new triggers wait, mirroring the wake-word node's echo_guard_sec.
@@ -140,6 +163,12 @@ class STTNode(Node):
         self.language_duel_override_margin = self._param(
             'language_duel_override_margin')
         self.min_publish_avg_logprob = self._param('min_publish_avg_logprob')
+        self.beam_size = int(self._param('beam_size'))
+        self.initial_prompt = self._param('initial_prompt')
+        self.vad_threshold = float(self._param('vad_threshold'))
+        self.vad_min_silence_ms = int(self._param('vad_min_silence_ms'))
+        self.vad_speech_pad_ms = int(self._param('vad_speech_pad_ms'))
+        self.normalize_audio = bool(self._param('normalize_audio'))
         self.tts_echo_guard_sec = float(self._param('tts_echo_guard_sec'))
 
         self.is_recording = False
@@ -158,11 +187,12 @@ class STTNode(Node):
         # 'float16' (or 'int8_float16') for GPU, while CPU keeps 'int8'.
         compute_type = 'float16' if self.device == 'cuda' else 'int8'
 
-        self.get_logger().info(
-            f'Loading faster-whisper model: {self.model_size} '
-            f'(device={self.device}, compute_type={compute_type})')
+        log_info(self,
+                 f'Loading faster-whisper model: {self.model_size} '
+                 f'(device={self.device}, compute_type={compute_type})')
         # Make the hand-built CUDA libctranslate2 resolvable before faster_whisper
-        # imports it. Harmless no-op when the library is already on the loader path.
+        # imports it. Harmless no-op when the library is already on the loader
+        # path.
         _preload_ctranslate2(logger=self.get_logger())
         from faster_whisper import WhisperModel
         try:
@@ -172,11 +202,11 @@ class STTNode(Node):
             # GPU-only target: if the CUDA load fails (no CUDA build of
             # ctranslate2, driver issue, etc.), surface it loudly rather than
             # silently falling back to CPU.
-            self.get_logger().error(
-                f'faster-whisper failed to load on device="{self.device}" '
+            log_error(
+                self, f'faster-whisper failed to load on device="{self.device}" '
                 f'(compute_type={compute_type}): {e}')
             raise
-        self.get_logger().info('faster-whisper model loaded')
+        log_info(self, 'faster-whisper model loaded')
 
         self.trigger_sub = self.create_subscription(
             Bool, '/g1/voice/trigger', self.trigger_callback, 10)
@@ -191,12 +221,13 @@ class STTNode(Node):
         self.create_subscription(
             String, '/g1/tts/status', self._tts_status_callback, 10)
 
-        self.transcript_pub = self.create_publisher(String, '/g1/stt/transcript', 10)
+        self.transcript_pub = self.create_publisher(
+            String, '/g1/stt/transcript', 10)
         self.status_pub = self.create_publisher(String, '/g1/stt/status', 10)
 
         mic_mode = 'UDP multicast' if self.use_udp_mic else 'sounddevice'
-        self.get_logger().info(f'STT node ready — mic: {mic_mode}')
-        self.get_logger().info(f'Continuous mode: {self.continuous_mode}')
+        log_info(self, f'STT node ready — mic: {mic_mode}')
+        log_info(self, f'Continuous mode: {self.continuous_mode}')
 
         # Always-on (continuous) machinery is strictly OPT-IN: it is armed ONLY
         # when continuous_mode is True (e.g. enabled at runtime via the START
@@ -226,7 +257,7 @@ class STTNode(Node):
         # One-shot: disarm the timer, then start the first turn.
         self._start_kick.cancel()
         if not self.is_recording:
-            self.get_logger().info('Always-on mode — starting first listening turn')
+            log_info(self, 'Always-on mode — starting first listening turn')
             self._retrigger()
 
     def _retrigger(self):
@@ -240,8 +271,10 @@ class STTNode(Node):
         """
         if self.is_recording:
             return
-        self.get_logger().info('Always-on — starting next listening turn')
-        threading.Thread(target=self._record_and_transcribe, daemon=True).start()
+        log_info(self, 'Always-on — starting next listening turn')
+        threading.Thread(
+            target=self._record_and_transcribe,
+            daemon=True).start()
 
     def _schedule_self_retrigger(self, delay=None):
         """
@@ -270,8 +303,8 @@ class STTNode(Node):
     def _watchdog_fire(self):
         self._watchdog.cancel()
         if self.llm_busy:
-            self.get_logger().info(
-                'Continuous watchdog deferred while LLM is generating')
+            log_info(self,
+                     'Continuous watchdog deferred while LLM is generating')
             self._schedule_self_retrigger(self.watchdog_interval)
         elif self._tts_echo_active():
             # TTS is speaking (or its ring-down is still on the mic): opening
@@ -280,12 +313,14 @@ class STTNode(Node):
             # Re-check at guard expiry instead of waiting a full interval —
             # otherwise every healthy TTS handoff stalls ~15 s.
             delay = self._echo_guard_remaining() + 0.2
-            self.get_logger().info(
-                f'Continuous watchdog deferred while TTS is speaking '
-                f'(retry in {delay:.1f}s)')
+            log_info(self,
+                     f'Continuous watchdog deferred while TTS is speaking '
+                     f'(retry in {delay:.1f}s)')
             self._schedule_self_retrigger(delay)
         elif not self.is_recording:
-            self.get_logger().info('Always-on watchdog — no reply received, listening again')
+            log_info(
+                self,
+                'Always-on watchdog — no reply received, listening again')
             self._retrigger()
 
     def _delayed_trigger(self, delay: float,
@@ -316,23 +351,25 @@ class STTNode(Node):
         if self._tts_echo_active():
             remaining = self._echo_guard_remaining() + 0.2
             if deadline is not None and time.monotonic() + remaining > deadline:
-                self.get_logger().info(
-                    'Delayed trigger exceeded wait budget — yielding to '
-                    'the watchdog')
+                log_info(self,
+                         'Delayed trigger exceeded wait budget — yielding to '
+                         'the watchdog')
                 return
             # Playback restarted (e.g. next sentence) — wait for the new guard.
-            self.get_logger().info(
-                'Delayed trigger still guarded — re-waiting for TTS')
+            log_info(self,
+                     'Delayed trigger still guarded — re-waiting for TTS')
             self._delayed_trigger(remaining, deadline)
             return
-        self.get_logger().info('Trigger received — starting recording '
-                               '(after echo guard)')
+        log_info(self, 'Trigger received — starting recording '
+                 '(after echo guard)')
         # A watchdog may have been re-armed while we waited out the guard;
         # cancel it so it cannot open a second overlapping recording.
         with self._watchdog_lock:
             if self._watchdog is not None:
                 self._watchdog.cancel()
-        threading.Thread(target=self._record_and_transcribe, daemon=True).start()
+        threading.Thread(
+            target=self._record_and_transcribe,
+            daemon=True).start()
 
     def trigger_callback(self, msg: Bool):
         """Handle an external /g1/voice/trigger message to start recording."""
@@ -343,17 +380,17 @@ class STTNode(Node):
                 # trigger (dropping stalls chained turns until the 15 s
                 # watchdog fires).
                 delay = self._echo_guard_remaining() + 0.2
-                self.get_logger().info(
-                    f'Trigger deferred — TTS echo guard active '
-                    f'(starting in {delay:.1f}s)')
+                log_info(self,
+                         f'Trigger deferred — TTS echo guard active '
+                         f'(starting in {delay:.1f}s)')
                 threading.Thread(target=self._delayed_trigger,
                                  args=(delay,), daemon=True).start()
                 return
-            self.get_logger().info('Trigger received — starting recording')
+            log_info(self, 'Trigger received — starting recording')
             if not self._mic_path_logged:
                 self._mic_path_logged = True
-                self.get_logger().info(
-                    f'Mic path = {"UDP multicast" if self.use_udp_mic else "sounddevice"} '
+                log_info(
+                    self, f'Mic path = {"UDP multicast" if self.use_udp_mic else "sounddevice"} '
                     f'(multicast_group={self.udp_multicast_group}, '
                     f'port={self.udp_port}, local_ip={self.udp_local_ip})')
             # An external trigger means the loop is being driven normally; cancel
@@ -361,7 +398,9 @@ class STTNode(Node):
             with self._watchdog_lock:
                 if self._watchdog is not None:
                     self._watchdog.cancel()
-            threading.Thread(target=self._record_and_transcribe, daemon=True).start()
+            threading.Thread(
+                target=self._record_and_transcribe,
+                daemon=True).start()
         else:
             # Explicit visibility into dropped/wasted trigger firings so a
             # stalled loop can be diagnosed from the logs:
@@ -373,27 +412,27 @@ class STTNode(Node):
             # recording/transcription lines is diagnosable from journalctl,
             # which only shows INFO and above by default.
             if msg.data:
-                self.get_logger().warn(
-                    'Trigger received but ignored — already '
-                    f'recording ({self.is_recording})')
+                log_warn(self,
+                         'Trigger received but ignored — already '
+                         f'recording ({self.is_recording})')
             else:
-                self.get_logger().warn(
-                    'Trigger received with data=False — no-op')
+                log_warn(self,
+                         'Trigger received with data=False — no-op')
 
     def stop_callback(self, msg: Bool):
         if msg.data:
             self.stop_requested = True
-            self.get_logger().info('Stop recording requested — F1 released')
+            log_info(self, 'Stop recording requested — F1 released')
 
     def _continuous_start_cb(self, msg: Bool):
         if msg.data:
             self.continuous_mode = True
-            self.get_logger().info('Continuous mode enabled')
+            log_info(self, 'Continuous mode enabled')
 
     def _continuous_stop_cb(self, msg: Bool):
         if msg.data:
             self.continuous_mode = False
-            self.get_logger().info('Continuous mode disabled')
+            log_info(self, 'Continuous mode disabled')
 
     def _llm_status_callback(self, msg: String):
         self.llm_busy = msg.data == 'thinking'
@@ -408,10 +447,12 @@ class STTNode(Node):
             self._last_tts_speaking_time = time.time()
 
     def _tts_echo_active(self) -> bool:
-        """True while TTS is speaking or within the post-playback guard."""
+        """Return True while TTS is speaking or within the post-playback guard."""
         if self.tts_busy:
             return True
-        return (time.time() - self._last_tts_speaking_time) < self.tts_echo_guard_sec
+        return (
+            time.time() -
+            self._last_tts_speaking_time) < self.tts_echo_guard_sec
 
     @staticmethod
     def _looks_like_noise(text: str) -> bool:
@@ -430,7 +471,8 @@ class STTNode(Node):
         t = text.strip()
         if not t:
             return True
-        # Must contain at least one letter or digit, else it's pure noise/punctuation.
+        # Must contain at least one letter or digit, else it's pure
+        # noise/punctuation.
         if not re.search(r'[A-Za-z0-9]', t):
             return True
 
@@ -449,7 +491,8 @@ class STTNode(Node):
                 if words[i:i + p] == words[i + p:i + 2 * p]:
                     repeated_words = 2 * p
                     j = i + 2 * p
-                    while j + p <= len(words) and words[j:j + p] == words[i:i + p]:
+                    while j + \
+                            p <= len(words) and words[j:j + p] == words[i:i + p]:
                         repeated_words += p
                         j += p
                     if repeated_words / len(words) >= 0.70:
@@ -457,7 +500,8 @@ class STTNode(Node):
 
         # Repetition ratio: (occurrences of most common word) / total words.
         # Loops like "sorry sorry sorry sorry" score high. Require >=4 words so a
-        # legit short reply like "hello there" or "yes please" is never dropped.
+        # legit short reply like "hello there" or "yes please" is never
+        # dropped.
         if len(words) >= 4:
             from collections import Counter
             top, count = Counter(words).most_common(1)[0]
@@ -506,7 +550,7 @@ class STTNode(Node):
         self._transcript_published = False
         self._turn_had_transcript = False
         self._publish_status('recording')
-        self.get_logger().info('Recording started — capturing audio...')
+        log_info(self, 'Recording started — capturing audio...')
 
         if self.use_udp_mic:
             audio_data = self._record_via_udp()
@@ -514,7 +558,7 @@ class STTNode(Node):
             audio_data = self._record_via_sounddevice()
 
         if audio_data is None or len(audio_data) == 0:
-            self.get_logger().warn('No audio recorded')
+            log_warn(self, 'No audio recorded')
             # Contract with wake_word_node.stt_status_callback: a turn with
             # no audio is an empty turn (counts toward max_empty_turns).
             self._publish_status('empty_turn')
@@ -527,7 +571,8 @@ class STTNode(Node):
         self._publish_status('transcribing')
 
         try:
-            segments, info = self._transcribe_with_language_fallback(audio_data)
+            segments, info = self._transcribe_with_language_fallback(
+                audio_data)
 
             # Confidence gate: drop segments Whisper flags as likely non-speech
             # (see speech_gate.py). Quiet-room noise hallucinations measure
@@ -539,57 +584,59 @@ class STTNode(Node):
                 kept, dropped = filter_segments(
                     segments, self.max_no_speech_prob)
             except Exception:
-                self.get_logger().warn(
-                    'speech_gate unavailable; keeping raw transcript')
+                log_warn(self,
+                         'speech_gate unavailable; keeping raw transcript')
                 kept = [s.text.strip() for s in segments if s.text.strip()]
                 dropped = []
 
             if dropped:
-                self.get_logger().info(
-                    f'Filtered {len(dropped)} no-speech segment(s): '
-                    + '; '.join(f'[{nsp:.2f}] "{t}"' for nsp, t in dropped))
+                log_info(
+                    self,
+                    f'Filtered {len(dropped)} no-speech segment(s): ' +
+                    '; '.join(
+                        f'[{nsp:.2f}] "{t}"' for nsp,
+                        t in dropped))
 
             transcript = ' '.join(kept).strip()
             detected_language = (getattr(info, 'language', '') or '').lower()
             language_probability = getattr(info, 'language_probability', 0.0)
-            self.get_logger().info(
-                f'Whisper detected language: {detected_language} '
-                f'(probability={language_probability:.2f})')
+            log_info(self,
+                     f'Whisper detected language: {detected_language} '
+                     f'(probability={language_probability:.2f})')
             if detected_language not in ('pl', 'en'):
                 # Whisper's auto language detection is unreliable on noisy
                 # mic audio (e.g. 'es' at probability=0.54 for real English
                 # speech). Don't throw away a valid transcript: default to
                 # English for TTS/LTS routing. The text itself is what the
                 # LLM sees.
-                self.get_logger().warn(
-                    f'Unsupported language {detected_language or "unknown"}, '
+                log_warn(
+                    self, f'Unsupported language {detected_language or "unknown"}, '
                     f'defaulting to English')
                 detected_language = 'en'
-                if best_language is None:
-                    best_language = detected_language
+            best_language = detected_language
 
             if transcript and self._looks_like_noise(transcript):
-                self.get_logger().info(
-                    f'Ignored noise/hallucination transcript: "{transcript}"')
+                log_info(
+                    self, f'Ignored noise/hallucination transcript: "{transcript}"')
             elif transcript:
                 mean_logprob = float(np.mean([
                     getattr(s, 'avg_logprob', -10.0) for s in kept]))
                 if mean_logprob < self.min_publish_avg_logprob:
                     # Extreme-garbage floor; the value is logged on every
                     # publish so the threshold can be tightened from data.
-                    self.get_logger().warn(
-                        f'Dropped low-confidence transcript '
-                        f'(avg_logprob={mean_logprob:.2f} < '
-                        f'{self.min_publish_avg_logprob:.2f}): '
-                        f'"{transcript}"')
+                    log_warn(self,
+                             f'Dropped low-confidence transcript '
+                             f'(avg_logprob={mean_logprob:.2f} < '
+                             f'{self.min_publish_avg_logprob:.2f}): '
+                             f'"{transcript}"')
                     transcript = ''
                 else:
-                    self.get_logger().info(
-                        f'Transcript: "{transcript}" '
-                        f'(avg_logprob={mean_logprob:.2f})')
-                    self.get_logger().info(
-                        'PUBLISHING /g1/stt/transcript with digest: '
-                        f'"{transcript[:80]}..."')
+                    log_info(self,
+                             f'Transcript: "{transcript}" '
+                             f'(avg_logprob={mean_logprob:.2f})')
+                    log_info(self,
+                             'PUBLISHING /g1/stt/transcript with digest: '
+                             f'"{transcript[:80]}..."')
                     msg = String()
                     msg.data = (
                         f'[USER_LANGUAGE:{best_language}]\n{transcript}')
@@ -601,10 +648,10 @@ class STTNode(Node):
                     # _TURN_END, which re-triggers listening.
                     self._turn_had_transcript = True
             else:
-                self.get_logger().warn('Empty transcript — nothing detected')
+                log_warn(self, 'Empty transcript — nothing detected')
 
         except Exception as e:
-            self.get_logger().error(f'Transcription error: {e}')
+            log_error(self, f'Transcription error: {e}')
             self._publish_status('error')
             # No transcript came out of this turn — report it as empty so
             # the session can still close crisply via max_empty_turns
@@ -640,14 +687,27 @@ class STTNode(Node):
             self._schedule_self_retrigger()
 
     def _transcribe(self, audio_data, language=None):
+        audio_for_model = audio_data
+        if getattr(self, 'normalize_audio', False):
+            arr = np.asarray(audio_data, dtype=np.float32)
+            if arr.size:
+                peak = float(np.max(np.abs(arr)))
+                if 0.0 < peak < 0.95:
+                    audio_for_model = arr * (0.9 / peak)
         segments, info = self.model.transcribe(
-            audio_data,
+            audio_for_model,
             language=language,
-            beam_size=1,
+            beam_size=getattr(self, 'beam_size', 5),
             temperature=0.0,
             condition_on_previous_text=False,
+            initial_prompt=getattr(self, 'initial_prompt', '') or None,
             vad_filter=True,
-            vad_parameters=dict(min_silence_duration_ms=500),
+            vad_parameters=dict(
+                onset=getattr(self, 'vad_threshold', 0.5),
+                min_silence_duration_ms=getattr(
+                    self, 'vad_min_silence_ms', 500),
+                speech_pad_ms=getattr(self, 'vad_speech_pad_ms', 200),
+            ),
         )
         return list(segments), info
 
@@ -669,9 +729,13 @@ class STTNode(Node):
             return segments, info
 
         auto_segments, auto_info = self._transcribe(audio_data)
+        _auto_text = ' '.join(s.text.strip() for s in auto_segments).strip()
+        log_info(self, f'Duel auto transcript: {_auto_text[:120]}')
         detected = (getattr(auto_info, 'language', '') or '').lower()
         probability = getattr(auto_info, 'language_probability', 0.0)
-        if detected in ('pl', 'en') and probability >= self.language_detection_min_probability:
+        if detected in (
+            'pl',
+                'en') and probability >= self.language_detection_min_probability:
             return auto_segments, auto_info
 
         # Skip the scored pl/en duel when the automatic pass contains no
@@ -684,8 +748,8 @@ class STTNode(Node):
         # speech so the duel still runs (never lose a real turn to a missing
         # import).
         if not self._has_speech(auto_segments):
-            self.get_logger().info(
-                'No speech in auto pass '
+            log_info(
+                self, 'No speech in auto pass '
                 f'(auto={detected or "unknown"} probability={probability:.2f}); '
                 'skipping language duel')
             return auto_segments, auto_info
@@ -693,6 +757,9 @@ class STTNode(Node):
         candidates = {}
         for language in ('pl', 'en'):
             candidates[language] = self._transcribe(audio_data, language)
+        for language, (segments, _info) in candidates.items():
+            _text = ' '.join(s.text.strip() for s in segments).strip()
+            log_info(self, f'Duel candidate {language}: {_text[:120]}')
 
         # Score the auto pass too: a forced candidate may replace it only
         # with a clear margin (language_duel_override_margin). The old blind
@@ -737,21 +804,22 @@ class STTNode(Node):
         margin = self.language_duel_override_margin
 
         if best_language is None or best_score < auto_score + margin:
-            self.get_logger().info(
-                f'Duel: auto={detected or "unknown"} '
+            log_info(
+                self, f'Duel: auto={detected or "unknown"} '
                 f'(probability={probability:.2f}) score={auto_score:.2f} | '
                 f'{scores_desc} -> keeping auto (margin {margin:.2f})')
             return auto_segments, auto_info
 
         best_segments, best_info = candidates[best_language]
-        self.get_logger().info(
-            f'Duel: auto={detected or "unknown"} '
-            f'(probability={probability:.2f}) score={auto_score:.2f} | '
-            f'{scores_desc} -> selected={best_language}')
+        log_info(self,
+                 f'Duel: auto={detected or "unknown"} '
+                 f'(probability={probability:.2f}) score={auto_score:.2f} | '
+                 f'{scores_desc} -> selected={best_language}')
         return best_segments, best_info
 
     def _has_speech(self, segments) -> bool:
-        """Return True when at least one segment is genuine speech, not noise.
+        """
+        Return True when at least one segment is genuine speech, not noise.
 
         Reuses ``speech_gate.keep_segment`` so this decision uses exactly the
         same confidence rule the transcript path applies downstream. A segment
@@ -777,8 +845,14 @@ class STTNode(Node):
     def _record_via_udp(self):
         self.stop_requested = False
         BYTES_PER_SAMPLE = 2
-        target_bytes = int(self.sample_rate * BYTES_PER_SAMPLE * self.recording_duration)
-        silence_limit = int(self.silence_duration * self.sample_rate * BYTES_PER_SAMPLE)
+        target_bytes = int(
+            self.sample_rate *
+            BYTES_PER_SAMPLE *
+            self.recording_duration)
+        silence_limit = int(
+            self.silence_duration *
+            self.sample_rate *
+            BYTES_PER_SAMPLE)
 
         sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
@@ -811,7 +885,9 @@ class STTNode(Node):
         rms_window = []
         rms_window_max = 5
 
-        self.get_logger().info(f'Recording via UDP {self.udp_multicast_group}:{self.udp_port}...')
+        log_info(
+            self,
+            f'Recording via UDP {self.udp_multicast_group}:{self.udp_port}...')
 
         try:
             while total_bytes < target_bytes and not self.stop_requested:
@@ -820,7 +896,9 @@ class STTNode(Node):
                     frames.append(data)
                     total_bytes += len(data)
 
-                    samples = np.frombuffer(data, dtype=np.int16).astype(np.float32) / 32768.0
+                    samples = np.frombuffer(
+                        data, dtype=np.int16).astype(
+                        np.float32) / 32768.0
                     rms = np.sqrt(np.mean(samples**2))
                     rms_window.append(float(rms))
                     if len(rms_window) > rms_window_max:
@@ -851,20 +929,20 @@ class STTNode(Node):
                     # the accepted tradeoff for not recording dead air.
                     if (speech_detected
                             and silence_bytes >= silence_limit):
-                        self.get_logger().info('Silence detected — stopping early')
+                        log_info(self, 'Silence detected — stopping early')
                         break
 
                 except socket.timeout:
                     continue
 
         except Exception as e:
-            self.get_logger().error(f'UDP recording error: {e}')
+            log_error(self, f'UDP recording error: {e}')
             return None
         finally:
             sock.close()
 
         if self.stop_requested:
-            self.get_logger().info('Recording stopped by F1 release')
+            log_info(self, 'Recording stopped by F1 release')
 
         if not frames:
             return None
@@ -897,7 +975,7 @@ class STTNode(Node):
                 blocksize=chunk_size,
                 callback=audio_callback
             ):
-                self.get_logger().info('Recording via sounddevice...')
+                log_info(self, 'Recording via sounddevice...')
                 total_samples = 0
                 max_samples = int(self.recording_duration * self.sample_rate)
 
@@ -920,11 +998,11 @@ class STTNode(Node):
                                 silence_frames += chunk_size
 
                         if speech_detected and silence_frames >= silence_limit:
-                            self.get_logger().info('Silence detected — stopping early')
+                            log_info(self, 'Silence detected — stopping early')
                             break
 
         except Exception as e:
-            self.get_logger().error(f'Recording error: {e}')
+            log_error(self, f'Recording error: {e}')
             return None
 
         if not audio_frames:

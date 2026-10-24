@@ -22,6 +22,21 @@ SELECT_KEY = 8
 
 DEBOUNCE_TIME = 0.25  # seconds — de-bounce the switch but allow fast double-taps
 
+try:
+    from .node_logging import info as log_info, warning as log_warning
+except ImportError:
+    try:
+        from g1_voice.node_logging import info as log_info, warning as log_warning
+    except ImportError:
+        import os as _os
+        import sys as _sys
+
+        _sys.path.insert(0, _os.path.dirname(_os.path.abspath(__file__)))
+        import node_logging as _node_logging
+
+        log_info = _node_logging.info
+        log_warning = _node_logging.warning
+
 
 class ButtonTriggerNode(Node):
     def __init__(self):
@@ -42,8 +57,7 @@ class ButtonTriggerNode(Node):
         # Long default split across string literals to stay under the 99-col
         # flake8 limit; the YAML configs override it anyway.
         self.declare_parameter(
-            'custom_say_text',
-            'Hello! I am Aletta, a humanoid robot assistant at '
+            'custom_say_text', 'Hello! I am Aletta, a humanoid robot assistant at '
             'Poznan University of Technology. I am here to support '
             'researchers, students, and academic staff in their daily '
             'activities. I can assist with research-related tasks, provide '
@@ -58,12 +72,17 @@ class ButtonTriggerNode(Node):
 
         # Publishers
         self.trigger_pub = self.create_publisher(Bool, '/g1/voice/trigger', 10)
-        self.stop_pub = self.create_publisher(Bool, '/g1/voice/stop_recording', 10)
-        self.continuous_start_pub = self.create_publisher(Bool, '/g1/voice/continuous_start', 10)
-        self.continuous_stop_pub = self.create_publisher(Bool, '/g1/voice/continuous_stop', 10)
-        self.speak_enable_pub = self.create_publisher(Bool, '/g1/voice/speak_enable', 10)
+        self.stop_pub = self.create_publisher(
+            Bool, '/g1/voice/stop_recording', 10)
+        self.continuous_start_pub = self.create_publisher(
+            Bool, '/g1/voice/continuous_start', 10)
+        self.continuous_stop_pub = self.create_publisher(
+            Bool, '/g1/voice/continuous_stop', 10)
+        self.speak_enable_pub = self.create_publisher(
+            Bool, '/g1/voice/speak_enable', 10)
         self.say_pub = self.create_publisher(String, '/g1/voice/say_text', 10)
-        self.status_pub = self.create_publisher(String, '/g1/button/status', 10)
+        self.status_pub = self.create_publisher(
+            String, '/g1/button/status', 10)
 
         # Track the real session state that wake_word_node owns. It publishes
         # /g1/voice/continuous_start when "Aletta" opens a session, and any
@@ -84,11 +103,11 @@ class ButtonTriggerNode(Node):
             10
         )
 
-        self.get_logger().info('Button trigger node ready')
-        self.get_logger().info('Hold F1 → push-to-talk (release to send)')
-        self.get_logger().info('F3 → toggle speaking enabled/muted (robot TTS output)')
-        self.get_logger().info('START → end conversation session (kill switch)')
-        self.get_logger().info('SELECT → speak custom phrase (custom_say_text)')
+        log_info(self, 'Button trigger node ready')
+        log_info(self, 'Hold F1 → push-to-talk (release to send)')
+        log_info(self, 'F3 → toggle speaking enabled/muted (robot TTS output)')
+        log_info(self, 'START → end conversation session (kill switch)')
+        log_info(self, 'SELECT → speak custom phrase (custom_say_text)')
 
         # Publish the initial speaking-enabled state so subscribers can sync
         # (TTS defaults to enabled too, so this is belt-and-suspenders).
@@ -141,30 +160,32 @@ class ButtonTriggerNode(Node):
 
         # F1 pressed (rising edge) → start recording, only in push-to-talk mode
         if f1_now and not f1_prev and not self.continuous_mode:
-            self.get_logger().info('F1 held → start recording')
+            log_info(self, 'F1 held → start recording')
             self.recording_active = True
             self._publish_trigger(True)
             self._publish_status('recording')
 
         # F1 released (falling edge) → stop recording
         if not f1_now and f1_prev and self.recording_active:
-            self.get_logger().info('F1 released → stop recording, transcribing...')
+            log_info(self, 'F1 released → stop recording, transcribing...')
             self.recording_active = False
             self._publish_stop()
             self._publish_status('transcribing')
 
     def _on_continuous_start(self, msg: Bool):
-        """Session opened (e.g. via \"Aletta\") — suppress F1 push-to-talk."""
+        r"""Session opened (e.g. via \"Aletta\") — suppress F1 push-to-talk."""
         if msg.data:
             self.continuous_mode = True
-            self.get_logger().info(
+            log_info(
+                self,
                 'Continuous mode ON (session opened) — F1 push-to-talk disabled')
 
     def _on_continuous_stop(self, msg: Bool):
         """Session ended — re-enable F1 push-to-talk."""
         if msg.data:
             self.continuous_mode = False
-            self.get_logger().info(
+            log_info(
+                self,
                 'Continuous mode OFF (session closed) — F1 push-to-talk re-enabled')
 
     def _toggle_continuous(self):
@@ -176,10 +197,11 @@ class ButtonTriggerNode(Node):
             msg = Bool()
             msg.data = True
             self.continuous_stop_pub.publish(msg)
-            self.get_logger().info('Continuous mode OFF (manual stop)')
+            log_info(self, 'Continuous mode OFF (manual stop)')
             self._publish_status('continuous_off')
         else:
-            self.get_logger().info(
+            log_info(
+                self,
                 'START ignored — continuous mode starts only via "Aletta"')
             self._publish_status('continuous_blocked')
 
@@ -187,10 +209,10 @@ class ButtonTriggerNode(Node):
         self.speak_enabled = not self.speak_enabled
         self._publish_speak_enable(self.speak_enabled)
         if self.speak_enabled:
-            self.get_logger().info('Speaking ENABLED (robot will speak replies)')
+            log_info(self, 'Speaking ENABLED (robot will speak replies)')
             self._publish_status('speaking_enabled')
         else:
-            self.get_logger().info('Speaking MUTED (robot will stay silent)')
+            log_info(self, 'Speaking MUTED (robot will stay silent)')
             self._publish_status('speaking_muted')
 
     def _publish_trigger(self, value: bool):
@@ -201,12 +223,12 @@ class ButtonTriggerNode(Node):
     def _publish_say_text(self):
         text = (self.custom_say_text or '').strip()
         if not text:
-            self.get_logger().warning('SELECT pressed but custom_say_text is empty')
+            log_warning(self, 'SELECT pressed but custom_say_text is empty')
             return
         msg = String()
         msg.data = text
         self.say_pub.publish(msg)
-        self.get_logger().info(f'SELECT → speaking custom phrase ({len(text)} chars)')
+        log_info(self, f'SELECT → speaking custom phrase ({len(text)} chars)')
         self._publish_status('custom_say')
 
     def _publish_speak_enable(self, value: bool):

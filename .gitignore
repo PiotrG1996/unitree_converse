@@ -15,3 +15,7 @@ __pycache__/
 
 # Wake-word training data and models live in the src/wakeword_training
 # git submodule (tracked there, not here). See src/wakeword_training/README.md.
+
+# Local Piper TTS artifacts
+piper/
+piper_linux_aarch64.tar.gz

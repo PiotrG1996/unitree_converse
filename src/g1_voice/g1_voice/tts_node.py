@@ -14,7 +14,6 @@ import time
 import queue
 import numpy as np
 
-
 # Sentence boundaries for incremental TTS. A sentence is "complete" once a
 # terminator (. ! ? ;) is followed by whitespace, a newline, or end-of-string.
 # This guarantees we never start speaking a half-word when the next streamed
@@ -76,6 +75,33 @@ def split_complete_sentences(buffer):
 # multi-sentence reply never re-triggers the microphone mid-answer.
 _TURN_END = object()
 
+try:
+    from .node_logging import (
+        error as log_error,
+        info as log_info,
+        warning as log_warning,
+        warn as log_warn,
+    )
+except ImportError:
+    try:
+        from g1_voice.node_logging import (
+            error as log_error,
+            info as log_info,
+            warning as log_warning,
+            warn as log_warn,
+        )
+    except ImportError:
+        import os as _os
+        import sys as _sys
+
+        _sys.path.insert(0, _os.path.dirname(_os.path.abspath(__file__)))
+        import node_logging as _node_logging
+
+        log_error = _node_logging.error
+        log_info = _node_logging.info
+        log_warning = _node_logging.warning
+        log_warn = _node_logging.warn
+
 
 class TTSNode(Node):
     def _param(self, name):
@@ -85,13 +111,10 @@ class TTSNode(Node):
     def __init__(self):
         super().__init__('tts_node')
 
-        self.declare_parameter(
-            'voice_model_path',
-            os.path.expanduser('~/.local/share/piper/en_US-lessac-medium.onnx'))
-        self.declare_parameter(
-            'polish_voice_model_path',
-            os.path.expanduser(
-                '~/.local/share/piper/pl_PL-gosia-medium/pl_PL-gosia-medium.onnx'))
+        self.declare_parameter('voice_model_path', os.path.expanduser(
+            '~/.local/share/piper/en_US-lessac-medium.onnx'))
+        self.declare_parameter('polish_voice_model_path', os.path.expanduser(
+            '~/.local/share/piper/pl_PL-gosia-medium/pl_PL-gosia-medium.onnx'))
         self.declare_parameter('use_cuda', True)
         self.declare_parameter('output_device', -1)
         # Default OFF to match stt_node: after a reply the pipeline goes back
@@ -100,8 +123,10 @@ class TTSNode(Node):
         self.declare_parameter('output_sample_rate', 44100)
         self.declare_parameter('network_interface', 'eth0')
         self.declare_parameter('tts_mode', 'binary')  # 'python' or 'binary'
-        self.declare_parameter('piper_binary', os.path.expanduser('~/.local/piper-bin/piper'))
-        self.declare_parameter('piper_lib_dir', os.path.expanduser('~/.local/piper-bin'))
+        self.declare_parameter('piper_binary',
+                               os.path.expanduser('~/.local/piper-bin/piper'))
+        self.declare_parameter('piper_lib_dir',
+                               os.path.expanduser('~/.local/piper-bin'))
         # Piper speaking rate. 1.0 = the model's natural baseline; lower speaks
         # faster, higher speaks slower. Exposed as a parameter so "make it feel
         # faster" is a config tweak, not a code change.
@@ -133,7 +158,8 @@ class TTSNode(Node):
         self._init_after_worker()
 
     def _maybe_launch_worker(self):
-        """Spawn the native G1 audio worker if it is missing/dead.
+        """
+        Spawn the native G1 audio worker if it is missing/dead.
 
         The speech thread (_play_audio) only reads/writes an already
         installed handle; installing or replacing the subprocess happens
@@ -177,18 +203,17 @@ class TTSNode(Node):
         try:
             ready_line = self._audio_worker.stdout.readline()
             if not ready_line:
-                self.get_logger().error(
-                    'G1 audio worker exited during startup; check its error output'
-                )
+                log_error(
+                    self, 'G1 audio worker exited during startup; check its error output')
                 self._audio_worker = None
                 self._worker_relaunch_requested = True
                 return
             ready = json.loads(ready_line)
             if not ready.get('ready'):
-                self.get_logger().error(
-                    'G1 audio worker initialization failed: '
-                    + ready.get('error', 'unknown error')
-                )
+                log_error(self,
+                          'G1 audio worker initialization failed: '
+                          + ready.get('error', 'unknown error')
+                          )
                 try:
                     self._audio_worker.terminate()
                 except Exception:
@@ -196,13 +221,13 @@ class TTSNode(Node):
                 self._audio_worker = None
                 self._worker_relaunch_requested = True
                 return
-            self.get_logger().info(
-                f'Native G1 audio worker initialized on {self.network_interface}'
-            )
+            log_info(
+                self,
+                f'Native G1 audio worker initialized on {self.network_interface}')
         except Exception as e:
-            self.get_logger().error(
-                f'Failed to read G1 audio worker startup message: {e}'
-            )
+            log_error(self,
+                      f'Failed to read G1 audio worker startup message: {e}'
+                      )
             try:
                 self._audio_worker.terminate()
             except Exception:
@@ -275,57 +300,75 @@ class TTSNode(Node):
         self.stream_sub = self.create_subscription(
             String, 'llm_stream', self.stream_callback, 10)
         self.create_subscription(
-            String, '/g1/stt/transcript', self._transcript_language_callback, 10)
-        self.create_subscription(Bool, '/g1/voice/continuous_start', self._continuous_start_cb, 10)
-        self.create_subscription(Bool, '/g1/voice/continuous_stop', self._continuous_stop_cb, 10)
-        self.create_subscription(Bool, '/g1/voice/speak_enable', self._speak_enable_cb, 10)
+            String,
+            '/g1/stt/transcript',
+            self._transcript_language_callback,
+            10)
+        self.create_subscription(
+            Bool,
+            '/g1/voice/continuous_start',
+            self._continuous_start_cb,
+            10)
+        self.create_subscription(
+            Bool,
+            '/g1/voice/continuous_stop',
+            self._continuous_stop_cb,
+            10)
+        self.create_subscription(
+            Bool,
+            '/g1/voice/speak_enable',
+            self._speak_enable_cb,
+            10)
         self.say_sub = self.create_subscription(
             String, '/g1/voice/say_text', self.say_text_callback, 10)
 
         self.status_pub = self.create_publisher(String, '/g1/tts/status', 10)
         self.trigger_pub = self.create_publisher(Bool, '/g1/voice/trigger', 10)
 
-        self.get_logger().info(f'TTS node ready — mode: {self.tts_mode}, model: {self.model_path}')
+        log_info(
+            self,
+            f'TTS node ready — mode: {self.tts_mode}, model: {self.model_path}')
 
     def _load_voice_python(self):
         if not os.path.exists(self.model_path):
-            self.get_logger().error(f'Piper model not found: {self.model_path}')
+            log_error(self, f'Piper model not found: {self.model_path}')
             return
         try:
             from piper.voice import PiperVoice
-            self.voice = PiperVoice.load(self.model_path, use_cuda=self.use_cuda)
-            self.get_logger().info(
-                f'Piper English voice loaded — native rate: '
-                f'{self.voice.config.sample_rate}Hz')
+            self.voice = PiperVoice.load(
+                self.model_path, use_cuda=self.use_cuda)
+            log_info(self,
+                     f'Piper English voice loaded — native rate: '
+                     f'{self.voice.config.sample_rate}Hz')
             if not os.path.isfile(self.polish_model_path):
-                self.get_logger().error(
-                    f'Piper Polish model not found: {self.polish_model_path}')
+                log_error(
+                    self, f'Piper Polish model not found: {self.polish_model_path}')
                 return
             self.polish_voice = PiperVoice.load(
                 self.polish_model_path, use_cuda=self.use_cuda)
-            self.get_logger().info(
-                f'Piper Polish voice loaded — native rate: '
-                f'{self.polish_voice.config.sample_rate}Hz')
+            log_info(self,
+                     f'Piper Polish voice loaded — native rate: '
+                     f'{self.polish_voice.config.sample_rate}Hz')
         except Exception as e:
-            self.get_logger().error(f'Failed to load Piper Python voice: {e}')
+            log_error(self, f'Failed to load Piper Python voice: {e}')
 
     def _check_binary(self):
         if not os.path.exists(self.piper_binary):
-            self.get_logger().error(f'Piper binary not found: {self.piper_binary}')
+            log_error(self, f'Piper binary not found: {self.piper_binary}')
             return
-        self.get_logger().info(f'Piper binary found: {self.piper_binary}')
+        log_info(self, f'Piper binary found: {self.piper_binary}')
         for language, model_path in (
                 ('English', self.model_path),
                 ('Polish', self.polish_model_path)):
             if not os.path.isfile(model_path):
-                self.get_logger().error(
-                    f'{language} Piper voice model not found: {model_path}')
+                log_error(
+                    self, f'{language} Piper voice model not found: {model_path}')
             elif not os.access(model_path, os.R_OK):
-                self.get_logger().error(
-                    f'{language} Piper voice model is not readable: {model_path}')
+                log_error(
+                    self, f'{language} Piper voice model is not readable: {model_path}')
             else:
-                self.get_logger().info(
-                    f'{language} Piper voice ready: {model_path}')
+                log_info(self,
+                         f'{language} Piper voice ready: {model_path}')
 
     def _play_wav_bytes(self, wav_bytes: bytes):
         """Play a 16-bit PCM WAV through the native G1 speaker (g1_audio_worker)."""
@@ -354,7 +397,9 @@ class TTSNode(Node):
     def response_callback(self, msg: String):
         try:
             data = json.loads(msg.data)
-            reply = data.get('reply', '').strip() if isinstance(data, dict) else msg.data.strip()
+            reply = data.get(
+                'reply', '').strip() if isinstance(
+                data, dict) else msg.data.strip()
         except (json.JSONDecodeError, KeyError):
             reply = msg.data.strip()
 
@@ -363,7 +408,7 @@ class TTSNode(Node):
 
         language, reply = self._language_and_text(reply)
         if not reply:
-            self.get_logger().warning('Ignoring empty response after language marker')
+            log_warning(self, 'Ignoring empty response after language marker')
             return
 
         # Only trust previously streamed chunks when they belong to THIS
@@ -407,7 +452,7 @@ class TTSNode(Node):
             self._turn_open = False
         else:
             preview = f'"{reply[:80]}..."' if len(reply) > 80 else f'"{reply}"'
-            self.get_logger().info(f'Speaking: {preview}')
+            log_info(self, f'Speaking: {preview}')
             self._speech_queue.put((language, reply))
             self._speech_queue.put(_TURN_END)
 
@@ -429,11 +474,11 @@ class TTSNode(Node):
         # in-flight LLM reply (see _language_and_text).
         language, text = self._language_and_text(text, consume_latched=False)
         if not text:
-            self.get_logger().warning('Ignoring empty say_text after language marker')
+            log_warning(self, 'Ignoring empty say_text after language marker')
             return
         self._warn_on_language_mismatch(text, language)
         preview = f'"{text[:80]}..."' if len(text) > 80 else f'"{text}"'
-        self.get_logger().info(f'Speaking custom say_text: {preview}')
+        log_info(self, f'Speaking custom say_text: {preview}')
         self._speech_queue.put((language, text))
 
     def _normalize(self, audio: np.ndarray, target: float = 0.9) -> np.ndarray:
@@ -450,7 +495,11 @@ class TTSNode(Node):
             audio = audio * (target / peak)
         return np.clip(audio, -1.0, 1.0).astype(np.float32)
 
-    def _resample(self, audio: np.ndarray, orig_sr: int, target_sr: int) -> np.ndarray:
+    def _resample(
+            self,
+            audio: np.ndarray,
+            orig_sr: int,
+            target_sr: int) -> np.ndarray:
         if orig_sr == target_sr:
             return audio
         duration = len(audio) / orig_sr
@@ -462,7 +511,8 @@ class TTSNode(Node):
         ).astype(np.float32)
 
     def _play_audio(self, audio: np.ndarray, src_rate: int):
-        """Send synthesized PCM to the separate native G1 audio worker.
+        """
+        Send synthesized PCM to the separate native G1 audio worker.
 
         On any failure (dead worker, closed pipe, error reply) this method
         tears down only the worker handle IT was using and asks the node's
@@ -481,7 +531,7 @@ class TTSNode(Node):
             audio = np.clip(audio, -1.0, 1.0)
             pcm_data = (audio * 32767.0).astype(np.int16).tobytes()
             if not pcm_data:
-                self.get_logger().warning("No audio samples to play")
+                log_warning(self, "No audio samples to play")
                 return
 
             with tempfile.NamedTemporaryFile(
@@ -494,8 +544,8 @@ class TTSNode(Node):
             # this worker, not a newer one spawned in the meantime.
             worker = self._audio_worker
             if worker is None or worker.poll() is not None:
-                self.get_logger().error(
-                    "G1 audio worker is not running — relaunching")
+                log_error(self,
+                          "G1 audio worker is not running — relaunching")
                 raise RuntimeError("G1 audio worker not running")
 
             worker.stdin.write(json.dumps({
@@ -521,11 +571,11 @@ class TTSNode(Node):
                     response.get("error", "Unknown worker playback error")
                 )
 
-            self.get_logger().info("Playback complete via native G1 speaker")
+            log_info(self, "Playback complete via native G1 speaker")
 
         except Exception as e:
-            self.get_logger().error(
-                f"Native G1 audio playback failed: {e}")
+            log_error(self,
+                      f"Native G1 audio playback failed: {e}")
             # Tear down exactly the handle this call pinned, and flag the
             # node's timer to spawn a fresh worker. Without the flag, the
             # (gated) _maybe_launch_worker() would never run and TTS would
@@ -567,7 +617,7 @@ class TTSNode(Node):
                 trigger = Bool()
                 trigger.data = True
                 self.trigger_pub.publish(trigger)
-                self.get_logger().info('Continuous mode — auto-triggering next turn')
+                log_info(self, 'Continuous mode — auto-triggering next turn')
             self._turn_had_transcript = False
             return True
         language, text = item
@@ -592,14 +642,14 @@ class TTSNode(Node):
                     # F3 muted: process the reply but do not play it. Skip synthesis
                     # entirely (it would be discarded anyway) and skip straight to
                     # idle so the continuous-mode loop keeps turning.
-                    self.get_logger().info(
-                        'Speaking MUTED (F3) — reply received but not played.')
+                    log_info(
+                        self, 'Speaking MUTED (F3) — reply received but not played.')
                 elif self.tts_mode == 'python':
                     self._speak_python(text, language)
                 else:
                     self._speak_binary(text, language)
             except Exception as e:
-                self.get_logger().error(f'TTS error: {e}')
+                log_error(self, f'TTS error: {e}')
                 self._publish_status('error')
                 self.is_speaking = False
                 return
@@ -637,7 +687,8 @@ class TTSNode(Node):
             self._turn_had_transcript = True
 
     def _language_and_text(self, text: str, consume_latched: bool = True):
-        """Return the explicit or remembered language and clean response text.
+        """
+        Return the explicit or remembered language and clean response text.
 
         Args:
             text: Raw reply, optionally prefixed with a [USER_LANGUAGE:xx]
@@ -664,16 +715,21 @@ class TTSNode(Node):
 
         if language is None:
             language = "pl" if self._is_polish_text(text) else "en"
-        self.get_logger().info(
-            f'TTS language selected from latest user turn: {language}')
+        log_info(self,
+                 f'TTS language selected from latest user turn: {language}')
         return language, text.strip()
 
     # Backwards-compatible alias used by older call sites/tests.
     def _language_and_text_preserve(self, text: str):
         return self._language_and_text(text, consume_latched=False)
 
-    def _play_audio_with_timeout(self, audio, src_rate, timeout_sec: float = 60.0) -> bool:
-        """Run _play_audio in a bounded thread and bound its wall-clock time.
+    def _play_audio_with_timeout(
+            self,
+            audio,
+            src_rate,
+            timeout_sec: float = 60.0) -> bool:
+        """
+        Run _play_audio in a bounded thread and bound its wall-clock time.
 
         _play_audio blocks on the audio worker's stdout with no timeout: a
         dead worker would block the speech-queue thread forever. Running it
@@ -695,9 +751,9 @@ class TTSNode(Node):
         worker = threading.Thread(target=_run, daemon=True)
         worker.start()
         if not done.wait(timeout=timeout_sec):
-            self.get_logger().error(
-                f'TTS playback timed out after {timeout_sec:.0f}s — '
-                'skipping to next queue item')
+            log_error(self,
+                      f'TTS playback timed out after {timeout_sec:.0f}s — '
+                      'skipping to next queue item')
             self._publish_status('error')
             return False
         return outcome['ok']
@@ -717,8 +773,8 @@ class TTSNode(Node):
         expected_polish = (language == 'pl')
         if looks_polish != expected_polish:
             actual = 'pl' if looks_polish else 'en'
-            self.get_logger().warning(
-                f'Reply language mismatch: turn language is {language!r} '
+            log_warning(
+                self, f'Reply language mismatch: turn language is {language!r} '
                 f'but reply text looks {actual!r}: {reply[:60]!r}...')
 
     # --- streamed-llm state machine (llm_stream -> incremental sentences) ---
@@ -737,7 +793,8 @@ class TTSNode(Node):
         self._stream_seq = -1
 
     def _reset_turn_state_only(self):
-        """Clear stream buffers without touching the transcript flag.
+        """
+        Clear stream buffers without touching the transcript flag.
 
         Kept for the unit-test harness and external callers that need a
         buffer-only reset. Bumps the generation counter exactly like
@@ -767,8 +824,8 @@ class TTSNode(Node):
         the full reply.
         """
         if not self._turn_open:
-            self.get_logger().warning(
-                'Ignoring llm_stream delta for a closed turn')
+            log_warning(self,
+                        'Ignoring llm_stream delta for a closed turn')
             return
         self._on_stream_chunk(msg.data, self._turn_language)
 
@@ -831,7 +888,7 @@ class TTSNode(Node):
     def _speak_python(self, text: str, language: str):
         voice = self.polish_voice if language == 'pl' else self.voice
         if voice is None:
-            self.get_logger().error(f'No Python {language} voice loaded')
+            log_error(self, f'No Python {language} voice loaded')
             return
 
         chunks = []
@@ -840,7 +897,7 @@ class TTSNode(Node):
             chunks.append(audio_chunk.audio_float_array)
 
         if not chunks:
-            self.get_logger().warn('Piper produced no audio')
+            log_warn(self, 'Piper produced no audio')
             return
 
         audio = np.concatenate(chunks).astype(np.float32)
@@ -871,17 +928,17 @@ class TTSNode(Node):
         """Synthesize text with Piper and play it through the G1 speaker."""
         text = text.strip()
         if not text:
-            self.get_logger().warning("Empty TTS text; skipping synthesis")
+            log_warning(self, "Empty TTS text; skipping synthesis")
             return
 
         if not os.path.isfile(self.piper_binary):
-            self.get_logger().error(
-                f"Piper binary not found: {self.piper_binary}"
-            )
+            log_error(self,
+                      f"Piper binary not found: {self.piper_binary}"
+                      )
             return
 
         if not text:
-            self.get_logger().warning("No text left for synthesis")
+            log_warning(self, "No text left for synthesis")
             return
 
         selected_model = (
@@ -890,15 +947,15 @@ class TTSNode(Node):
 
         # Don't silently speak Polish with an English voice (or vice versa).
         if not os.path.isfile(selected_model):
-            self.get_logger().error(
-                f"Selected {language} Piper model not found: {selected_model}"
-            )
+            log_error(
+                self,
+                f"Selected {language} Piper model not found: {selected_model}")
             return
 
         if not os.access(selected_model, os.R_OK):
-            self.get_logger().error(
-                f"Piper model is not readable: {selected_model}"
-            )
+            log_error(self,
+                      f"Piper model is not readable: {selected_model}"
+                      )
             return
 
         env = os.environ.copy()
@@ -914,9 +971,9 @@ class TTSNode(Node):
                 os.path.join(self.piper_lib_dir, "espeak-ng-data"),
             )
 
-        self.get_logger().info(
-            f"Selected Piper language: {language}; model: {selected_model}"
-        )
+        log_info(
+            self,
+            f"Selected Piper language: {language}; model: {selected_model}")
 
         # A value of 1.0 is the model's usual baseline speed.
         # Lower values speak faster; higher values speak slower.
@@ -947,19 +1004,18 @@ class TTSNode(Node):
                 check=False,
             )
 
-            self.get_logger().info(
-                f"Piper synthesis took {time.monotonic() - start:.2f}s"
-            )
+            log_info(self,
+                     f"Piper synthesis took {time.monotonic() - start:.2f}s"
+                     )
 
             if result.returncode != 0:
                 error_text = result.stderr.strip()[-1500:]
-                self.get_logger().error(
-                    f"Piper failed (exit {result.returncode}): {error_text}"
-                )
+                log_error(
+                    self, f"Piper failed (exit {result.returncode}): {error_text}")
                 return
 
             if not os.path.isfile(wav_path) or os.path.getsize(wav_path) == 0:
-                self.get_logger().error("Piper produced an empty WAV file")
+                log_error(self, "Piper produced an empty WAV file")
                 return
 
             with open(wav_path, "rb") as wav_file:
@@ -969,33 +1025,33 @@ class TTSNode(Node):
             try:
                 with wave.open(io.BytesIO(wav_bytes), "rb") as wav_file:
                     if wav_file.getnframes() == 0:
-                        self.get_logger().error("Piper WAV contains no audio frames")
+                        log_error(self, "Piper WAV contains no audio frames")
                         return
             except (wave.Error, EOFError) as exc:
-                self.get_logger().error(f"Piper produced an invalid WAV: {exc}")
+                log_error(self, f"Piper produced an invalid WAV: {exc}")
                 return
 
         except subprocess.TimeoutExpired:
-            self.get_logger().error("Piper synthesis timed out after 60 seconds")
+            log_error(self, "Piper synthesis timed out after 60 seconds")
             return
         except OSError as exc:
-            self.get_logger().error(f"Could not run Piper: {exc}")
+            log_error(self, f"Could not run Piper: {exc}")
             return
         finally:
             if wav_path and os.path.exists(wav_path):
                 try:
                     os.unlink(wav_path)
                 except OSError as exc:
-                    self.get_logger().warning(
-                        f"Could not remove temporary WAV: {exc}"
-                    )
+                    log_warning(self,
+                                f"Could not remove temporary WAV: {exc}"
+                                )
 
         playback_start = time.monotonic()
         self._play_wav_bytes(wav_bytes)
-        self.get_logger().info(
-            f"Audio playback processing took "
-            f"{time.monotonic() - playback_start:.2f}s"
-        )
+        log_info(self,
+                 f"Audio playback processing took "
+                 f"{time.monotonic() - playback_start:.2f}s"
+                 )
 
     # def _speak_binary(self, text: str):
     #     """Synthesize with the standalone Piper binary and play through the
@@ -1004,7 +1060,7 @@ class TTSNode(Node):
     #     unitree_sdk2 (no AudioClient::PlayStream), so we render a WAV locally
     #     with Piper and play it via sounddevice/ALSA instead."""
     #     if not os.path.exists(self.piper_binary):
-    #         self.get_logger().error(f'Piper binary not found: {self.piper_binary}')
+    #         log_error(self, f'Piper binary not found: {self.piper_binary}')
     #         return
 
     #     env = os.environ.copy()
@@ -1026,10 +1082,10 @@ class TTSNode(Node):
     #                 selected_model = self.polish_model_path
     #                 selected_language = 'pl'
     #             else:
-    #                 self.get_logger().error(
+    #                 log_error(self,
     #                     f'Polish Piper model not found: {self.polish_model_path}; '
     #                     'falling back to English voice')
-    #         self.get_logger().info(
+    #         log_info(self,
     #             f'Selected Piper language: {selected_language}; model: {selected_model}')
     #         cmd = [self.piper_binary, '--model', selected_model,
     #             '--length_scale', '0.85',
@@ -1043,21 +1099,21 @@ class TTSNode(Node):
     #         result = subprocess.run(
     #             cmd, input=text.encode('utf-8'), capture_output=True,
     #             timeout=60, env=env)
-    #         self.get_logger().info(
+    #         log_info(self,
     #             f'Piper synthesis took {time.monotonic() - t0:.2f}s'
     #         )
 
     #         if result.returncode != 0:
-    #             self.get_logger().error(
+    #             log_error(self,
     #                 f'Piper error: {result.stderr.decode(errors="ignore").strip()}')
     #             return
     #         with open(wav_path, 'rb') as f:
     #             wav_bytes = f.read()
     #     except FileNotFoundError:
-    #         self.get_logger().error(f'Piper binary not found: {self.piper_binary}')
+    #         log_error(self, f'Piper binary not found: {self.piper_binary}')
     #         return
     #     except subprocess.TimeoutExpired:
-    #         self.get_logger().error('Piper synthesis timed out')
+    #         log_error(self, 'Piper synthesis timed out')
     #         return
     #     finally:
     #         if os.path.exists(wav_path):
@@ -1067,26 +1123,26 @@ class TTSNode(Node):
 
     #     t1 = time.monotonic()
     #     self._play_wav_bytes(wav_bytes)
-    #     self.get_logger().info(
+    #     log_info(self,
     #         f'Audio processing and playback took {time.monotonic() - t1:.2f}s'
     #     )
 
     def _continuous_start_cb(self, msg: Bool):
         if msg.data:
             self.continuous_mode = True
-            self.get_logger().info('Continuous mode enabled')
+            log_info(self, 'Continuous mode enabled')
 
     def _continuous_stop_cb(self, msg: Bool):
         if msg.data:
             self.continuous_mode = False
-            self.get_logger().info('Continuous mode disabled')
+            log_info(self, 'Continuous mode disabled')
 
     def _speak_enable_cb(self, msg: Bool):
         # F3 button toggles this. When False (muted), the robot still receives and
         # processes replies but does not play them through the speaker.
         self.speak_enabled = bool(msg.data)
         state = 'ENABLED' if self.speak_enabled else 'MUTED'
-        self.get_logger().info(f'Speaking {state} (via F3 / /g1/voice/speak_enable)')
+        log_info(self, f'Speaking {state} (via F3 / /g1/voice/speak_enable)')
 
     def _publish_status(self, status: str):
         msg = String()

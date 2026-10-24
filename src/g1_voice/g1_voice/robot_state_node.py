@@ -4,6 +4,21 @@ from std_msgs.msg import String
 import socket
 import subprocess
 
+try:
+    from .node_logging import info as log_info, warn as log_warn
+except ImportError:
+    try:
+        from g1_voice.node_logging import info as log_info, warn as log_warn
+    except ImportError:
+        import os as _os
+        import sys as _sys
+
+        _sys.path.insert(0, _os.path.dirname(_os.path.abspath(__file__)))
+        import node_logging as _node_logging
+
+        log_info = _node_logging.info
+        log_warn = _node_logging.warn
+
 
 class RobotStateNode(Node):
     """
@@ -47,17 +62,22 @@ class RobotStateNode(Node):
                 durability=DurabilityPolicy.VOLATILE,
                 depth=10
             )
-            self.create_subscription(BmsState, '/lf/bmsstate', self._bms_callback, qos)
-            self.get_logger().info('Subscribed to /lf/bmsstate')
+            self.create_subscription(
+                BmsState, '/lf/bmsstate', self._bms_callback, qos)
+            log_info(self, 'Subscribed to /lf/bmsstate')
         except Exception as e:
-            self.get_logger().warn(f'Could not subscribe to BmsState: {e}')
+            log_warn(self, f'Could not subscribe to BmsState: {e}')
 
         try:
             from unitree_go.msg import SportModeState
-            self.create_subscription(SportModeState, '/odommodestate', self._sport_callback, 10)
-            self.get_logger().info('Subscribed to /odommodestate')
+            self.create_subscription(
+                SportModeState,
+                '/odommodestate',
+                self._sport_callback,
+                10)
+            log_info(self, 'Subscribed to /odommodestate')
         except Exception as e:
-            self.get_logger().warn(f'Could not subscribe to SportModeState: {e}')
+            log_warn(self, f'Could not subscribe to SportModeState: {e}')
 
         # Subscribe to STT transcript
         self.transcript_sub = self.create_subscription(
@@ -74,7 +94,7 @@ class RobotStateNode(Node):
         # from the per-turn prompt path.
         self.create_timer(30.0, self._update_ros_node_count)
 
-        self.get_logger().info('Robot state node ready')
+        log_info(self, 'Robot state node ready')
 
     def _update_ros_node_count(self):
         """Count ROS2 nodes in the background; cache for per-turn reuse."""
@@ -103,7 +123,8 @@ class RobotStateNode(Node):
         self.battery_current = msg.current / 1000.0  # mA to A
         temps = [t for t in msg.temperature if t > 0]
         self.battery_temp = max(temps) if temps else None
-        self.battery_voltage = msg.bmsvoltage[0] / 1000.0 if len(msg.bmsvoltage) > 0 else None
+        self.battery_voltage = msg.bmsvoltage[0] / \
+            1000.0 if len(msg.bmsvoltage) > 0 else None
         self.battery_cycles = msg.cycle
 
     def _sport_callback(self, msg):
@@ -140,7 +161,8 @@ class RobotStateNode(Node):
         except Exception:
             info['uptime'] = 'unknown'
 
-        # ROS2 nodes (use the background-cached count; never block the turn here)
+        # ROS2 nodes (use the background-cached count; never block the turn
+        # here)
         info['ros_nodes'] = self._cached_ros_nodes
 
         return info
@@ -168,13 +190,18 @@ class RobotStateNode(Node):
 
         # Mode
         if self.mode is not None:
-            mode_names = {0: 'idle', 1: 'balancing', 2: 'walking', 3: 'running'}
+            mode_names = {
+                0: 'idle',
+                1: 'balancing',
+                2: 'walking',
+                3: 'running'}
             mode_str = mode_names.get(self.mode, f'mode {self.mode}')
             lines.append(f'Motion mode: {mode_str}')
 
         # System
         sys_info = self._get_system_info()
-        lines.append(f'Network: eth {sys_info["eth_ip"]}, wifi {sys_info["wifi_ip"]}')
+        lines.append(
+            f'Network: eth {sys_info["eth_ip"]}, wifi {sys_info["wifi_ip"]}')
         lines.append(f'Uptime: {sys_info["uptime"]}')
         lines.append(f'Active ROS2 nodes: {sys_info["ros_nodes"]}')
         lines.append(f'LLM: Ollama LLaMA 3.2 3B (local)')
@@ -192,7 +219,8 @@ class RobotStateNode(Node):
 
         # Read language metadata from STT while preserving the spoken text.
         first_line, separator, remaining = raw_text.partition('\n')
-        if separator and first_line.startswith('[USER_LANGUAGE:') and first_line.endswith(']'):
+        if separator and first_line.startswith(
+                '[USER_LANGUAGE:') and first_line.endswith(']'):
             language_code = first_line[len('[USER_LANGUAGE:'):-1].lower()
             transcript = remaining.strip()
         if not transcript:
@@ -212,8 +240,7 @@ class RobotStateNode(Node):
                 f"Reply in {language_name} for this turn, regardless of earlier "
                 "conversation turns. This instruction overrides the language "
                 "used in previous turns, unless the user explicitly requests "
-                "a different language."
-            )
+                "a different language.")
             enriched = (
                 f"{state_context}\n\n{language_instruction}"
                 f"\n\nUser: {transcript}"
@@ -225,7 +252,7 @@ class RobotStateNode(Node):
         out.data = enriched
         self.prompt_pub.publish(out)
 
-        self.get_logger().info(f'Forwarded enriched prompt to LLM')
+        log_info(self, f'Forwarded enriched prompt to LLM')
 
     def _publish_state_summary(self):
         """Publish robot state summary every 30s."""

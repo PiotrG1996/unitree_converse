@@ -76,7 +76,6 @@ class _FakeWakeNode:
         self.session_opened_by_wake = False
         self.session_had_llm_reply = False
         self.last_session_activity = 0.0
-        self.session_silence_timeout = 20.0
         # Duration cap + empty-turn limit (session-close conditions).
         self.session_max_duration_sec = 300.0
         self.max_empty_turns = 4

@@ -66,9 +66,15 @@
     model_size: "base"
     language: "auto"
     device: "cuda"
+    beam_size: 5
+    initial_prompt: "Aletta, robot assistant. Hello, how can I help? Czesc, jak moge pomoc?"
+    vad_threshold: 0.5
+    vad_min_silence_ms: 500
+    vad_speech_pad_ms: 200
+    normalize_audio: false
 
     sample_rate: 16000
-    recording_duration: 8.0
+    recording_duration: 10.0
     silence_threshold: 0.008
 
     # Turn-taking: stop early on trailing silence so the pipeline answers

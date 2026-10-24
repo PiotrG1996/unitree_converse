@@ -15,8 +15,14 @@
     model_size: "base"
     language: "en"
     device: "cpu"
+    beam_size: 5
+    initial_prompt: "Aletta, robot assistant. Hello, how can I help?"
+    vad_threshold: 0.5
+    vad_min_silence_ms: 500
+    vad_speech_pad_ms: 200
+    normalize_audio: false
     sample_rate: 16000
-    recording_duration: 5.0
+    recording_duration: 8.0
     silence_threshold: 0.01
     silence_duration: 2.5
     # Raised 0.5 -> 0.85: live logs show real uncertain English speech at

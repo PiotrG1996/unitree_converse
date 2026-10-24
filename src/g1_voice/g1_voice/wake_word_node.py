@@ -8,6 +8,33 @@ import struct
 import threading
 import time
 
+try:
+    from .node_logging import (
+        info as log_info,
+        warn as log_warn,
+        debug as log_debug,
+        error as log_error,
+    )
+except ImportError:
+    try:
+        from g1_voice.node_logging import (
+            info as log_info,
+            warn as log_warn,
+            debug as log_debug,
+            error as log_error,
+        )
+    except ImportError:
+        import os as _os
+        import sys as _sys
+
+        _sys.path.insert(0, _os.path.dirname(_os.path.abspath(__file__)))
+        import node_logging as _node_logging
+
+        log_info = _node_logging.info
+        log_warn = _node_logging.warn
+        log_debug = _node_logging.debug
+        log_error = _node_logging.error
+
 
 class WakeWordNode(Node):
     """
@@ -221,7 +248,7 @@ class WakeWordNode(Node):
         # Publish health status periodically for observability/diagnostics.
         self.create_timer(5.0, self._publish_health)
 
-        self.get_logger().info('Wake word node ready (Aletta + pad only)')
+        log_info(self, 'Wake word node ready (Aletta + pad only)')
 
     def stt_status_callback(self, msg: String):
         self.stt_busy = msg.data in ('recording', 'transcribing')
@@ -233,9 +260,9 @@ class WakeWordNode(Node):
             # a reason to close on its own: the STT watchdog re-arms
             # listening, and the session survives until max_empty_turns.
             self.empty_turns += 1
-            self.get_logger().info(
-                f'Empty turn {self.empty_turns}/{self.max_empty_turns} '
-                '(no transcript published)')
+            log_info(self,
+                     f'Empty turn {self.empty_turns}/{self.max_empty_turns} '
+                     '(no transcript published)')
             if self.empty_turns >= self.max_empty_turns:
                 self._close_session(
                     f'{self.empty_turns} consecutive empty turns')
@@ -311,8 +338,8 @@ class WakeWordNode(Node):
             msg = Bool()
             msg.data = True
             self.continuous_start_pub.publish(msg)
-            self.get_logger().info(
-                f'Conversation session OPEN ({source}) — closes on START, '
+            log_info(
+                self, f'Conversation session OPEN ({source}) — closes on START, '
                 f'{self.max_empty_turns} empty turns, or '
                 f'{self.session_max_duration_sec:.0f}s max duration')
         else:
@@ -347,23 +374,18 @@ class WakeWordNode(Node):
             new_cooldown = self.base_cooldown * (
                 self.false_accept_backoff_multiplier ** self.false_accept_count)
             self.cooldown = min(new_cooldown, self.max_false_accept_cooldown)
-            self.get_logger().warn(
-                f'False accept #{self.false_accept_count} — session ended '
+            log_warn(
+                self, f'False accept #{self.false_accept_count} — session ended '
                 f'({reason}) with no reply, cooldown back off to '
                 f'{self.cooldown:.0f}s')
         self.session_opened_by_wake = False
         self.session_had_llm_reply = False
-        self.get_logger().info(
-            f'Conversation session CLOSED ({reason}) — '
-            'say "Aletta" to start again')
+        log_info(self,
+                 f'Conversation session CLOSED ({reason}) — '
+                 'say "Aletta" to start again')
 
     def _can_trigger(self):
         now = time.time()
-        # Allow trigger if session is open AND cooldown has passed — wake word
-        # must be able to refresh the session window (missed-wake prevention,
-        # 2026-10-17), but respect the cooldown to avoid rapid-firing.
-        if self.session_open and (now - self.last_trigger_time) >= self.cooldown:
-            return True
         if self.stt_busy or self.llm_busy or self.tts_busy:
             return False
         if (now - self.last_trigger_time) < self.cooldown:
@@ -391,7 +413,8 @@ class WakeWordNode(Node):
                 f'{self.session_max_duration_sec:.0f}s)')
 
     def _in_session_refresh(self, score):
-        """Refresh an open session on a fresh wake-word detection.
+        """
+        Refresh an open session on a fresh wake-word detection.
 
         When the pipeline is free (not recording / transcribing / thinking /
             speaking),
@@ -401,20 +424,20 @@ class WakeWordNode(Node):
         """
         self._touch_session()
         if not (self.stt_busy or self.llm_busy or self.tts_busy):
-            self.get_logger().info(
-                'Aletta during open session — starting new turn '
-                f'(score={score:.2f})')
+            log_info(self,
+                     'Aletta during open session — starting new turn '
+                     f'(score={score:.2f})')
             self._fire_trigger('aletta_wake_word')
         else:
-            self.get_logger().info(
-                'Aletta heard during open session '
-                f'(score={score:.2f}) - session refreshed '
-                '(pipeline busy, no new turn)')
+            log_info(self,
+                     'Aletta heard during open session '
+                     f'(score={score:.2f}) - session refreshed '
+                     '(pipeline busy, no new turn)')
 
     def _fire_trigger(self, source: str):
         if not self._can_trigger():
-            self.get_logger().debug(
-                'Trigger blocked — pipeline busy or cooldown active')
+            log_debug(self,
+                      'Trigger blocked — pipeline busy or cooldown active')
             return
         self.last_trigger_time = time.time()
         if source != 'aletta_wake_word':
@@ -434,7 +457,7 @@ class WakeWordNode(Node):
         # coexist, so a repeated "Aletta" refreshes the window (see
         # _in_session_refresh) instead of hitting a closed socket. The firing
         # itself stays gated by _can_trigger (cooldown + pipeline-busy).
-        self.get_logger().info(f'Trigger fired from: {source}')
+        log_info(self, f'Trigger fired from: {source}')
         msg = Bool()
         msg.data = True
         self.trigger_pub.publish(msg)
@@ -445,7 +468,8 @@ class WakeWordNode(Node):
     def _publish_health(self):
         """Publish wake-node health status for observability/diagnostics."""
         msg = String()
-        remaining = max(0.0, self.cooldown - (time.time() - self.last_trigger_time))
+        remaining = max(0.0, self.cooldown -
+                        (time.time() - self.last_trigger_time))
         msg.data = (
             f'model_loaded={self.wake_model_loaded},'
             f'last_score={self.last_wake_score:.2f},'
@@ -492,17 +516,17 @@ class WakeWordNode(Node):
         if self._init_openwakeword():
             if not self._wake_mic_path_logged:
                 self._wake_mic_path_logged = True
-                self.get_logger().info(
-                    f'Wake mic path = UDP multicast '
+                log_info(
+                    self, f'Wake mic path = UDP multicast '
                     f'(group={self.udp_multicast_group}, port={self.udp_port})')
             threading.Thread(target=self._wake_word_loop, daemon=True).start()
-            self.get_logger().info(
-                'Wake listener started — "Aletta" openWakeWord model '
-                f'(threshold={self.aletta_threshold})')
+            log_info(self,
+                     'Wake listener started — "Aletta" openWakeWord model '
+                     f'(threshold={self.aletta_threshold})')
         else:
-            self.get_logger().error(
-                'Wake listener disabled — Aletta model did not load; '
-                'use pad buttons (F1/START/SELECT) to talk to the robot')
+            log_error(self,
+                      'Wake listener disabled — Aletta model did not load; '
+                      'use pad buttons (F1/START/SELECT) to talk to the robot')
 
     def _wake_word_loop(self):
         # openWakeWord streams on 80 ms frames (1280 samples @16kHz).
@@ -533,14 +557,15 @@ class WakeWordNode(Node):
                     mreq = struct.pack(
                         '4s4s', socket.inet_aton(self.udp_multicast_group),
                         socket.inet_aton(self.udp_local_ip))
-                    sock.setsockopt(socket.IPPROTO_IP, socket.IP_ADD_MEMBERSHIP, mreq)
+                    sock.setsockopt(
+                        socket.IPPROTO_IP, socket.IP_ADD_MEMBERSHIP, mreq)
                     sock.settimeout(0.5)
-                    self.get_logger().info(
-                        'Aletta mic open on UDP '
-                        f'{self.udp_multicast_group}:{self.udp_port}')
+                    log_info(self,
+                             'Aletta mic open on UDP '
+                             f'{self.udp_multicast_group}:{self.udp_port}')
                 except OSError as e:
-                    self.get_logger().error(
-                        f'Failed to bind wake-word socket: {e}')
+                    log_error(self,
+                              f'Failed to bind wake-word socket: {e}')
                     time.sleep(1.0)
                     continue
             audio = bytearray()
@@ -611,8 +636,8 @@ class WakeWordNode(Node):
                             continue
                         if self.oww_detector.process(frame):
                             score = self.oww_detector.last_score
-                            self.get_logger().info(
-                                'Aletta wake word detected (openWakeWord, '
+                            log_info(
+                                self, 'Aletta wake word detected (openWakeWord, '
                                 f'score={score:.2f})')
                             if self.session_open:
                                 self._in_session_refresh(score)
@@ -622,8 +647,8 @@ class WakeWordNode(Node):
                             audio.clear()
                             break
             except OSError:
-                self.get_logger().error(
-                    'Aletta UDP socket closed unexpectedly — recreating')
+                log_error(self,
+                          'Aletta UDP socket closed unexpectedly — recreating')
                 if self._wake_socket is sock:
                     self._wake_socket = None
                 try:
@@ -633,7 +658,7 @@ class WakeWordNode(Node):
                 sock = None
                 time.sleep(0.5)
             except Exception as e:
-                self.get_logger().error(f'Aletta UDP listener error: {e}')
+                log_error(self, f'Aletta UDP listener error: {e}')
                 time.sleep(0.5)
 
     def _score_buffered_audio(self, audio, oww_frame_bytes):
@@ -661,9 +686,9 @@ class WakeWordNode(Node):
             if self.oww_detector.process(frame):
                 score = self.oww_detector.last_score
                 self.last_wake_score = score
-                self.get_logger().info(
-                    'Aletta wake word detected (openWakeWord, '
-                    f'score={score:.2f})')
+                log_info(self,
+                         'Aletta wake word detected (openWakeWord, '
+                         f'score={score:.2f})')
                 self._fire_trigger('aletta_wake_word')
                 self.oww_detector.reset()
                 audio.clear()
@@ -683,16 +708,16 @@ class WakeWordNode(Node):
         if remaining > 0 and peak >= self.aletta_threshold * 0.5:
             if now - self._blocked_by_cooldown_log >= 10.0:
                 self._blocked_by_cooldown_log = now
-                self.get_logger().warn(
-                    'Wake-like audio during cooldown '
-                    f'(peak={peak:.2f}, fires in {remaining:.0f}s) - '
-                    'mic kept scoring, will fire at expiry if held')
+                log_warn(self,
+                         'Wake-like audio during cooldown '
+                         f'(peak={peak:.2f}, fires in {remaining:.0f}s) - '
+                         'mic kept scoring, will fire at expiry if held')
             return
         if now - self._last_telemetry_log < self.telemetry_log_interval_sec:
             return
         self._last_telemetry_log = now
-        self.get_logger().debug(
-            'Wake idle burst: no detection '
+        log_debug(
+            self, 'Wake idle burst: no detection '
             f'(peak score={peak:.2f} vs threshold={self.aletta_threshold:.2f})')
 
     def _resume_when_idle(self):
@@ -711,7 +736,7 @@ class WakeWordNode(Node):
         # NOTE (missed-wake, 2026-10-16): only *firing* is
         # cooldown-gated (in _fire_trigger); the mic resumes immediately
         # so a real "Aletta" held past expiry fires at expiry.
-        self.get_logger().info('Pipeline idle — say "Aletta" or use pad')
+        log_info(self, 'Pipeline idle — say "Aletta" or use pad')
 
 
 def main(args=None):

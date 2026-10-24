@@ -50,6 +50,9 @@ def _install_ros_stubs():
 def _load_module(module_name, filename):
     """Load a g1_voice node module from source under a unique name."""
     _install_ros_stubs()
+    source_root = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
+    if source_root not in sys.path:
+        sys.path.insert(0, source_root)
     path = os.path.join(os.path.dirname(__file__), '..', 'g1_voice', filename)
     spec = importlib.util.spec_from_file_location(module_name, path)
     module = importlib.util.module_from_spec(spec)

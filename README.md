@@ -6,7 +6,7 @@ A complete voice conversation pipeline for the **Unitree G1 humanoid robot** ("A
 
 ## Demo
 
-- **Say "Aletta"** → robot wakes and opens a conversation session (turns chain automatically; closes after 15 s of silence). Saying "Aletta" *during* an open session starts a fresh STT turn when the pipeline is free; otherwise it just refreshes the session window.
+- **Say "Aletta"** → robot wakes and opens a conversation session (turns chain automatically; closes on START, 4 consecutive empty turns, or 5 min max). Saying "Aletta" *during* an open session starts a fresh STT turn when the pipeline is free; otherwise it just refreshes the session window.
 - **Hold F1** on the Unitree remote → robot listens → release F1 → robot responds
 - **Press START** → end the conversation session immediately (kill switch — sessions start only via "Aletta")
 - **Press F3** → mute/unmute the robot's spoken replies (processing continues while muted)
@@ -185,6 +185,9 @@ unitree_converse/
     │   ├── resource/g1_voice           # ament resource index marker
     │   ├── g1_voice/
     │   │   ├── __init__.py                 # (empty) marks the Python package
+    │   │   ├── log.py                      # compatibility alias for node_logging
+    │   │   ├── logging_utils.py            # compatibility alias for node_logging
+    │   │   ├── node_logging.py             # shared, testable ROS 2 node logging helper
     │   │   ├── wake_word_node.py           # wake listener: "Aletta" openWakeWord only (no phrases, no keyboard)
     │   │   ├── wake_word_openwakeword.py   # openWakeWord detector wrapper (import-light, loud-error)
     │   │   ├── stt_node.py                 # faster-whisper STT on GPU + UDP mic + speech gate
@@ -206,6 +209,7 @@ unitree_converse/
     │       ├── test_speech_gate.py         # No-speech confidence-gate unit tests
     │       ├── test_split_sentences.py     # TTS sentence split / bilingual voice-latch tests
     │       ├── test_stt_language_gate.py   # STT language-duel + noise-skip unit tests
+    │       ├── test_node_logging.py        # Shared ROS 2 node logging helper unit tests
     │       ├── test_copyright.py           # ament_copyright linter (skipped repo-wide)
     │       ├── test_flake8.py              # ament_flake8 linter
     │       └── test_pep257.py              # ament_pep257 (docstring) linter
@@ -223,6 +227,38 @@ unitree_converse/
 > standalone nodes.
 
 ---
+
+## Centralized Node Logging
+
+All ROS 2 nodes route their log calls through a shared, testable helper in
+`src/g1_voice/g1_voice/node_logging.py` instead of calling
+`node.get_logger()` directly at every site. The helper delegates to the node's
+own `Node.get_logger()` (it never shadows that method) and exposes:
+
+- `get_logger(node)` plus level helpers `debug`, `info`, `warn`/`warning`,
+  `error`, and the generic `log(node, level, message, **fields)`.
+- Structured fields: `log_info(node, "listening", count=2)` appends
+  `count=2` to the message.
+- Throttling via `should_log(node, key, interval_sec)` / `throttle(...)`,
+  with per-node state stored on the node object.
+- Import-light design: `node_logging.py` does not import `rclpy`, so it can be
+  unit-tested without a ROS 2 runtime.
+
+Compatibility aliases `log.py` and `logging_utils.py` re-export the same API,
+so existing call sites and tests can import from any of the three module names.
+Migration imports use a three-tier fallback (`from .node_logging`, then
+`from g1_voice.node_logging`, then a local-file import) so the code works both
+inside the installed package and in the unit-test layout.
+
+Run the helper tests with:
+
+```bash
+cd src/g1_voice && python3 -m pytest test/test_node_logging.py -v
+```
+
+---
+
+
 
 ## Key Discovery: Audio Routing
 
@@ -324,8 +360,11 @@ ros2 topic pub --once /g1/voice/say_text std_msgs/msg/String "data: 'Hello! I am
 button) before it listens. It does not auto-listen at startup and there is no
 always-on mode: saying "Aletta" opens a **conversation session** — a window in
 which turns chain automatically (the end of one reply re-arms listening) — and
-the window closes itself after `session_silence_timeout` seconds (15 s by
-default) with no turn activity. START cannot open a session; it only ends one.
+the window closes on explicit evidence only: pressing **START**, 4 consecutive
+turns with no published transcript (`max_empty_turns`), or the
+`session_max_duration_sec` wall-clock backstop (5 min by default). There is
+deliberately no silence timeout, so a dropped/noisy turn never kills a session
+the user is still in. START cannot open a session; it only ends one.
 
 Session state is published on `/g1/wake/session_state` (`std_msgs/String`) as one of
 `idle`, `opening`, `refreshing`, `closed` so operators can tell whether "Aletta"
@@ -357,8 +396,8 @@ still reachable (e.g. SELECT speaks the intro phrase).
 > the pipeline is idle, closes it when a trigger fires, and reopens it once
 > STT/LLM are done. While a conversation session is open, STT owns the
 > stream most of the time and the wake word is effectively quiet — the
-> session closes itself after 15 s of silence (or press START to end it
-> immediately), returning to wake-word-first operation.
+> session closes on START, 4 consecutive empty turns, or the 5-min
+> wall-clock backstop, returning to wake-word-first operation.
 
 For conversation turns, automatic language detection is confidence-aware:
 high-confidence Polish or English results are accepted directly. Ambiguous
@@ -487,7 +526,7 @@ threshold; otherwise record real negatives and retrain (step 1b).
 Hold F1 while speaking → release → robot responds → done.
 
 ### Conversation session (chained turns)
-Saying **"Aletta"** opens a session → robot listens → responds → automatically listens again, turn after turn. The session closes itself after 15 s without turn activity (`session_silence_timeout`), or immediately when you press **START**. START cannot open a session — only "Aletta" can.
+Saying **"Aletta"** opens a session → robot listens → responds → automatically listens again, turn after turn. The session closes on **START**, 4 consecutive turns with no published transcript (`max_empty_turns`), or the `session_max_duration_sec` wall-clock backstop (5 min by default). There is no silence timeout. START cannot open a session — only "Aletta" can.
 
 ### Mute (F3)
 Press **F3** at any time to mute/unmute the robot's spoken replies. While muted the
@@ -560,10 +599,12 @@ cd src/g1_voice && python3 -m pytest test/test_llm_pipeline.py -v
 
 # bob_llm integration test (requires tests/.env with LLM_API_KEY etc.)
 cd src/bob_llm && python3 -m pytest tests/test_llm_integration.py -v
+
+# Full unit-test suite for g1_voice (logging helper, speech gate, STT language gate, etc.)
+cd src/g1_voice && python3 -m pytest -q
 ```
 
 ### Manual ROS2 checks
-
 ```bash
 source source_ros.sh   # sets the exact service environment
 
@@ -612,9 +653,10 @@ ros2 topic echo /g1/robot_state
     aletta_threshold: 0.85          # higher = fewer false wakes
     min_consecutive_frames: 2       # reject single-spike false accepts
     echo_guard_sec: 1.5             # ignore mic while TTS plays (+ ring-down)
-    session_silence_timeout: 15.0   # seconds of silence before the session closes
+    session_max_duration_sec: 300.0 # wall-clock backstop for phantom sessions
+    max_empty_turns: 4             # consecutive no-transcript turns close session
     idle_listen_burst_sec: 1.5      # idle listener throttle (near-zero CPU)
-    idle_sleep_sec: 1.5
+    idle_sleep_sec: 0.3
 
 /tts_node:
   ros__parameters:
