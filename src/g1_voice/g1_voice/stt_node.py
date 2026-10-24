@@ -642,8 +642,31 @@ class STTNode(Node):
                 log_info(
                     self, f'Ignored noise/hallucination transcript: "{transcript}"')
             elif transcript:
-                mean_logprob = float(np.mean([
-                    getattr(s, 'avg_logprob', -10.0) for s in kept]))
+                # `kept` holds transcript *strings* (filter_segments strips the
+                # segment objects), so avg_logprob must be read from the
+                # original segments that survived the no-speech gate. Reading
+                # it from the strings always yielded the -10.0 default and
+                # dropped every real transcript.
+                try:
+                    from g1_voice.speech_gate import keep_segment as _keep_seg
+                except Exception:
+                    _keep_seg = None
+                if _keep_seg is not None:
+                    kept_segments = [
+                        s for s in segments
+                        if (getattr(s, 'text', '') or '').strip()
+                        and _keep_seg(
+                            getattr(s, 'no_speech_prob', None),
+                            self.max_no_speech_prob)]
+                else:
+                    kept_segments = [s for s in segments
+                                     if (getattr(s, 'text', '') or '').strip()]
+                if kept_segments:
+                    mean_logprob = float(np.mean([
+                        getattr(s, 'avg_logprob', -10.0)
+                        for s in kept_segments]))
+                else:
+                    mean_logprob = -10.0
                 if mean_logprob < self.min_publish_avg_logprob:
                     # Extreme-garbage floor; the value is logged on every
                     # publish so the threshold can be tightened from data.

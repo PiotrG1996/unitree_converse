@@ -23,7 +23,7 @@
     normalize_audio: true
     sample_rate: 16000
     recording_duration: 8.0
-    silence_threshold: 0.005
+    silence_threshold: 0.008
     silence_duration: 2.5
     # Raised 0.5 -> 0.85: live logs show real uncertain English speech at
     # no_speech_prob ~0.75 being dropped on the noisy UDP mic feed. 0.85

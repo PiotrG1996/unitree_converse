@@ -75,7 +75,7 @@
 
     sample_rate: 16000
     recording_duration: 10.0
-    silence_threshold: 0.005
+    silence_threshold: 0.008
 
     # Turn-taking: stop early on trailing silence so the pipeline answers
     # promptly. 2.5s (was 1.0s) so users have time to finish short phrases
