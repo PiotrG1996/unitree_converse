@@ -116,6 +116,7 @@
     # The _looks_like_noise gate and language duel provide a second line of
     # defence against noise leaking through.
     min_publish_avg_logprob: -2.5
+    dump_audio_dir: "/tmp/stt_dumps"
     # TTS echo guard: while the robot speaks (and this long after), the mic
     # hears its own Piper voice on the head-mounted speaker. STT defers
     # watchdog/trigger opens during the guard so it never transcribes its
