@@ -165,8 +165,14 @@ class ButtonTriggerNode(Node):
             self._publish_trigger(True)
             self._publish_status('recording')
 
-        # F1 released (falling edge) → stop recording
+        # F1 released (falling edge) -> stop recording (only in push-to-talk
+        # mode). During an Aletta session F1 is fully suppressed: no stop is
+        # published, but a stale recording_active flag is still cleared so the
+        # button state cannot get stuck.
         if not f1_now and f1_prev and self.recording_active:
+            if self.continuous_mode:
+                self.recording_active = False
+                return
             log_info(self, 'F1 released → stop recording, transcribing...')
             self.recording_active = False
             self._publish_stop()
