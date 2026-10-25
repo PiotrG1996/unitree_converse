@@ -54,7 +54,7 @@ class WhisperTranscriber:
         max_no_speech_prob=0.5,
         language_detection_min_probability=0.5,
         language_duel_override_margin=0.25,
-        min_publish_avg_logprob=-2.5,
+        min_publish_avg_logprob=-11.0,
         logger=None,
     ):
         self.model_size = model_size

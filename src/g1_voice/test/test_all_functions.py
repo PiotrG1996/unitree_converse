@@ -93,6 +93,12 @@ class _FakeWakeNode:
         self.llm_busy = False
         self.tts_busy = False
         self._wake_socket = None
+        # Pending wake: wake detected during a busy pipeline, queued for
+        # firing when the pipeline drains. Mirrors WakeWordNode.__init__.
+        self.pending_wake = False
+        # Turn-in-flight guard (mirrors WakeWordNode.__init__).
+        self.turn_in_flight = False
+        self._turn_in_flight_since = 0.0
         # Telemetry state
         self.aletta_threshold = 0.85
         self.telemetry_log_interval_sec = 30.0
@@ -114,6 +120,8 @@ class _FakeWakeNode:
         self._publish_session_state = lambda: cls._publish_session_state(self)
         self._in_session_refresh = (
             lambda score: cls._in_session_refresh(self, score))
+        self._check_pending_wake = (
+            lambda: cls._check_pending_wake(self))
         self._wake_open = lambda: cls._fire_trigger(self, 'aletta_wake_word')
 
     def get_logger(self):

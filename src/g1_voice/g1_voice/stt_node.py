@@ -104,7 +104,7 @@ class STTNode(Node):
         # (points to a device/driver problem).
         self._mic_path_logged = False
         self.declare_parameter('udp_multicast_group', '239.168.123.161')
-        self.declare_parameter('udp_port', 5555)
+        self.declare_parameter('udp_port', 5556)
         self.declare_parameter('udp_local_ip', '192.168.123.164')
         # WAKE-WORD GATED BY DEFAULT: the robot waits for "Aletta"
         # (wake_word_node) or an explicit pad press (F1/START). It must NOT
@@ -130,8 +130,7 @@ class STTNode(Node):
         # Publish floor: drop transcripts whose kept segments average below
         # this avg_logprob — only extreme Whisper garbage trips it. The value
         # is logged on every publish so it can be tightened with data.
-        self.declare_parameter('min_publish_avg_logprob', -2.5)
-        self.declare_parameter('dump_audio_dir', '')
+        self.declare_parameter('min_publish_avg_logprob', -11.0)
         # STT accuracy tuning (beam search, vocabulary prompt, VAD).
         self.declare_parameter('beam_size', 5)
         self.declare_parameter('initial_prompt', '')
@@ -164,7 +163,6 @@ class STTNode(Node):
         self.language_duel_override_margin = self._param(
             'language_duel_override_margin')
         self.min_publish_avg_logprob = self._param('min_publish_avg_logprob')
-        self.dump_audio_dir = self._param('dump_audio_dir')
         self.beam_size = int(self._param('beam_size'))
         self.initial_prompt = self._param('initial_prompt')
         self.vad_threshold = float(self._param('vad_threshold'))
@@ -230,6 +228,22 @@ class STTNode(Node):
         mic_mode = 'UDP multicast' if self.use_udp_mic else 'sounddevice'
         log_info(self, f'STT node ready — mic: {mic_mode}')
         log_info(self, f'Continuous mode: {self.continuous_mode}')
+
+        # Startup health check: warn if critical external topics have no
+        # publishers. Without llm_node/tts_node, the STT node cannot track
+        # pipeline state and the conversation loop stalls.
+        topic_names_types = dict(self.get_topic_names_and_types())
+        critical_topics = {
+            '/g1/llm/status': 'llm_node',
+            '/g1/tts/status': 'tts_node',
+        }
+        missing = [name for name in critical_topics if name not in topic_names_types]
+        if missing:
+            log_warn(
+                self,
+                'Critical topics have no publishers — state tracking will '
+                f'degrade: {", ".join(missing)}. Start the missing nodes '
+                '(llm_node, tts_node) before relying on STT.')
 
         # Always-on (continuous) machinery is strictly OPT-IN: it is armed ONLY
         # when continuous_mode is True (e.g. enabled at runtime via the START
@@ -559,27 +573,6 @@ class STTNode(Node):
         else:
             audio_data = self._record_via_sounddevice()
 
-        if (audio_data is not None and len(audio_data) > 0
-                and self.dump_audio_dir):
-            try:
-                import os as _os
-                import wave as _wave
-                import time as _time
-                _os.makedirs(self.dump_audio_dir, exist_ok=True)
-                _path = _os.path.join(
-                    self.dump_audio_dir,
-                    f'stt_{int(_time.time())}.wav')
-                with _wave.open(_path, 'wb') as _w:
-                    _w.setnchannels(1)
-                    _w.setsampwidth(2)
-                    _w.setframerate(self.sample_rate)
-                    _pcm = (np.clip(audio_data, -1.0, 1.0) * 32767.0
-                            ).astype(np.int16)
-                    _w.writeframes(_pcm.tobytes())
-                log_info(self, f'Dumped recorded audio to {_path}')
-            except Exception as _e:
-                log_warn(self, f'Audio dump failed: {_e}')
-
         if audio_data is None or len(audio_data) == 0:
             log_warn(self, 'No audio recorded')
             # Contract with wake_word_node.stt_status_callback: a turn with
@@ -592,6 +585,10 @@ class STTNode(Node):
             return
 
         self._publish_status('transcribing')
+
+        # Initialize best_language here to avoid 'referenced before assignment'
+        # if early return paths execute (empty audio, exception handler).
+        best_language = 'en'
 
         try:
             segments, info = self._transcribe_with_language_fallback(

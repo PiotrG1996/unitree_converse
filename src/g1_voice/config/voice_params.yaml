@@ -5,7 +5,7 @@
     api_model: "llama3.2"
     system_prompt: "You are Aletta, a friendly humanoid robot by Unitree Robotics. Currently you are being researched and worked upon by the Poznan University of technology, Poland. Keep ALL responses under 2 sentences. You are speaking out loud, be concise."
     temperature: 0.7
-    max_history_length: 10
+    max_history_length: 0
     stream: false                             # keep false for TTS compatibility
 
 /stt_node:
@@ -23,7 +23,7 @@
     normalize_audio: true
     sample_rate: 16000
     recording_duration: 8.0
-    silence_threshold: 0.008
+    silence_threshold: 0.0072
     silence_duration: 2.5
     # Raised 0.5 -> 0.85: live logs show real uncertain English speech at
     # no_speech_prob ~0.75 being dropped on the noisy UDP mic feed. 0.85
@@ -43,7 +43,7 @@
     language_duel_override_margin: 0.25
     # Raised from -2.5 to -11.0: real speech on a noisy mic feed decodes at
     # low avg_logprob (~-10). Keep it; block only extreme garbage (< -11).
-    min_publish_avg_logprob: -2.5
+    min_publish_avg_logprob: -11.0
     # TTS echo guard (see voice_params_real.yaml): STT defers mic opens
     # while the robot's own voice is on the air.
     tts_echo_guard_sec: 2.0
@@ -80,11 +80,12 @@
     # scoring. 300 rejects quiet room noise/HVAC that the synthetic model
     # scores ~0.99.
     silence_rms: 300.0
+    base_cooldown_sec: 4.0
     # False-accept backoff: when a wake-opened session times out with no
-    # speech, multiply cooldown by this factor (caps at 60s). Resets on real
-    # activity. Slows the idle storm from ~1/8-12s to ~1/min+.
-    false_accept_backoff_multiplier: 2.0
-    max_false_accept_cooldown: 60.0
+    # speech, multiply cooldown by this factor (caps at 15s). Resets on real
+    # activity. Reduced from 2.0/60s to make queued wakes more likely to fire.
+    false_accept_backoff_multiplier: 1.25
+    max_false_accept_cooldown: 15.0
 
 /button_trigger_node:
   ros__parameters:

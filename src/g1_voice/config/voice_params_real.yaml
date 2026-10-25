@@ -39,7 +39,7 @@
       Avoid unnecessary lists, technical details, and repetition."
 
     temperature: 0.4
-    max_history_length: 10
+    max_history_length: 0
     # stream: false
     stream: true
 
@@ -59,9 +59,14 @@
     boot_kick_delay: 0.0
 
     udp_multicast_group: "239.168.123.161"
-    udp_port: 5555
+    udp_port: 5556
     udp_local_ip: "192.168.123.164"
 
+    # NOTE: STT uses port 5556 while wake_word_node uses 5555. Both join the
+    # same multicast group; the audio source must multicast to both ports so
+    # neither socket starves the other of datagrams (see wake_word_node.py
+    # _wake_word_loop and stt_node.py _record_via_udp for the SO_REUSEADDR
+    # port-contention rationale).
     # Baseline: benchmark against small on the target Jetson.
     model_size: "base"
     language: "en"
@@ -75,7 +80,7 @@
 
     sample_rate: 16000
     recording_duration: 10.0
-    silence_threshold: 0.008
+    silence_threshold: 0.0072
 
     # Turn-taking: stop early on trailing silence so the pipeline answers
     # promptly. 2.5s (was 1.0s) so users have time to finish short phrases
@@ -115,8 +120,7 @@
     # blocking extreme garbage (avg_logprob < -11, e.g. -15, -20 on pure noise).
     # The _looks_like_noise gate and language duel provide a second line of
     # defence against noise leaking through.
-    min_publish_avg_logprob: -2.5
-    dump_audio_dir: "/tmp/stt_dumps"
+    min_publish_avg_logprob: -11.0
     # TTS echo guard: while the robot speaks (and this long after), the mic
     # hears its own Piper voice on the head-mounted speaker. STT defers
     # watchdog/trigger opens during the guard so it never transcribes its
@@ -164,11 +168,12 @@
     # scoring. 300 rejects quiet room noise/HVAC that the synthetic model
     # scores ~0.99.
     silence_rms: 350.0
+    base_cooldown_sec: 4.0
     # False-accept backoff: when a wake-opened session times out with no
-    # speech, multiply cooldown by this factor (caps at 60s). Resets on real
-    # activity. Slows the idle storm from ~1/8-12s to ~1/min+.
-    false_accept_backoff_multiplier: 2.0
-    max_false_accept_cooldown: 60.0
+    # speech, multiply cooldown by this factor (caps at 15s). Resets on real
+    # activity. Reduced from 2.0/60s to make queued wakes more likely to fire.
+    false_accept_backoff_multiplier: 1.25
+    max_false_accept_cooldown: 15.0
 
 
 /button_trigger_node:

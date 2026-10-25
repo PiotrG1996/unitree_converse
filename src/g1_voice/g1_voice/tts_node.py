@@ -9,7 +9,6 @@ import sys
 import io
 import wave
 import subprocess
-import tempfile
 import time
 import queue
 import numpy as np
@@ -194,8 +193,7 @@ class TTSNode(Node):
             stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
             stderr=None,
-            text=True,
-            bufsize=1
+            bufsize=0
         )
         # Confirm the worker is up before returning. If it dies during
         # startup the next _maybe_launch_worker pass catches it (poll() !=
@@ -208,7 +206,7 @@ class TTSNode(Node):
                 self._audio_worker = None
                 self._worker_relaunch_requested = True
                 return
-            ready = json.loads(ready_line)
+            ready = json.loads(ready_line.decode('utf-8'))
             if not ready.get('ready'):
                 log_error(self,
                           'G1 audio worker initialization failed: '
@@ -370,29 +368,33 @@ class TTSNode(Node):
                 log_info(self,
                          f'{language} Piper voice ready: {model_path}')
 
-    def _play_wav_bytes(self, wav_bytes: bytes):
-        """Play a 16-bit PCM WAV through the native G1 speaker (g1_audio_worker)."""
-        with wave.open(io.BytesIO(wav_bytes), 'rb') as wf:
-            n_channels = wf.getnchannels()
-            src_rate = wf.getframerate()
-            frames = wf.readframes(wf.getnframes())
+    def _play_wav_bytes(self, wav_bytes: bytes) -> bool:
+        """Play WAV via G1 audio worker; returns True on success."""
+        try:
+            with wave.open(io.BytesIO(wav_bytes), 'rb') as wf:
+                n_channels = wf.getnchannels()
+                src_rate = wf.getframerate()
+                frames = wf.readframes(wf.getnframes())
 
-        audio = np.frombuffer(frames, dtype=np.int16)
-        if n_channels > 1:
-            audio = audio.reshape(-1, n_channels).mean(axis=1).astype(np.int16)
-        audio = audio.astype(np.float32) / 32768.0
+            audio = np.frombuffer(frames, dtype=np.int16)
+            if n_channels > 1:
+                audio = audio.reshape(-1, n_channels).mean(axis=1).astype(np.int16)
+            audio = audio.astype(np.float32) / 32768.0
 
-        # Piper output frequently peaks at full scale (peak ≈ 1.0), which clips
-        # on the speaker and sounds distorted/crackly. Normalise to a safe peak
-        # so the voice is clean and loudness is consistent.
-        audio = self._normalize(audio)
+            # Piper output frequently peaks at full scale (peak ≈ 1.0), which clips
+            # on the speaker and sounds distorted/crackly. Normalise to a safe peak
+            # so the voice is clean and loudness is consistent.
+            audio = self._normalize(audio)
 
-        if src_rate != self.output_sample_rate:
-            audio = self._resample(audio, src_rate, self.output_sample_rate)
+            if src_rate != self.output_sample_rate:
+                audio = self._resample(audio, src_rate, self.output_sample_rate)
 
-        timeout = 30.0 + 3.0 * len(audio) / float(self.output_sample_rate)
-        self._play_audio_with_timeout(
-            audio, self.output_sample_rate, timeout_sec=timeout)
+            timeout = 30.0 + 3.0 * len(audio) / float(self.output_sample_rate)
+            return self._play_audio_with_timeout(
+                audio, self.output_sample_rate, timeout_sec=timeout)
+        except Exception as exc:
+            log_error(self, f"WAV playback preparation failed: {exc}")
+            return False
 
     def response_callback(self, msg: String):
         try:
@@ -521,7 +523,6 @@ class TTSNode(Node):
         immediately; a worker that hangs alive is bounded by the caller's
         _play_audio_with_timeout() deadline.
         """
-        temp_path = None
         worker = None
         try:
             audio = np.asarray(audio, dtype=np.float32).reshape(-1)
@@ -534,12 +535,6 @@ class TTSNode(Node):
                 log_warning(self, "No audio samples to play")
                 return
 
-            with tempfile.NamedTemporaryFile(
-                prefix="g1_tts_", suffix=".pcm", delete=False
-            ) as temp_file:
-                temp_file.write(pcm_data)
-                temp_path = temp_file.name
-
             # Pin the handle: a late failure below must tear down exactly
             # this worker, not a newer one spawned in the meantime.
             worker = self._audio_worker
@@ -548,10 +543,14 @@ class TTSNode(Node):
                           "G1 audio worker is not running — relaunching")
                 raise RuntimeError("G1 audio worker not running")
 
-            worker.stdin.write(json.dumps({
+            # Send PCM bytes in-memory (no temp file): command carries the
+            # byte length, followed by the raw PCM on stdin.
+            worker.stdin.write((json.dumps({
                 "command": "play",
-                "path": temp_path
-            }) + "\n")
+                "length": len(pcm_data)
+            }) + "\n").encode('utf-8'))
+            worker.stdin.flush()
+            worker.stdin.write(pcm_data)
             worker.stdin.flush()
 
             # Block on the worker's single completion line. The worker
@@ -565,7 +564,7 @@ class TTSNode(Node):
                 raise RuntimeError(
                     "G1 audio worker closed its response pipe")
 
-            response = json.loads(response_line)
+            response = json.loads(response_line.decode('utf-8'))
             if not response.get("ok"):
                 raise RuntimeError(
                     response.get("error", "Unknown worker playback error")
@@ -599,20 +598,18 @@ class TTSNode(Node):
                     pass
             raise
         finally:
-            if temp_path and os.path.exists(temp_path):
-                try:
-                    os.unlink(temp_path)
-                except OSError:
-                    pass
+            pass
 
     def _process_queue_item(self, item) -> bool:
         """Consume one speech-queue item. Returns True if it was _TURN_END."""
         if item is _TURN_END:
-            # End of turn: re-trigger continuous listening once, but only if
-            # the previous turn actually had a valid user transcript. This
-            # prevents the infinite noise-recording loop when a false accept
-            # opens a session and STT gets only silence/ambient noise.
-            if self.continuous_mode and self._turn_had_transcript:
+            # End of turn: re-trigger continuous listening once.
+            # Re-arm on all turns (not just valid transcripts) so the robot
+            # does not stay deaf for up to the watchdog interval after a
+            # failed/noise turn. Session closure is handled by wake_word_node's
+            # max_empty_turns counter (4 consecutive empty turns), which
+            # prevents infinite noise-recording loops.
+            if self.continuous_mode:
                 time.sleep(0.5)
                 trigger = Bool()
                 trigger.data = True
@@ -904,7 +901,9 @@ class TTSNode(Node):
         # Bound playback time: a stuck audio worker must not stall the
         # single speech-queue thread forever (see _play_audio_with_timeout).
         timeout = 30.0 + 3.0 * len(audio) / float(native_sr)
-        self._play_audio_with_timeout(audio, native_sr, timeout_sec=timeout)
+        if not self._play_audio_with_timeout(audio, native_sr, timeout_sec=timeout):
+            log_error(self, f"Piper playback failed — TTS turn incomplete")
+            self._publish_status('error')
 
     @staticmethod
     def _is_polish_text(text: str) -> bool:
@@ -984,19 +983,15 @@ class TTSNode(Node):
             "--length_scale", f"{self.length_scale:g}",
         ]
 
-        wav_path = None
-        try:
-            with tempfile.NamedTemporaryFile(
-                suffix=".wav", delete=False
-            ) as tf:
-                wav_path = tf.name
+        # Stream WAV bytes directly to stdout (no temp file) for in-memory playback.
+        cmd = cmd + ["--output_file", "-"]
 
+        wav_bytes = None
+        try:
             start = time.monotonic()
             result = subprocess.run(
-                cmd + ["--output_file", wav_path],
-                input=text + "\n",
-                text=True,
-                encoding="utf-8",
+                cmd,
+                input=(text + "\n").encode('utf-8'),
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
                 timeout=60,
@@ -1009,17 +1004,15 @@ class TTSNode(Node):
                      )
 
             if result.returncode != 0:
-                error_text = result.stderr.strip()[-1500:]
+                error_text = result.stderr.decode('utf-8', errors='replace').strip()[-1500:]
                 log_error(
                     self, f"Piper failed (exit {result.returncode}): {error_text}")
                 return
 
-            if not os.path.isfile(wav_path) or os.path.getsize(wav_path) == 0:
-                log_error(self, "Piper produced an empty WAV file")
+            wav_bytes = result.stdout
+            if not wav_bytes:
+                log_error(self, "Piper produced empty WAV output")
                 return
-
-            with open(wav_path, "rb") as wav_file:
-                wav_bytes = wav_file.read()
 
             # Validate the WAV before passing it to the playback pipeline.
             try:
@@ -1037,17 +1030,13 @@ class TTSNode(Node):
         except OSError as exc:
             log_error(self, f"Could not run Piper: {exc}")
             return
-        finally:
-            if wav_path and os.path.exists(wav_path):
-                try:
-                    os.unlink(wav_path)
-                except OSError as exc:
-                    log_warning(self,
-                                f"Could not remove temporary WAV: {exc}"
-                                )
 
         playback_start = time.monotonic()
-        self._play_wav_bytes(wav_bytes)
+        if not self._play_wav_bytes(wav_bytes):
+            log_error(self, "Audio playback failed — TTS turn incomplete")
+            self._publish_status('error')
+            self.is_speaking = False
+            return
         log_info(self,
                  f"Audio playback processing took "
                  f"{time.monotonic() - playback_start:.2f}s"

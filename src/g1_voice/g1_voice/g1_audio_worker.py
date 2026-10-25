@@ -27,9 +27,12 @@ def main():
         send_message({"ready": False, "error": str(exc)})
         return 1
 
-    for line in sys.stdin:
+    while True:
+        line = sys.stdin.buffer.readline()
+        if not line:
+            break
         try:
-            command = json.loads(line)
+            command = json.loads(line.decode("utf-8"))
 
             if command.get("command") == "quit":
                 break
@@ -38,7 +41,6 @@ def main():
                 send_message({"ok": False, "error": "Unknown command"})
                 continue
 
-            path = command["path"]
             app_name = "unitree_converse"
             # Monotonic per-process counter: wall-clock ms collided for
             # back-to-back sentences (same ms + same seq within one
@@ -50,8 +52,21 @@ def main():
             main._stream_seq += 1
             stream_id = f"{time.time_ns()}-{main._stream_seq}"
 
-            with open(path, "rb") as audio_file:
-                pcm_data = audio_file.read()
+            length = command.get("length")
+            if length is None:
+                # Backward compat: read from file if path provided
+                path = command.get("path")
+                if path is None:
+                    send_message({"ok": False, "error": "Missing length/path"})
+                    continue
+                with open(path, "rb") as audio_file:
+                    pcm_data = audio_file.read()
+            else:
+                length = int(length)
+                pcm_data = sys.stdin.buffer.read(length)
+                if len(pcm_data) != length:
+                    send_message({"ok": False, "error": "Short PCM read from stdin"})
+                    continue
 
             if not pcm_data:
                 send_message({"ok": False, "error": "Empty PCM audio"})

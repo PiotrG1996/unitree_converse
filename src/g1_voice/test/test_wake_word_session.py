@@ -94,6 +94,12 @@ class _FakeWakeNode:
         self.llm_busy = False
         self.tts_busy = False
         self._wake_socket = None
+        # Pending wake: wake detected during a busy pipeline, queued for
+        # firing when the pipeline drains. Mirrors WakeWordNode.__init__.
+        self.pending_wake = False
+        # Turn-in-flight guard (mirrors WakeWordNode.__init__).
+        self.turn_in_flight = False
+        self._turn_in_flight_since = 0.0
         # Missed-wake telemetry state (mirrors WakeWordNode.__init__)
         self.aletta_threshold = 0.85
         self.telemetry_log_interval_sec = 30.0
@@ -121,8 +127,14 @@ class _FakeWakeNode:
             lambda: cls._check_session_timeout(self))
         self._check_session_timeout = (
             lambda: cls._check_session_timeout(self))
+        self._check_pending_wake = (
+            lambda: cls._check_pending_wake(self))
         self.llm_status_callback = (
             lambda msg: cls.llm_status_callback(self, msg))
+        self.stt_status_callback = (
+            lambda msg: cls.stt_status_callback(self, msg))
+        self.tts_status_callback = (
+            lambda msg: cls.tts_status_callback(self, msg))
 
     def get_logger(self):
         harness = self
@@ -253,6 +265,77 @@ class TestBackoffEscalation(unittest.TestCase):
         self.assertAlmostEqual(
             node.last_session_activity, time.time(), delta=2.0)
         self.assertTrue(any('refreshed' in m for _lvl, m in node.logged))
+        # Wake must be queued for later firing, not silently dropped.
+        self.assertTrue(node.pending_wake)
+        self.assertTrue(any('queued' in m for _lvl, m in node.logged))
+
+    def test_pending_wake_fires_when_pipeline_frees(self):
+        node = _FakeWakeNode()
+        node._wake_open()  # opens session, first trigger fires
+        node.cooldown = 0.0  # ensure cooldown never blocks
+        node.tts_busy = True
+        node._in_session_refresh(0.99)  # queues wake
+        self.assertTrue(node.pending_wake)
+        triggered_before = len(node.trigger_pub.published)
+        node.tts_busy = False
+        node._check_pending_wake()
+        self.assertFalse(node.pending_wake)
+        self.assertEqual(len(node.trigger_pub.published),
+                         triggered_before + 1)
+        self.assertTrue(any('firing queued' in m for _lvl, m in node.logged))
+
+    def test_pending_wake_stays_queued_while_busy(self):
+        node = _FakeWakeNode()
+        node._wake_open()
+        node.cooldown = 0.0
+        node.tts_busy = True
+        node._in_session_refresh(0.99)  # queues wake
+        self.assertTrue(node.pending_wake)
+        triggered_before = len(node.trigger_pub.published)
+        node._check_pending_wake()  # still busy -> no fire
+        self.assertTrue(node.pending_wake)
+        self.assertEqual(len(node.trigger_pub.published),
+                         triggered_before)
+
+    def test_pending_wake_cleared_on_session_close(self):
+        node = _FakeWakeNode()
+        node._wake_open()
+        node.tts_busy = True
+        node._in_session_refresh(0.99)  # queues wake
+        self.assertTrue(node.pending_wake)
+        node._close_session('manual stop')
+        self.assertFalse(node.pending_wake)
+
+    def test_pending_wake_gated_by_cooldown(self):
+        # Cooldown back-off must still block a queued wake when the
+        # pipeline frees, just as it blocks a normal re-trigger.
+        node = _FakeWakeNode()
+        node._wake_open()  # last_trigger_time = now, cooldown = 8
+        node.tts_busy = True
+        node._in_session_refresh(0.99)  # queues wake
+        self.assertTrue(node.pending_wake)
+        triggered_before = len(node.trigger_pub.published)
+        node.tts_busy = False
+        node._check_pending_wake()  # cooldown no longer blocks queued wake
+        self.assertFalse(node.pending_wake)
+        self.assertEqual(len(node.trigger_pub.published),
+                         triggered_before + 1)
+
+    def test_status_callback_drains_pending_wake(self):
+        # Integration: the STT status callback fires the queued wake
+        # when it transitions the pipeline to idle.
+        node = _FakeWakeNode()
+        node._wake_open()
+        node.cooldown = 0.0
+        node.stt_busy = True
+        node._in_session_refresh(0.99)  # queues wake
+        self.assertTrue(node.pending_wake)
+        triggered_before = len(node.trigger_pub.published)
+        # STT finishes -> status callback drains the pending wake.
+        node.stt_status_callback(_wake_module.String('idle'))
+        self.assertFalse(node.pending_wake)
+        self.assertEqual(len(node.trigger_pub.published),
+                         triggered_before + 1)
 
     def test_resume_ignores_cooldown_listens_immediately(self):
         # Missed-wake regression: after a phantom timeout the escalated
@@ -289,6 +372,85 @@ class TestBackoffEscalation(unittest.TestCase):
         first = len(node.logged)
         node._log_burst_telemetry()  # within interval -> silent
         self.assertEqual(len(node.logged), first)
+
+
+class TestTurnInFlight(unittest.TestCase):
+
+    def test_turn_in_flight_blocks_trigger(self):
+        node = _FakeWakeNode()
+        node.turn_in_flight = True
+        node._turn_in_flight_since = time.time()
+        node.last_trigger_time = 0.0
+        node.cooldown = 0.0
+        triggered_before = len(node.trigger_pub.published)
+        node._fire_trigger('aletta_wake_word')
+        self.assertEqual(len(node.trigger_pub.published), triggered_before)
+
+    def test_turn_in_flight_cleared_after_30s(self):
+        node = _FakeWakeNode()
+        node.turn_in_flight = True
+        node._turn_in_flight_since = time.time() - 31.0
+        node.last_trigger_time = 0.0
+        node.cooldown = 0.0
+        node._fire_trigger('aletta_wake_word')
+        self.assertEqual(len(node.trigger_pub.published), 1)
+
+    def test_stt_recording_sets_turn_in_flight(self):
+        node = _FakeWakeNode()
+        node.stt_status_callback(_wake_module.String('recording'))
+        self.assertTrue(node.turn_in_flight)
+        self.assertTrue(node.stt_busy)
+
+    def test_llm_thinking_sets_turn_in_flight(self):
+        node = _FakeWakeNode()
+        node.llm_status_callback(_wake_module.String('thinking'))
+        self.assertTrue(node.turn_in_flight)
+        self.assertTrue(node.llm_busy)
+
+    def test_tts_speaking_sets_turn_in_flight(self):
+        node = _FakeWakeNode()
+        node.tts_status_callback(_wake_module.String('speaking'))
+        self.assertTrue(node.turn_in_flight)
+        self.assertTrue(node.tts_busy)
+
+    def test_f1_turn_sets_last_trigger_time(self):
+        node = _FakeWakeNode()
+        node.last_trigger_time = 0.0
+        node.session_open = False
+        node.stt_status_callback(_wake_module.String('recording'))
+        self.assertGreater(node.last_trigger_time, 0.0)
+
+    def test_close_clears_turn_in_flight(self):
+        node = _FakeWakeNode()
+        node.turn_in_flight = True
+        node._close_session('test')
+        self.assertFalse(node.turn_in_flight)
+
+    def test_two_times_two_scenario(self):
+        node = _FakeWakeNode()
+        # F1 push-to-talk turn starts: "What is result of two times two"
+        node.stt_status_callback(_wake_module.String('recording'))
+        node.stt_status_callback(_wake_module.String('transcribing'))
+        triggered_before = len(node.trigger_pub.published)
+        # Wake-word false accept fires mid-pipeline -> must be blocked.
+        node._fire_trigger('aletta_wake_word')
+        self.assertEqual(len(node.trigger_pub.published), triggered_before)
+        self.assertFalse(node.session_open)
+        # LLM starts answering.
+        node.llm_status_callback(_wake_module.String('thinking'))
+        self.assertTrue(node.turn_in_flight)
+        node._fire_trigger('aletta_wake_word')
+        self.assertEqual(len(node.trigger_pub.published), triggered_before)
+        # TTS speaks the answer.
+        node.tts_status_callback(_wake_module.String('speaking'))
+        self.assertTrue(node.turn_in_flight)
+        node._fire_trigger('aletta_wake_word')
+        self.assertEqual(len(node.trigger_pub.published), triggered_before)
+        # Pipeline finishes.
+        node.tts_status_callback(_wake_module.String('idle'))
+        node.llm_status_callback(_wake_module.String('idle'))
+        node.stt_status_callback(_wake_module.String('idle'))
+        self.assertFalse(node.turn_in_flight)
 
 
 if __name__ == '__main__':

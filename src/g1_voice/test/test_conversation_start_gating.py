@@ -146,6 +146,9 @@ class _FakeWakeNode:
         self.stt_busy = False
         self.llm_busy = False
         self.tts_busy = False
+        # Turn-in-flight guard (mirrors WakeWordNode.__init__).
+        self.turn_in_flight = False
+        self._turn_in_flight_since = 0.0
         # Publishers observed by the tests
         self.trigger_pub = _FakePub()
         self.status_pub = _FakePub()
@@ -344,6 +347,20 @@ class TestPadButtonGating(unittest.TestCase):
         node.controller_callback(_Keys(0))  # release before next press
         node.controller_callback(_Keys(F1_KEY))
         self.assertEqual(len(node.trigger_pub.published), 1)
+
+    def test_f1_release_ignored_while_session_open(self):
+        node = _FakeButtonNode()
+        node._on_continuous_start(_Msg(True))
+        self.assertTrue(node.continuous_mode)
+        # Even if a recording were somehow active, releasing F1 must not
+        # emit a stop_recording during an Aletta session.
+        node.recording_active = True
+        node.prev_keys = F1_KEY
+        node.controller_callback(_Keys(0))
+        self.assertEqual(
+            node.stop_pub.published, [],
+            'F1 release must not stop a turn while an Aletta session is open')
+        self.assertFalse(node.recording_active)
 
     def test_start_cannot_open_a_session(self):
         node = _FakeButtonNode()

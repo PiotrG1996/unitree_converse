@@ -192,6 +192,18 @@ class WakeWordNode(Node):
         # trigger: if it fails to load, wake stays disabled (pad still works).
         self.oww_detector = None
         self._wake_socket = None
+        # Wake word detected while the pipeline was busy: the session is
+        # refreshed but the trigger is deferred. When the pipeline drains
+        # to idle, the pending wake fires (subject to _can_trigger's
+        # cooldown check). Prevents a genuine re-wake from being silently
+        # dropped just because STT/LLM/TTS happened to be mid-turn.
+        self.pending_wake = False
+        # Turn-in-flight guard: True while STT is recording/transcribing
+        # or LLM/TTS is processing. Prevents a wake-word false accept
+        # from opening a new session and disrupting an in-flight answer
+        # (e.g. an F1 push-to-talk question that hasn't finished yet).
+        self.turn_in_flight = False
+        self._turn_in_flight_since = 0.0
 
         self.trigger_pub = self.create_publisher(Bool, '/g1/voice/trigger', 10)
         self.status_pub = self.create_publisher(String, '/g1/wake/status', 10)
@@ -248,10 +260,45 @@ class WakeWordNode(Node):
         # Publish health status periodically for observability/diagnostics.
         self.create_timer(5.0, self._publish_health)
 
+        # Startup health check: warn if critical external topics have no
+        # publishers. Without llm_node/tts_node/rtabmap publishing status,
+        # the session state machine stalls (no LLM reply → every session
+        # counts as a false accept → cooldown escalates until wake is
+        # unresponsive).
+        topic_names_types = dict(self.get_topic_names_and_types())
+        critical_topics = {
+            '/g1/llm/status': 'llm_node',
+            '/g1/tts/status': 'tts_node',
+            '/g1/stt/status': 'stt_node',
+        }
+        missing = [name for name in critical_topics if name not in topic_names_types]
+        if missing:
+            log_warn(
+                self,
+                'Critical topics have no publishers — session gating will '
+                f'degrade: {", ".join(missing)}. Start the missing nodes '
+                '(llm_node, tts_node, stt_node) before relying on wake word.')
+
         log_info(self, 'Wake word node ready (Aletta + pad only)')
 
     def stt_status_callback(self, msg: String):
         self.stt_busy = msg.data in ('recording', 'transcribing')
+        # Track turn-in-flight: STT recording/transcribing means a turn
+        # is active. Also update last_trigger_time for F1 push-to-talk
+        # turns (which bypass the wake node) so the cooldown gate
+        # applies and wake-word false accepts are throttled.
+        if self.stt_busy:
+            self.turn_in_flight = True
+            self._turn_in_flight_since = time.time()
+            if not self.session_open:
+                # F1 push-to-talk turn: set cooldown anchor so wake
+                # triggers are throttled during the answer pipeline.
+                self.last_trigger_time = time.time()
+        elif msg.data in ('idle', 'empty_turn'):
+            # STT finished; clear turn-in-flight only if LLM and TTS
+            # are also idle (no answer pipeline in progress).
+            if not self.llm_busy and not self.tts_busy:
+                self.turn_in_flight = False
         if self.stt_busy and self.session_open:
             self._touch_session()
         if msg.data == 'empty_turn' and self.session_open:
@@ -272,6 +319,8 @@ class WakeWordNode(Node):
             # robot_state/transcript path via llm busy) to avoid resetting
             # on back-to-back silence.
             pass
+        # Drain a queued wake-word trigger now that STT state may have changed.
+        self._check_pending_wake()
 
     def manual_stop_callback(self, msg: Bool):
         """START pad kill-switch: close the session immediately."""
@@ -280,6 +329,13 @@ class WakeWordNode(Node):
 
     def llm_status_callback(self, msg: String):
         self.llm_busy = msg.data == 'thinking'
+        # Track turn-in-flight: LLM thinking means an answer is being
+        # generated; clear only when LLM goes idle AND TTS is also idle.
+        if self.llm_busy:
+            self.turn_in_flight = True
+            self._turn_in_flight_since = time.time()
+        elif not self.tts_busy and not self.stt_busy:
+            self.turn_in_flight = False
         if self.llm_busy and self.session_open:
             # A reply is being generated: this session is a real
             # conversation, not a false accept. End the backoff streak.
@@ -291,13 +347,24 @@ class WakeWordNode(Node):
             # real conversation cannot close the session.
             self.empty_turns = 0
             self._touch_session()
+        # Drain a queued wake-word trigger now that LLM state changed.
+        self._check_pending_wake()
 
     def tts_status_callback(self, msg: String):
         self.tts_busy = msg.data in ('speaking', 'synthesizing', 'playing')
+        # Track turn-in-flight: TTS speaking means the answer is being
+        # delivered; clear only when TTS goes idle AND LLM is also idle.
+        if self.tts_busy:
+            self.turn_in_flight = True
+            self._turn_in_flight_since = time.time()
+        elif not self.llm_busy and not self.stt_busy:
+            self.turn_in_flight = False
         if self.tts_busy:
             self._last_tts_busy = time.time()
         if self.tts_busy and self.session_open:
             self._touch_session()
+        # Drain a queued wake-word trigger now that TTS state changed.
+        self._check_pending_wake()
 
     def _tts_echo_active(self):
         """
@@ -380,17 +447,61 @@ class WakeWordNode(Node):
                 f'{self.cooldown:.0f}s')
         self.session_opened_by_wake = False
         self.session_had_llm_reply = False
+        self.pending_wake = False
+        self.turn_in_flight = False
         log_info(self,
                  f'Conversation session CLOSED ({reason}) — '
                  'say "Aletta" to start again')
 
     def _can_trigger(self):
         now = time.time()
+        if self.turn_in_flight:
+            # Auto-clear stale flag (safety net: 30s max).
+            if (now - self._turn_in_flight_since) < 30.0:
+                return False
+            self.turn_in_flight = False
         if self.stt_busy or self.llm_busy or self.tts_busy:
             return False
         if (now - self.last_trigger_time) < self.cooldown:
             return False
         return True
+
+    def _check_pending_wake(self):
+        """
+        Fire a queued wake-word trigger if the pipeline is now idle.
+
+        Only fires when STT, LLM, and TTS are all idle AND we're within
+        cooldown.  Prevents a genuine re-wake from being silently dropped
+        just because STT/LLM/TTS happened to be mid-turn when the wake
+        word fired.
+
+        If the pipeline is still busy, the pending wake is left queued
+        (flag remains True). The flag is only cleared when the trigger
+        actually fires.
+        """
+        if not self.pending_wake:
+            return
+        if self.turn_in_flight:
+            # Auto-clear stale flag (safety net: 30s max), mirroring
+            # _can_trigger, so a stuck guard cannot strand a queued wake.
+            if (time.time() - self._turn_in_flight_since) >= 30.0:
+                self.turn_in_flight = False
+            else:
+                # An in-flight turn is still draining: keep the wake queued.
+                return
+        if self.stt_busy or self.llm_busy or self.tts_busy:
+            # Pipeline still busy: leave pending_wake queued, do not fire
+            return
+        if not self.session_open:
+            return
+        # Fire the trigger and clear the pending flag.
+        self.last_trigger_time = time.time()
+        self._touch_session()
+        msg = Bool()
+        msg.data = True
+        self.trigger_pub.publish(msg)
+        self.pending_wake = False
+        log_info(self, 'firing queued wake word')
 
     def _check_session_timeout(self):
         """Enforce the session duration cap (no silence timeout)."""
@@ -431,8 +542,10 @@ class WakeWordNode(Node):
         else:
             log_info(self,
                      'Aletta heard during open session '
-                     f'(score={score:.2f}) - session refreshed '
+                     f'(score={score:.2f}) - session refreshed queued '
                      '(pipeline busy, no new turn)')
+            if not self.pending_wake:
+                self.pending_wake = True
 
     def _fire_trigger(self, source: str):
         if not self._can_trigger():
@@ -577,8 +690,10 @@ class WakeWordNode(Node):
                         # Also runs when the mic goes quiet: enforces the
                         # session duration cap (silence never closes).
                         self._check_session_timeout()
+                        self._check_pending_wake()
                         continue
                     self._check_session_timeout()
+                    self._check_pending_wake()
                     # Idle wait: no open session — score only a short burst,
                     # then sleep. Keeps the wait state near zero CPU while
                     # still reacting to "Aletta" within ~a second.
