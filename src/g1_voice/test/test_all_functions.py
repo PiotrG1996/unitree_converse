@@ -15,6 +15,7 @@ No ROS runtime required: modules are loaded from source with rclpy stubbed.
 import importlib.util
 import os
 import sys
+import threading
 import time
 import types
 import unittest
@@ -99,6 +100,10 @@ class _FakeWakeNode:
         # Turn-in-flight guard (mirrors WakeWordNode.__init__).
         self.turn_in_flight = False
         self._turn_in_flight_since = 0.0
+        # Pending-wake timestamp (mirrors WakeWordNode.__init__).
+        self._pending_wake_since = 0.0
+        # Thread-safety lock (mirrors WakeWordNode.__init__).
+        self._state_lock = threading.RLock()
         # Telemetry state
         self.aletta_threshold = 0.85
         self.telemetry_log_interval_sec = 30.0

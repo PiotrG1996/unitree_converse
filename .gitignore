@@ -19,3 +19,4 @@ __pycache__/
 # Local Piper TTS artifacts
 piper/
 piper_linux_aarch64.tar.gz
+src/g1_voice/g1_voice.egg-info/

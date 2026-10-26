@@ -185,8 +185,6 @@ unitree_converse/
     │   ├── resource/g1_voice           # ament resource index marker
     │   ├── g1_voice/
     │   │   ├── __init__.py                 # (empty) marks the Python package
-    │   │   ├── log.py                      # compatibility alias for node_logging
-    │   │   ├── logging_utils.py            # compatibility alias for node_logging
     │   │   ├── node_logging.py             # shared, testable ROS 2 node logging helper
     │   │   ├── wake_word_node.py           # wake listener: "Aletta" openWakeWord only (no phrases, no keyboard)
     │   │   ├── wake_word_openwakeword.py   # openWakeWord detector wrapper (import-light, loud-error)
@@ -194,7 +192,6 @@ unitree_converse/
     │   │   ├── speech_gate.py              # No-speech confidence filter (rclpy-free helpers)
     │   │   ├── tts_node.py                 # Piper TTS, bilingual streamed via llm_stream
     │   │   ├── g1_audio_worker.py          # Native G1 AudioHub playback (separate process)
-    │   │   ├── action_dispatcher_node.py   # (placeholder, empty) future robot-action node
     │   │   ├── button_trigger_node.py      # F1/F3/START/SELECT remote button mapping
     │   │   └── robot_state_node.py         # Live robot state injection into the LLM
     │   ├── launch/
@@ -204,12 +201,10 @@ unitree_converse/
     │   │   ├── voice_params.yaml       # Dev machine params
     │   │   └── voice_params_real.yaml  # Jetson robot params (GPU STT, tuned prompt)
     │   └── test/
-    │       ├── test_audio_hw.py            # Speaker/microphone hardware tests
     │       ├── test_llm_pipeline.py        # Ollama/Piper/Whisper stage tests
     │       ├── test_speech_gate.py         # No-speech confidence-gate unit tests
     │       ├── test_split_sentences.py     # TTS sentence split / bilingual voice-latch tests
     │       ├── test_stt_language_gate.py   # STT language-duel + noise-skip unit tests
-    │       ├── test_node_logging.py        # Shared ROS 2 node logging helper unit tests
     │       ├── test_copyright.py           # ament_copyright linter (skipped repo-wide)
     │       ├── test_flake8.py              # ament_flake8 linter
     │       └── test_pep257.py              # ament_pep257 (docstring) linter
@@ -243,18 +238,6 @@ own `Node.get_logger()` (it never shadows that method) and exposes:
   with per-node state stored on the node object.
 - Import-light design: `node_logging.py` does not import `rclpy`, so it can be
   unit-tested without a ROS 2 runtime.
-
-Compatibility aliases `log.py` and `logging_utils.py` re-export the same API,
-so existing call sites and tests can import from any of the three module names.
-Migration imports use a three-tier fallback (`from .node_logging`, then
-`from g1_voice.node_logging`, then a local-file import) so the code works both
-inside the installed package and in the unit-test layout.
-
-Run the helper tests with:
-
-```bash
-cd src/g1_voice && python3 -m pytest test/test_node_logging.py -v
-```
 
 ---
 
@@ -590,10 +573,6 @@ so they are suitable for CI or a post-deploy smoke test.
 ### Pytest suite
 
 ```bash
-# Audio hardware tests (devices open + stream). Add G1_INTERACTIVE=1 to also
-# require you to hear a tone / speak into the mic.
-cd src/g1_voice && python3 -m pytest test/test_audio_hw.py -v
-
 # LLM pipeline tests (Ollama / Piper / Whisper round trip)
 cd src/g1_voice && python3 -m pytest test/test_llm_pipeline.py -v
 

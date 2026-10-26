@@ -15,6 +15,7 @@ the streak on a real reply (or a manual pad press).
 import importlib.util
 import os
 import sys
+import threading
 import time
 import types
 import unittest
@@ -97,6 +98,9 @@ class _FakeWakeNode:
         # Pending wake: wake detected during a busy pipeline, queued for
         # firing when the pipeline drains. Mirrors WakeWordNode.__init__.
         self.pending_wake = False
+        self._pending_wake_since = 0.0
+        # Thread-safety lock (mirrors WakeWordNode.__init__).
+        self._state_lock = threading.RLock()
         # Turn-in-flight guard (mirrors WakeWordNode.__init__).
         self.turn_in_flight = False
         self._turn_in_flight_since = 0.0
@@ -122,9 +126,6 @@ class _FakeWakeNode:
         self._in_session_refresh = (
             lambda score: cls._in_session_refresh(self, score))
         self._log_burst_telemetry = lambda: cls._log_burst_telemetry(self)
-        self._resume_when_idle = lambda: cls._resume_when_idle(self)
-        self._check_session_timeout = (
-            lambda: cls._check_session_timeout(self))
         self._check_session_timeout = (
             lambda: cls._check_session_timeout(self))
         self._check_pending_wake = (
@@ -316,10 +317,10 @@ class TestBackoffEscalation(unittest.TestCase):
         self.assertTrue(node.pending_wake)
         triggered_before = len(node.trigger_pub.published)
         node.tts_busy = False
-        node._check_pending_wake()  # cooldown no longer blocks queued wake
-        self.assertFalse(node.pending_wake)
+        node._check_pending_wake()  # cooldown blocks queued wake
+        self.assertTrue(node.pending_wake)
         self.assertEqual(len(node.trigger_pub.published),
-                         triggered_before + 1)
+                         triggered_before)
 
     def test_status_callback_drains_pending_wake(self):
         # Integration: the STT status callback fires the queued wake
@@ -336,27 +337,6 @@ class TestBackoffEscalation(unittest.TestCase):
         self.assertFalse(node.pending_wake)
         self.assertEqual(len(node.trigger_pub.published),
                          triggered_before + 1)
-
-    def test_resume_ignores_cooldown_listens_immediately(self):
-        # Missed-wake regression: after a phantom timeout the escalated
-        # cooldown must not keep the mic closed. The listener resumes at
-        # once; only firing stays gated. (The historic `listening` pause
-        # flag was removed — the mic now stays open by design — so this
-        # asserts the session/timeout bookkeeping instead.)
-        node = _FakeWakeNode()
-        node._wake_open()  # last_trigger_time = now
-        node._touch_session()
-        node._close_session('20s of silence (>20s)')  # cooldown -> 16
-        self.assertEqual(node.cooldown, 16.0)
-        self.assertFalse(node.session_open)
-        node._resume_when_idle()
-        self.assertFalse(node.session_open)
-
-    def test_resume_keeps_session_closed_state(self):
-        node = _FakeWakeNode()
-        node._wake_open()
-        node._resume_when_idle()  # session still open -> stays open
-        self.assertTrue(node.session_open)
 
     def test_fire_still_gated_by_cooldown(self):
         node = _FakeWakeNode()

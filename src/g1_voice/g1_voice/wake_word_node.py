@@ -198,12 +198,16 @@ class WakeWordNode(Node):
         # cooldown check). Prevents a genuine re-wake from being silently
         # dropped just because STT/LLM/TTS happened to be mid-turn.
         self.pending_wake = False
+        self._pending_wake_since = 0.0
         # Turn-in-flight guard: True while STT is recording/transcribing
         # or LLM/TTS is processing. Prevents a wake-word false accept
         # from opening a new session and disrupting an in-flight answer
         # (e.g. an F1 push-to-talk question that hasn't finished yet).
         self.turn_in_flight = False
         self._turn_in_flight_since = 0.0
+        # Thread-safety: protects all shared mutable state accessed by both
+        # the ROS callback thread and the wake listener thread.
+        self._state_lock = threading.RLock()
 
         self.trigger_pub = self.create_publisher(Bool, '/g1/voice/trigger', 10)
         self.status_pub = self.create_publisher(String, '/g1/wake/status', 10)
@@ -282,89 +286,93 @@ class WakeWordNode(Node):
         log_info(self, 'Wake word node ready (Aletta + pad only)')
 
     def stt_status_callback(self, msg: String):
-        self.stt_busy = msg.data in ('recording', 'transcribing')
-        # Track turn-in-flight: STT recording/transcribing means a turn
-        # is active. Also update last_trigger_time for F1 push-to-talk
-        # turns (which bypass the wake node) so the cooldown gate
-        # applies and wake-word false accepts are throttled.
-        if self.stt_busy:
-            self.turn_in_flight = True
-            self._turn_in_flight_since = time.time()
-            if not self.session_open:
-                # F1 push-to-talk turn: set cooldown anchor so wake
-                # triggers are throttled during the answer pipeline.
-                self.last_trigger_time = time.time()
-        elif msg.data in ('idle', 'empty_turn'):
-            # STT finished; clear turn-in-flight only if LLM and TTS
-            # are also idle (no answer pipeline in progress).
-            if not self.llm_busy and not self.tts_busy:
-                self.turn_in_flight = False
-        if self.stt_busy and self.session_open:
-            self._touch_session()
-        if msg.data == 'empty_turn' and self.session_open:
-            # A turn produced no publishable transcript (silence, noise, or
-            # a dropped low-confidence decode). Not activity — but also not
-            # a reason to close on its own: the STT watchdog re-arms
-            # listening, and the session survives until max_empty_turns.
-            self.empty_turns += 1
-            log_info(self,
-                     f'Empty turn {self.empty_turns}/{self.max_empty_turns} '
-                     '(no transcript published)')
-            if self.empty_turns >= self.max_empty_turns:
-                self._close_session(
-                    f'{self.empty_turns} consecutive empty turns')
-        elif msg.data in ('recording', 'transcribing'):
-            # A fresh turn is starting — handled above for the touch; the
-            # empty counter resets only on a published transcript (see
-            # robot_state/transcript path via llm busy) to avoid resetting
-            # on back-to-back silence.
-            pass
-        # Drain a queued wake-word trigger now that STT state may have changed.
-        self._check_pending_wake()
+        with self._state_lock:
+            self.stt_busy = msg.data in ('recording', 'transcribing')
+            # Track turn-in-flight: STT recording/transcribing means a turn
+            # is active. Also update last_trigger_time for F1 push-to-talk
+            # turns (which bypass the wake node) so the cooldown gate
+            # applies and wake-word false accepts are throttled.
+            if self.stt_busy:
+                self.turn_in_flight = True
+                self._turn_in_flight_since = time.time()
+                if not self.session_open:
+                    # F1 push-to-talk turn: set cooldown anchor so wake
+                    # triggers are throttled during the answer pipeline.
+                    self.last_trigger_time = time.time()
+            elif msg.data in ('idle', 'empty_turn'):
+                # STT finished; clear turn-in-flight only if LLM and TTS
+                # are also idle (no answer pipeline in progress).
+                if not self.llm_busy and not self.tts_busy:
+                    self.turn_in_flight = False
+            if self.stt_busy and self.session_open:
+                self._touch_session()
+            if msg.data == 'empty_turn' and self.session_open:
+                # A turn produced no publishable transcript (silence, noise, or
+                # a dropped low-confidence decode). Not activity — but also not
+                # a reason to close on its own: the STT watchdog re-arms
+                # listening, and the session survives until max_empty_turns.
+                self.empty_turns += 1
+                log_info(self,
+                         f'Empty turn {self.empty_turns}/{self.max_empty_turns} '
+                         '(no transcript published)')
+                if self.empty_turns >= self.max_empty_turns:
+                    self._close_session(
+                        f'{self.empty_turns} consecutive empty turns')
+            elif msg.data in ('recording', 'transcribing'):
+                # A fresh turn is starting — handled above for the touch; the
+                # empty counter resets only on a published transcript (see
+                # robot_state/transcript path via llm busy) to avoid resetting
+                # on back-to-back silence.
+                pass
+            # Drain a queued wake-word trigger now that STT state may have changed.
+            self._check_pending_wake()
 
     def manual_stop_callback(self, msg: Bool):
         """START pad kill-switch: close the session immediately."""
-        if msg.data and self.session_open:
-            self._close_session('manual stop (START pad)')
+        with self._state_lock:
+            if msg.data and self.session_open:
+                self._close_session('manual stop (START pad)')
 
     def llm_status_callback(self, msg: String):
-        self.llm_busy = msg.data == 'thinking'
-        # Track turn-in-flight: LLM thinking means an answer is being
-        # generated; clear only when LLM goes idle AND TTS is also idle.
-        if self.llm_busy:
-            self.turn_in_flight = True
-            self._turn_in_flight_since = time.time()
-        elif not self.tts_busy and not self.stt_busy:
-            self.turn_in_flight = False
-        if self.llm_busy and self.session_open:
-            # A reply is being generated: this session is a real
-            # conversation, not a false accept. End the backoff streak.
-            self.session_had_llm_reply = True
-            self.false_accept_count = 0
-            self.cooldown = self.base_cooldown
-            # A published transcript broke the empty streak — reset the
-            # consecutive-empty counter so one noisy turn mixed into a
-            # real conversation cannot close the session.
-            self.empty_turns = 0
-            self._touch_session()
-        # Drain a queued wake-word trigger now that LLM state changed.
-        self._check_pending_wake()
+        with self._state_lock:
+            self.llm_busy = msg.data == 'thinking'
+            # Track turn-in-flight: LLM thinking means an answer is being
+            # generated; clear only when LLM goes idle AND TTS is also idle.
+            if self.llm_busy:
+                self.turn_in_flight = True
+                self._turn_in_flight_since = time.time()
+            elif not self.tts_busy and not self.stt_busy:
+                self.turn_in_flight = False
+            if self.llm_busy and self.session_open:
+                # A reply is being generated: this session is a real
+                # conversation, not a false accept. End the backoff streak.
+                self.session_had_llm_reply = True
+                self.false_accept_count = 0
+                self.cooldown = self.base_cooldown
+                # A published transcript broke the empty streak — reset the
+                # consecutive-empty counter so one noisy turn mixed into a
+                # real conversation cannot close the session.
+                self.empty_turns = 0
+                self._touch_session()
+            # Drain a queued wake-word trigger now that LLM state changed.
+            self._check_pending_wake()
 
     def tts_status_callback(self, msg: String):
-        self.tts_busy = msg.data in ('speaking', 'synthesizing', 'playing')
-        # Track turn-in-flight: TTS speaking means the answer is being
-        # delivered; clear only when TTS goes idle AND LLM is also idle.
-        if self.tts_busy:
-            self.turn_in_flight = True
-            self._turn_in_flight_since = time.time()
-        elif not self.llm_busy and not self.stt_busy:
-            self.turn_in_flight = False
-        if self.tts_busy:
-            self._last_tts_busy = time.time()
-        if self.tts_busy and self.session_open:
-            self._touch_session()
-        # Drain a queued wake-word trigger now that TTS state changed.
-        self._check_pending_wake()
+        with self._state_lock:
+            self.tts_busy = msg.data in ('speaking', 'synthesizing', 'playing')
+            # Track turn-in-flight: TTS speaking means the answer is being
+            # delivered; clear only when TTS goes idle AND LLM is also idle.
+            if self.tts_busy:
+                self.turn_in_flight = True
+                self._turn_in_flight_since = time.time()
+            elif not self.llm_busy and not self.stt_busy:
+                self.turn_in_flight = False
+            if self.tts_busy:
+                self._last_tts_busy = time.time()
+            if self.tts_busy and self.session_open:
+                self._touch_session()
+            # Drain a queued wake-word trigger now that TTS state changed.
+            self._check_pending_wake()
 
     def _tts_echo_active(self):
         """
@@ -376,95 +384,101 @@ class WakeWordNode(Node):
         false accepts (observed 2026-10-15: detection storms exactly while
         TTS chunks were playing).
         """
-        if self.tts_busy:
-            return True
-        return (time.time() - self._last_tts_busy) < self.echo_guard_sec
+        with self._state_lock:
+            if self.tts_busy:
+                return True
+            return (time.time() - self._last_tts_busy) < self.echo_guard_sec
 
     def _publish_session_state(self):
         """Publish the current session state for observability."""
-        msg = String()
-        msg.data = self._session_state
-        self.session_state_pub.publish(msg)
+        with self._state_lock:
+            msg = String()
+            msg.data = self._session_state
+            self.session_state_pub.publish(msg)
 
     def _touch_session(self):
         """Mark turn activity (keeps the conversation window open)."""
-        self.last_session_activity = time.time()
+        with self._state_lock:
+            self.last_session_activity = time.time()
 
     def _open_session(self, source: str):
         """Open (or refresh) the conversation window on a valid entry."""
-        was_open = self.session_open
-        self.session_open = True
-        self._touch_session()
-        if not was_open:
-            self.session_opened_at = time.time()
-            self.empty_turns = 0
-            self._session_state = 'opening'
-            self._publish_session_state()
-            # Enable chained turns downstream (STT continuous_mode + TTS
-            # _TURN_END auto-trigger). Without this the window is local-only.
-            msg = Bool()
-            msg.data = True
-            self.continuous_start_pub.publish(msg)
-            log_info(
-                self, f'Conversation session OPEN ({source}) — closes on START, '
-                f'{self.max_empty_turns} empty turns, or '
-                f'{self.session_max_duration_sec:.0f}s max duration')
-        else:
-            # Session already open: this is a refresh, not a new opening.
-            self._session_state = 'refreshing'
-            self._publish_session_state()
+        with self._state_lock:
+            was_open = self.session_open
+            self.session_open = True
+            self._touch_session()
+            if not was_open:
+                self.session_opened_at = time.time()
+                self.empty_turns = 0
+                self._session_state = 'opening'
+                self._publish_session_state()
+                # Enable chained turns downstream (STT continuous_mode + TTS
+                # _TURN_END auto-trigger). Without this the window is local-only.
+                msg = Bool()
+                msg.data = True
+                self.continuous_start_pub.publish(msg)
+                log_info(
+                    self, f'Conversation session OPEN ({source}) — closes on START, '
+                    f'{self.max_empty_turns} empty turns, or '
+                    f'{self.session_max_duration_sec:.0f}s max duration')
+            else:
+                # Session already open: this is a refresh, not a new opening.
+                self._session_state = 'refreshing'
+                self._publish_session_state()
 
     def _close_session(self, reason: str):
         """Close the window: back to throttled wait, no answers."""
-        was_open = self.session_open
-        if self.session_open:
-            msg = Bool()
-            msg.data = True
-            self.continuous_stop_pub.publish(msg)
-        self.session_open = False
-        self.last_session_activity = 0.0
-        self.session_opened_at = 0.0
-        self.empty_turns = 0
-        if was_open:
-            self._session_state = 'closed'
-            self._publish_session_state()
-        # False-accept backoff: a wake-opened session that ends with NO LLM
-        # reply was almost certainly a false accept (or hallucination turns
-        # nobody asked for). Exponentially increase the cooldown so the idle
-        # storm slows instead of re-firing every few seconds. A session that
-        # produced a reply is a real conversation: session_had_llm_reply
-        # stays True and no escalation happens (count was already reset when
-        # the reply started). Closes are explicit now (START / empty-turn
-        # limit / duration cap) — there is no silence timeout anymore.
-        if (self.session_opened_by_wake and not self.session_had_llm_reply):
-            self.false_accept_count += 1
-            new_cooldown = self.base_cooldown * (
-                self.false_accept_backoff_multiplier ** self.false_accept_count)
-            self.cooldown = min(new_cooldown, self.max_false_accept_cooldown)
-            log_warn(
-                self, f'False accept #{self.false_accept_count} — session ended '
-                f'({reason}) with no reply, cooldown back off to '
-                f'{self.cooldown:.0f}s')
-        self.session_opened_by_wake = False
-        self.session_had_llm_reply = False
-        self.pending_wake = False
-        self.turn_in_flight = False
-        log_info(self,
-                 f'Conversation session CLOSED ({reason}) — '
-                 'say "Aletta" to start again')
+        with self._state_lock:
+            was_open = self.session_open
+            if self.session_open:
+                msg = Bool()
+                msg.data = True
+                self.continuous_stop_pub.publish(msg)
+            self.session_open = False
+            self.last_session_activity = 0.0
+            self.session_opened_at = 0.0
+            self.empty_turns = 0
+            if was_open:
+                self._session_state = 'closed'
+                self._publish_session_state()
+            # False-accept backoff: a wake-opened session that ends with NO LLM
+            # reply was almost certainly a false accept (or hallucination turns
+            # nobody asked for). Exponentially increase the cooldown so the idle
+            # storm slows instead of re-firing every few seconds. A session that
+            # produced a reply is a real conversation: session_had_llm_reply
+            # stays True and no escalation happens (count was already reset when
+            # the reply started). Closes are explicit now (START / empty-turn
+            # limit / duration cap) — there is no silence timeout anymore.
+            if (self.session_opened_by_wake and not self.session_had_llm_reply):
+                self.false_accept_count += 1
+                new_cooldown = self.base_cooldown * (
+                    self.false_accept_backoff_multiplier ** self.false_accept_count)
+                self.cooldown = min(new_cooldown, self.max_false_accept_cooldown)
+                log_warn(
+                    self, f'False accept #{self.false_accept_count} — session ended '
+                    f'({reason}) with no reply, cooldown back off to '
+                    f'{self.cooldown:.0f}s')
+            self.session_opened_by_wake = False
+            self.session_had_llm_reply = False
+            self.pending_wake = False
+            self.turn_in_flight = False
+            log_info(self,
+                     f'Conversation session CLOSED ({reason}) — '
+                     'say "Aletta" to start again')
 
     def _can_trigger(self):
-        now = time.time()
-        if self.turn_in_flight:
-            # Auto-clear stale flag (safety net: 30s max).
-            if (now - self._turn_in_flight_since) < 30.0:
+        with self._state_lock:
+            now = time.time()
+            if self.turn_in_flight:
+                # Auto-clear stale flag (safety net: 30s max).
+                if (now - self._turn_in_flight_since) < 30.0:
+                    return False
+                self.turn_in_flight = False
+            if self.stt_busy or self.llm_busy or self.tts_busy:
                 return False
-            self.turn_in_flight = False
-        if self.stt_busy or self.llm_busy or self.tts_busy:
-            return False
-        if (now - self.last_trigger_time) < self.cooldown:
-            return False
-        return True
+            if (now - self.last_trigger_time) < self.cooldown:
+                return False
+            return True
 
     def _check_pending_wake(self):
         """
@@ -479,49 +493,49 @@ class WakeWordNode(Node):
         (flag remains True). The flag is only cleared when the trigger
         actually fires.
         """
-        if not self.pending_wake:
-            return
-        if self.turn_in_flight:
-            # Auto-clear stale flag (safety net: 30s max), mirroring
-            # _can_trigger, so a stuck guard cannot strand a queued wake.
-            if (time.time() - self._turn_in_flight_since) >= 30.0:
-                self.turn_in_flight = False
-            else:
-                # An in-flight turn is still draining: keep the wake queued.
+        with self._state_lock:
+            if not self.pending_wake:
                 return
-        if self.stt_busy or self.llm_busy or self.tts_busy:
-            # Pipeline still busy: leave pending_wake queued, do not fire
-            return
-        if not self.session_open:
-            return
-        # Fire the trigger and clear the pending flag.
-        self.last_trigger_time = time.time()
-        self._touch_session()
-        msg = Bool()
-        msg.data = True
-        self.trigger_pub.publish(msg)
-        self.pending_wake = False
-        log_info(self, 'firing queued wake word')
+            if self.turn_in_flight:
+                # Auto-clear stale flag (safety net: 30s max), mirroring
+                # _can_trigger, so a stuck guard cannot strand a queued wake.
+                if (time.time() - self._turn_in_flight_since) >= 30.0:
+                    self.turn_in_flight = False
+                else:
+                    # An in-flight turn is still draining: keep the wake queued.
+                    return
+            if self.stt_busy or self.llm_busy or self.tts_busy:
+                # Pipeline still busy: leave pending_wake queued, do not fire
+                return
+            if not self.session_open:
+                return
+            # Respect cooldown gating, just like a normal re-trigger.
+            if not self._can_trigger():
+                return
+            # Fire the trigger and clear the pending flag.
+            self.last_trigger_time = time.time()
+            self._touch_session()
+            msg = Bool()
+            msg.data = True
+            self.trigger_pub.publish(msg)
+            self.pending_wake = False
+            self._pending_wake_since = 0.0
+            log_info(self, 'firing queued wake word')
 
     def _check_session_timeout(self):
         """Enforce the session duration cap (no silence timeout)."""
-        """Kept under the historical name so the listener call sites and the
-        unit-test harness keep working. Silence/empty turns never close the
-        session here: STT re-arms listening via its watchdog, and the
-        empty-turn counter (stt_status_callback) closes after
-        max_empty_turns. This method enforces only the wall-clock backstop
-        against phantom sessions, and never interrupts an in-flight turn."""
-        if not self.session_open:
-            return
-        if self.stt_busy or self.llm_busy or self.tts_busy:
-            # A turn is in flight — touch and never cap mid-turn.
-            self._touch_session()
-            return
-        open_for = time.time() - self.session_opened_at
-        if open_for >= self.session_max_duration_sec:
-            self._close_session(
-                f'max duration ({open_for:.0f}s >= '
-                f'{self.session_max_duration_sec:.0f}s)')
+        with self._state_lock:
+            if not self.session_open:
+                return
+            if self.stt_busy or self.llm_busy or self.tts_busy:
+                # A turn is in flight — touch and never cap mid-turn.
+                self._touch_session()
+                return
+            open_for = time.time() - self.session_opened_at
+            if open_for >= self.session_max_duration_sec:
+                self._close_session(
+                    f'max duration ({open_for:.0f}s >= '
+                    f'{self.session_max_duration_sec:.0f}s)')
 
     def _in_session_refresh(self, score):
         """
@@ -533,63 +547,86 @@ class WakeWordNode(Node):
         push-to-talk. When the pipeline is busy, we only refresh the session
         window and log it, avoiding a race with the TTS _TURN_END chain.
         """
-        self._touch_session()
-        if not (self.stt_busy or self.llm_busy or self.tts_busy):
-            log_info(self,
-                     'Aletta during open session — starting new turn '
-                     f'(score={score:.2f})')
-            self._fire_trigger('aletta_wake_word')
-        else:
-            log_info(self,
-                     'Aletta heard during open session '
-                     f'(score={score:.2f}) - session refreshed queued '
-                     '(pipeline busy, no new turn)')
-            if not self.pending_wake:
+        with self._state_lock:
+            self._touch_session()
+            if not (self.stt_busy or self.llm_busy or self.tts_busy):
+                log_info(self,
+                         'Aletta during open session — starting new turn '
+                         f'(score={score:.2f})')
+                self._fire_trigger('aletta_wake_word')
+            else:
+                log_info(self,
+                         'Aletta heard during open session '
+                         f'(score={score:.2f}) - session refreshed queued '
+                         '(pipeline busy, no new turn)')
+                # Always (re)stamp when (re)queuing so stale ages are detected.
                 self.pending_wake = True
+                self._pending_wake_since = time.time()
+                # Track when pending wake was set for timeout/warning purposes.
+                # If the wake has been queued for too long, log a warning so
+                # the user/pipeline operator can diagnose a stuck state.
+                if self.pending_wake and hasattr(self, '_pending_wake_since'):
+                    age = time.time() - self._pending_wake_since
+                    if age > 30.0:
+                        log_warn(self,
+                                 f'Pending wake word queued for {age:.1f}s - '
+                                 'pipeline may be stuck; forcing check.')
+                # Try to fire the pending wake immediately in case the pipeline
+                # is at the boundary of busy/idle; otherwise it will be checked
+                # on the next status‑callback anyway.
+                self._check_pending_wake()
 
     def _fire_trigger(self, source: str):
-        if not self._can_trigger():
-            log_debug(self,
-                      'Trigger blocked — pipeline busy or cooldown active')
-            return
-        self.last_trigger_time = time.time()
-        if source != 'aletta_wake_word':
-            # Pad button = a human is present and wants the robot: clear the
-            # backoff so a manual press is never throttled. Wake fires keep
-            # the streak: consecutive no-reply wake sessions accumulate
-            # (8→16→32→60s). The old unconditional reset here restarted the
-            # streak on every false accept, so the cooldown could never
-            # exceed 16s — the observed ~25s session cadence of 2026-10-16.
-            # The streak resets on a real reply (llm_status_callback) instead.
-            self.cooldown = self.base_cooldown
-            self.false_accept_count = 0
-        self._open_session(source)
-        self.session_opened_by_wake = (source == 'aletta_wake_word')
-        # NOTE (missed-wake fix, 2026-10-16): the wake socket now STAYS OPEN
-        # during sessions. Multicast UDP allows the STT and wake sockets to
-        # coexist, so a repeated "Aletta" refreshes the window (see
-        # _in_session_refresh) instead of hitting a closed socket. The firing
-        # itself stays gated by _can_trigger (cooldown + pipeline-busy).
-        log_info(self, f'Trigger fired from: {source}')
-        msg = Bool()
-        msg.data = True
-        self.trigger_pub.publish(msg)
-        status = String()
-        status.data = f'triggered:{source}'
-        self.status_pub.publish(status)
+        with self._state_lock:
+            if not self._can_trigger():
+                log_debug(self,
+                          'Trigger blocked — pipeline busy or cooldown active')
+                return
+            self.last_trigger_time = time.time()
+            if source != 'aletta_wake_word':
+                # Pad button = a human is present and wants the robot: clear the
+                # backoff so a manual press is never throttled. Wake fires keep
+                # the streak: consecutive no-reply wake sessions accumulate
+                # (8→16→32→60s). The old unconditional reset here restarted the
+                # streak on every false accept, so the cooldown could never
+                # exceed 16s — the observed ~25s session cadence of 2026-10-16.
+                # The streak resets on a real reply (llm_status_callback) instead.
+                self.cooldown = self.base_cooldown
+                self.false_accept_count = 0
+            self._open_session(source)
+            self.session_opened_by_wake = (source == 'aletta_wake_word')
+            # NOTE (missed-wake fix, 2026-10-16): the wake socket now STAYS OPEN
+            # during sessions. Multicast UDP allows the STT and wake sockets to
+            # coexist, so a repeated "Aletta" refreshes the window (see
+            # _in_session_refresh) instead of hitting a closed socket. The firing
+            # itself stays gated by _can_trigger (cooldown + pipeline-busy).
+            log_info(self, f'Trigger fired from: {source}')
+            msg = Bool()
+            msg.data = True
+            self.trigger_pub.publish(msg)
+            status = String()
+            status.data = f'triggered:{source}'
+            self.status_pub.publish(status)
+
+    def _session_is_open(self) -> bool:
+        """Thread-safe read of the session-open flag."""
+        with self._state_lock:
+            return self.session_open
 
     def _publish_health(self):
         """Publish wake-node health status for observability/diagnostics."""
+        with self._state_lock:
+            remaining = max(0.0, self.cooldown -
+                            (time.time() - self.last_trigger_time))
+            data = (
+                f'model_loaded={self.wake_model_loaded},'
+                f'last_score={self.last_wake_score:.2f},'
+                f'threshold={self.aletta_threshold:.2f},'
+                f'session_open={self.session_open},'
+                f'cooldown_remaining={remaining:.1f}s,'
+                f'false_accept_count={self.false_accept_count}')
         msg = String()
-        remaining = max(0.0, self.cooldown -
-                        (time.time() - self.last_trigger_time))
-        msg.data = (
-            f'model_loaded={self.wake_model_loaded},'
-            f'last_score={self.last_wake_score:.2f},'
-            f'threshold={self.aletta_threshold:.2f},'
-            f'session_open={self.session_open},'
-            f'cooldown_remaining={remaining:.1f}s,'
-            f'false_accept_count={self.false_accept_count}')
+        msg.data = data
         self.wake_health_pub.publish(msg)
 
     def _init_openwakeword(self):
@@ -641,6 +678,30 @@ class WakeWordNode(Node):
                       'Wake listener disabled — Aletta model did not load; '
                       'use pad buttons (F1/START/SELECT) to talk to the robot')
 
+    def _create_wake_socket(self):
+        """Create and bind the wake UDP socket, ensuring the 0.5s timeout."""
+        try:
+            sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            sock.bind(('', self.udp_port))
+            mreq = struct.pack(
+                '4s4s', socket.inet_aton(self.udp_multicast_group),
+                socket.inet_aton(self.udp_local_ip))
+            sock.setsockopt(
+                socket.IPPROTO_IP, socket.IP_ADD_MEMBERSHIP, mreq)
+            # CRITICAL: always (re)apply the read timeout so recovery paths
+            # cannot lose it and spin on blocking recvfrom.
+            sock.settimeout(0.5)
+            self._wake_socket = sock
+            log_info(self,
+                     'Aletta mic open on UDP '
+                     f'{self.udp_multicast_group}:{self.udp_port}')
+            return sock
+        except OSError as e:
+            log_error(self, f'Failed to bind wake-word socket: {e}')
+            self._wake_socket = None
+            return None
+
     def _wake_word_loop(self):
         # openWakeWord streams on 80 ms frames (1280 samples @16kHz).
         # Only this tiny ONNX model runs while waiting — Whisper/LLM/TTS stay
@@ -659,26 +720,8 @@ class WakeWordNode(Node):
         sock = None
         while rclpy.ok():
             if sock is None:
-                try:
-                    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-                    self._wake_socket = sock
-                    sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-                    # NOTE: no SO_REUSEPORT — on Linux it load-balances
-                    # datagrams across same-port sockets, starving the STT
-                    # socket (see stt_node).
-                    sock.bind(('', self.udp_port))
-                    mreq = struct.pack(
-                        '4s4s', socket.inet_aton(self.udp_multicast_group),
-                        socket.inet_aton(self.udp_local_ip))
-                    sock.setsockopt(
-                        socket.IPPROTO_IP, socket.IP_ADD_MEMBERSHIP, mreq)
-                    sock.settimeout(0.5)
-                    log_info(self,
-                             'Aletta mic open on UDP '
-                             f'{self.udp_multicast_group}:{self.udp_port}')
-                except OSError as e:
-                    log_error(self,
-                              f'Failed to bind wake-word socket: {e}')
+                sock = self._create_wake_socket()
+                if sock is None:
                     time.sleep(1.0)
                     continue
             audio = bytearray()
@@ -697,7 +740,7 @@ class WakeWordNode(Node):
                     # Idle wait: no open session — score only a short burst,
                     # then sleep. Keeps the wait state near zero CPU while
                     # still reacting to "Aletta" within ~a second.
-                    if not self.session_open:
+                    if not self._session_is_open():
                         burst_end = time.time() + self.idle_listen_burst_sec
                         burst = bytearray(data)
                         while time.time() < burst_end:
@@ -756,6 +799,9 @@ class WakeWordNode(Node):
                                 f'score={score:.2f})')
                             if self.session_open:
                                 self._in_session_refresh(score)
+                                # Immediately check if pending wake can fire
+                                # (handles boundary cases between busy/idle states).
+                                self._check_pending_wake()
                             else:
                                 self._fire_trigger('aletta_wake_word')
                             self.oww_detector.reset()
@@ -813,45 +859,30 @@ class WakeWordNode(Node):
 
     def _log_burst_telemetry(self):
         """Throttled idle-burst observability (missed-wake, 2026-10-16)."""
-        now = time.time()
-        peak = getattr(self.oww_detector, 'last_score', 0.0) or 0.0
-        try:
-            peak = float(peak)
-        except (TypeError, ValueError):
-            peak = 0.0
-        remaining = self.cooldown - (now - self.last_trigger_time)
-        if remaining > 0 and peak >= self.aletta_threshold * 0.5:
-            if now - self._blocked_by_cooldown_log >= 10.0:
-                self._blocked_by_cooldown_log = now
-                log_warn(self,
-                         'Wake-like audio during cooldown '
-                         f'(peak={peak:.2f}, fires in {remaining:.0f}s) - '
-                         'mic kept scoring, will fire at expiry if held')
-            return
-        if now - self._last_telemetry_log < self.telemetry_log_interval_sec:
-            return
-        self._last_telemetry_log = now
-        log_debug(
-            self, 'Wake idle burst: no detection '
-            f'(peak score={peak:.2f} vs threshold={self.aletta_threshold:.2f})')
+        with self._state_lock:
+            now = time.time()
+            peak = getattr(self.oww_detector, 'last_score', 0.0) or 0.0
+            try:
+                peak = float(peak)
+            except (TypeError, ValueError):
+                peak = 0.0
+            remaining = self.cooldown - (now - self.last_trigger_time)
+            if remaining > 0 and peak >= self.aletta_threshold * 0.5:
+                if now - self._blocked_by_cooldown_log >= 10.0:
+                    self._blocked_by_cooldown_log = now
+                    log_warn(self,
+                             'Wake-like audio during cooldown '
+                             f'(peak={peak:.2f}, fires in {remaining:.0f}s) - '
+                             'mic kept scoring, will fire at expiry if held')
+                return
+            if now - self._last_telemetry_log < self.telemetry_log_interval_sec:
+                return
+            self._last_telemetry_log = now
+            log_debug(
+                self, 'Wake idle burst: no detection '
+                f'(peak score={peak:.2f} vs threshold={self.aletta_threshold:.2f})')
 
-    def _resume_when_idle(self):
-        # Kept for the unit-test harness (test_wake_word_session drives the
-        # session/timeout logic through it). The live listener loop no longer
-        # pauses — the mic stays open during sessions (see _wake_word_loop) —
-        # so this only enforces the duration cap and logs the idle prompt.
-        if self.stt_busy or self.llm_busy:
-            return
-        # Enforce the session duration cap so a wake-opened session
-        # closes even if the mic path stalls, and the listener can resume.
-        if self.session_open:
-            self._check_session_timeout()
-        if self.session_open:
-            return
-        # NOTE (missed-wake, 2026-10-16): only *firing* is
-        # cooldown-gated (in _fire_trigger); the mic resumes immediately
-        # so a real "Aletta" held past expiry fires at expiry.
-        log_info(self, 'Pipeline idle — say "Aletta" or use pad')
+    # _resume_when_idle removed (dead code): mic stays open by design.
 
 
 def main(args=None):

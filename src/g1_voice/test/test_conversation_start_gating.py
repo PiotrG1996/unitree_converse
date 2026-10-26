@@ -149,6 +149,8 @@ class _FakeWakeNode:
         # Turn-in-flight guard (mirrors WakeWordNode.__init__).
         self.turn_in_flight = False
         self._turn_in_flight_since = 0.0
+        # Thread-safety lock (mirrors WakeWordNode.__init__).
+        self._state_lock = threading.RLock()
         # Publishers observed by the tests
         self.trigger_pub = _FakePub()
         self.status_pub = _FakePub()
@@ -218,6 +220,7 @@ class _FakeSttTriggerNode:
     def __init__(self):
         self.logged = []
         self.is_recording = False
+        self._recording_lock = threading.Lock()
         self._watchdog_lock = threading.Lock()
         self._watchdog = None
         # TTS echo-guard state (mirrors STTNode.__init__)
@@ -239,6 +242,8 @@ class _FakeSttTriggerNode:
         cls = _stt_module.STTNode
         self.trigger_callback = (
             lambda msg: cls.trigger_callback(self, msg))
+        self._retrigger = lambda: cls._retrigger(self)
+        self._try_start_recording = lambda: cls._try_start_recording(self)
         self._tts_echo_active = lambda: cls._tts_echo_active(self)
         self._echo_guard_remaining = (
             lambda: cls._echo_guard_remaining(self))
@@ -430,6 +435,48 @@ class TestSttTriggerConsumption(unittest.TestCase):
         self._drain()
         self.assertEqual(node.record_calls, [])
         self.assertEqual(node.delayed_calls, [])
+
+
+class TestSttRetriggerConsumption(unittest.TestCase):
+    """stt_node._retrigger: the always-on self-advance path is race-free."""
+
+    def _drain(self, seconds=0.1):
+        # _retrigger spawns daemon threads; give them a moment to run.
+        time.sleep(seconds)
+
+    def test_retrigger_starts_recording_when_idle(self):
+        node = _FakeSttTriggerNode()
+        node._retrigger()
+        self._drain()
+        self.assertEqual(len(node.record_calls), 1)
+
+    def test_retrigger_ignored_while_already_recording(self):
+        node = _FakeSttTriggerNode()
+        node.is_recording = True
+        node._retrigger()
+        self._drain()
+        self.assertEqual(node.record_calls, [])
+
+    def test_retrigger_race_only_one_recording(self):
+        # The lock must make the check-and-set atomic: even if two callers
+        # race, only one recording thread is spawned (Bug 4 fix). The mock
+        # recording target stays alive long enough (via the event) to keep
+        # is_recording=True through the race window.
+        node = _FakeSttTriggerNode()
+        node.recording_release = threading.Event()
+        node._record_and_transcribe = lambda: (
+            node.record_calls.append(1),
+            node.recording_release.wait(timeout=2.0))
+        node.recording_release.set()
+        t1 = threading.Thread(target=node._retrigger)
+        t2 = threading.Thread(target=node._retrigger)
+        t1.start()
+        t2.start()
+        t1.join(timeout=2.0)
+        t2.join(timeout=2.0)
+        # Let the spawned daemon recording thread finish appending.
+        time.sleep(0.1)
+        self.assertEqual(len(node.record_calls), 1)
 
 
 if __name__ == '__main__':

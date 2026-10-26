@@ -171,7 +171,8 @@ class STTNode(Node):
         self.normalize_audio = bool(self._param('normalize_audio'))
         self.tts_echo_guard_sec = float(self._param('tts_echo_guard_sec'))
 
-        self.is_recording = False
+        self._finish_recording()
+        self._recording_lock = threading.Lock()
         self.stop_requested = False
         self._transcript_published = False
         self.llm_busy = False
@@ -276,6 +277,25 @@ class STTNode(Node):
             log_info(self, 'Always-on mode — starting first listening turn')
             self._retrigger()
 
+    def _try_start_recording(self) -> bool:
+        """
+        Atomically claim the recording slot.
+
+        Returns True when this caller won the race and is responsible for
+        spawning the recording thread; False when a recording is already
+        in flight.
+        """
+        with self._recording_lock:
+            if self.is_recording:
+                return False
+            self.is_recording = True
+            return True
+
+    def _finish_recording(self):
+        """Release the recording slot taken by ``_try_start_recording``."""
+        with self._recording_lock:
+            self._finish_recording()
+
     def _retrigger(self):
         """
         Start a new listening turn directly (self-advance).
@@ -285,7 +305,7 @@ class STTNode(Node):
         start the recording thread the same way trigger_callback does, rather
         than publishing on a publisher we don't have.
         """
-        if self.is_recording:
+        if not self._try_start_recording():
             return
         log_info(self, 'Always-on — starting next listening turn')
         threading.Thread(
@@ -383,6 +403,11 @@ class STTNode(Node):
         with self._watchdog_lock:
             if self._watchdog is not None:
                 self._watchdog.cancel()
+        if not self._try_start_recording():
+            log_info(self,
+                     'Trigger became active while another recording won '
+                     'the race — deferring to the in-flight turn')
+            return
         threading.Thread(
             target=self._record_and_transcribe,
             daemon=True).start()
@@ -414,6 +439,11 @@ class STTNode(Node):
             with self._watchdog_lock:
                 if self._watchdog is not None:
                     self._watchdog.cancel()
+            if not self._try_start_recording():
+                log_info(self,
+                         'An in-flight recording won the race — '
+                         'deferring to the live turn')
+                return
             threading.Thread(
                 target=self._record_and_transcribe,
                 daemon=True).start()
@@ -579,7 +609,7 @@ class STTNode(Node):
             # no audio is an empty turn (counts toward max_empty_turns).
             self._publish_status('empty_turn')
             self._publish_status('idle')
-            self.is_recording = False
+            self._finish_recording()
             if self.continuous_mode:
                 self._schedule_self_retrigger()
             return
@@ -700,7 +730,7 @@ class STTNode(Node):
             # the session can still close crisply via max_empty_turns
             # instead of lingering until the duration cap.
             self._publish_status('empty_turn')
-            self.is_recording = False
+            self._finish_recording()
             if self.continuous_mode:
                 self._schedule_self_retrigger()
             return
@@ -714,7 +744,7 @@ class STTNode(Node):
             # only die on the 300s duration cap.
             self._publish_status('empty_turn')
         self._publish_status('idle')
-        self.is_recording = False
+        self._finish_recording()
         # Re-arm continuous listening after the turn ends.
         #
         # TTS owns the healthy handoff after a valid transcript (it publishes
