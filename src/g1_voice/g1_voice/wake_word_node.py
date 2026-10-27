@@ -550,10 +550,26 @@ class WakeWordNode(Node):
         with self._state_lock:
             self._touch_session()
             if not (self.stt_busy or self.llm_busy or self.tts_busy):
-                log_info(self,
-                         'Aletta during open session — starting new turn '
-                         f'(score={score:.2f})')
-                self._fire_trigger('aletta_wake_word')
+                # An intentional "Aletta" during an open session should start a
+                # turn right away. Cooldown throttles false accepts, but here the
+                # user explicitly invoked the wake word, so don't let a stale
+                # cooldown silently drop/queue the turn (which made STT never
+                # record). Respect turn-in-flight and busy flags only.
+                saved_last_trigger = self.last_trigger_time
+                self.last_trigger_time = 0.0
+                if self._can_trigger():
+                    log_info(self,
+                             'Aletta during open session — starting new turn '
+                             f'(score={score:.2f})')
+                    self._fire_trigger('aletta_wake_word')
+                else:
+                    self.last_trigger_time = saved_last_trigger
+                    log_info(self,
+                             'Aletta during open session — turn in flight, '
+                             f'queued (score={score:.2f})')
+                    self.pending_wake = True
+                    self._pending_wake_since = time.time()
+                    self._check_pending_wake()
             else:
                 log_info(self,
                          'Aletta heard during open session '

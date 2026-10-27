@@ -158,21 +158,16 @@ class ButtonTriggerNode(Node):
                 self._toggle_speak_enable()
             return
 
-        # F1 pressed (rising edge) → start recording, only in push-to-talk mode
-        if f1_now and not f1_prev and not self.continuous_mode:
+        # F1 pressed (rising edge) → start recording. Allowed in push-to-talk
+        # mode and during an open session so the user can force a turn.
+        if f1_now and not f1_prev:
             log_info(self, 'F1 held → start recording')
             self.recording_active = True
             self._publish_trigger(True)
             self._publish_status('recording')
 
-        # F1 released (falling edge) -> stop recording (only in push-to-talk
-        # mode). During an Aletta session F1 is fully suppressed: no stop is
-        # published, but a stale recording_active flag is still cleared so the
-        # button state cannot get stuck.
+        # F1 released (falling edge) -> stop recording and transcribe.
         if not f1_now and f1_prev and self.recording_active:
-            if self.continuous_mode:
-                self.recording_active = False
-                return
             log_info(self, 'F1 released → stop recording, transcribing...')
             self.recording_active = False
             self._publish_stop()

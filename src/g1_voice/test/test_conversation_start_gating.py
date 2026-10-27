@@ -335,36 +335,30 @@ class TestPadButtonGating(unittest.TestCase):
         self.assertTrue(node.stop_pub.published[0].data)
         self.assertFalse(node.recording_active)
 
-    def test_f1_suppressed_while_session_open_then_restored(self):
+    def test_f1_works_during_open_session(self):
         node = _FakeButtonNode()
-        # Aletta opened a session -> the button node learns it via the
-        # continuous_start topic and must suppress push-to-talk.
+        # Aletta opened a session — F1 is still allowed so the user can
+        # force a turn manually.
         node._on_continuous_start(_Msg(True))
         self.assertTrue(node.continuous_mode)
-        node.controller_callback(_Keys(F1_KEY))
-        self.assertEqual(
-            node.trigger_pub.published, [],
-            'F1 must not start a turn while an Aletta session is open')
-        self.assertFalse(node.recording_active)
-        # Session close re-arms push-to-talk.
-        node._on_continuous_stop(_Msg(True))
-        self.assertFalse(node.continuous_mode)
-        node.controller_callback(_Keys(0))  # release before next press
         node.controller_callback(_Keys(F1_KEY))
         self.assertEqual(len(node.trigger_pub.published), 1)
+        self.assertTrue(node.trigger_pub.published[0].data)
+        self.assertTrue(node.recording_active)
+        node.controller_callback(_Keys(0))
+        self.assertEqual(len(node.stop_pub.published), 1)
+        self.assertTrue(node.stop_pub.published[0].data)
+        self.assertFalse(node.recording_active)
 
-    def test_f1_release_ignored_while_session_open(self):
+    def test_f1_release_stops_during_open_session(self):
         node = _FakeButtonNode()
         node._on_continuous_start(_Msg(True))
         self.assertTrue(node.continuous_mode)
-        # Even if a recording were somehow active, releasing F1 must not
-        # emit a stop_recording during an Aletta session.
         node.recording_active = True
         node.prev_keys = F1_KEY
         node.controller_callback(_Keys(0))
-        self.assertEqual(
-            node.stop_pub.published, [],
-            'F1 release must not stop a turn while an Aletta session is open')
+        self.assertEqual(len(node.stop_pub.published), 1)
+        self.assertTrue(node.stop_pub.published[0].data)
         self.assertFalse(node.recording_active)
 
     def test_start_cannot_open_a_session(self):
