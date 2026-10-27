@@ -188,7 +188,7 @@ if [ "$ROS_FULL" != "1" ]; then
 elif ! command -v ros2 >/dev/null 2>&1; then
     info "ros2 not on PATH — source the workspace first"
 else
-    for t in /g1/stt/transcript /g1/robot_state llm_response /g1/tts/status; do
+    for t in /g1/stt/transcript /g1/robot_state /llm_response /g1/tts/status; do
         if timeout 8 ros2 topic list 2>/dev/null | grep -q "^${t}$"; then
             ok "topic present: $t"
         else
