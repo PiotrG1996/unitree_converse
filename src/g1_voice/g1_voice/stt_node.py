@@ -171,8 +171,9 @@ class STTNode(Node):
         self.normalize_audio = bool(self._param('normalize_audio'))
         self.tts_echo_guard_sec = float(self._param('tts_echo_guard_sec'))
 
-        self._finish_recording()
         self._recording_lock = threading.Lock()
+        self.is_recording = False
+        self._finish_recording()
         self.stop_requested = False
         self._transcript_published = False
         self.llm_busy = False
@@ -294,7 +295,7 @@ class STTNode(Node):
     def _finish_recording(self):
         """Release the recording slot taken by ``_try_start_recording``."""
         with self._recording_lock:
-            self._finish_recording()
+            self.is_recording = False
 
     def _retrigger(self):
         """
