@@ -186,6 +186,10 @@ class STTNode(Node):
         self.is_recording = False
         self._finish_recording()
         log_debug(self, 'Recording slot initialized (is_recording=False)')
+        # Turn correlation ID: incremented on every new recording turn so an
+        # operator can grep one turn's progression through STT logs
+        # (trigger -> audio captured -> transcript -> publish).
+        self._turn_seq = 0
         self.stop_requested = False
         self._transcript_published = False
         self.llm_busy = False
@@ -433,6 +437,7 @@ class STTNode(Node):
         """Handle an external /g1/voice/trigger message to start recording."""
         log_debug(
             self, 'Trigger callback',
+            turn_seq=getattr(self, '_turn_seq', 0),
             data=msg.data, is_recording=self.is_recording,
             tts_busy=self.tts_busy)
         if msg.data and not self.is_recording:
@@ -617,6 +622,9 @@ class STTNode(Node):
         return False
 
     def _record_and_transcribe(self):
+        # A new turn begins here: bump the correlation ID so every log line
+        # in this turn carries the same turn_seq.
+        self._turn_seq += 1
         self.is_recording = True
         self._transcript_published = False
         self._turn_had_transcript = False
@@ -624,6 +632,7 @@ class STTNode(Node):
         log_info(self, 'Recording started — capturing audio...')
         log_debug(
             self, 'Recording thread start',
+            turn_seq=getattr(self, '_turn_seq', 0),
             use_udp_mic=self.use_udp_mic,
             sample_rate=self.sample_rate,
             recording_duration=self.recording_duration)
@@ -635,6 +644,7 @@ class STTNode(Node):
 
         log_debug(
             self, 'Audio captured',
+            turn_seq=getattr(self, '_turn_seq', 0),
             bytes=len(audio_data) if audio_data is not None else 0,
             seconds=round((len(audio_data) if audio_data is not None else 0)
                           / (self.sample_rate * 2), 2))
@@ -742,10 +752,12 @@ class STTNode(Node):
                 else:
                     log_info(self,
                              f'Transcript: "{transcript}" '
-                             f'(avg_logprob={mean_logprob:.2f})')
+                             f'(avg_logprob={mean_logprob:.2f})',
+                             turn_seq=getattr(self, '_turn_seq', 0))
                     log_info(self,
                              'PUBLISHING /g1/stt/transcript with digest: '
-                             f'"{transcript[:80]}..."')
+                             f'"{transcript[:80]}..."',
+                             turn_seq=getattr(self, '_turn_seq', 0))
                     msg = String()
                     msg.data = (
                         f'[USER_LANGUAGE:{best_language}]\n{transcript}')
@@ -859,6 +871,7 @@ class STTNode(Node):
         if not self._has_speech(auto_segments):
             log_debug(
                 self, 'Language duel skipped — no speech in auto pass',
+                turn_seq=getattr(self, '_turn_seq', 0),
                 auto=detected or 'unknown',
                 probability=round(probability, 2))
             log_info(
@@ -926,6 +939,7 @@ class STTNode(Node):
         best_segments, best_info = candidates[best_language]
         log_debug(
             self, 'Language duel override',
+            turn_seq=getattr(self, '_turn_seq', 0),
             winner=best_language,
             auto=detected or 'unknown',
             auto_score=round(auto_score, 2),
