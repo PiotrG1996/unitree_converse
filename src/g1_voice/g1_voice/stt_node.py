@@ -65,10 +65,20 @@ def _preload_ctranslate2(logger=None):
 
 
 try:
-    from .node_logging import info as log_info, error as log_error, warn as log_warn
+    from .node_logging import (  # noqa: E501
+        debug as log_debug,
+        info as log_info,
+        error as log_error,
+        warn as log_warn,
+    )
 except ImportError:
     try:
-        from g1_voice.node_logging import info as log_info, error as log_error, warn as log_warn
+        from g1_voice.node_logging import (  # noqa: E501
+            debug as log_debug,
+            info as log_info,
+            error as log_error,
+            warn as log_warn,
+        )
     except ImportError:
         import os as _os
         import sys as _sys
@@ -76,6 +86,7 @@ except ImportError:
         _sys.path.insert(0, _os.path.dirname(_os.path.abspath(__file__)))
         import node_logging as _node_logging
 
+        log_debug = _node_logging.debug
         log_info = _node_logging.info
         log_error = _node_logging.error
         log_warn = _node_logging.warn
@@ -174,6 +185,7 @@ class STTNode(Node):
         self._recording_lock = threading.Lock()
         self.is_recording = False
         self._finish_recording()
+        log_debug(self, 'Recording slot initialized (is_recording=False)')
         self.stop_requested = False
         self._transcript_published = False
         self.llm_busy = False
@@ -288,14 +300,17 @@ class STTNode(Node):
         """
         with self._recording_lock:
             if self.is_recording:
+                log_debug(self, 'Recording slot claim refused — already recording')
                 return False
             self.is_recording = True
+            log_debug(self, 'Recording slot claimed')
             return True
 
     def _finish_recording(self):
         """Release the recording slot taken by ``_try_start_recording``."""
         with self._recording_lock:
             self.is_recording = False
+            log_debug(self, 'Recording slot released')
 
     def _retrigger(self):
         """
@@ -307,6 +322,7 @@ class STTNode(Node):
         than publishing on a publisher we don't have.
         """
         if not self._try_start_recording():
+            log_debug(self, 'Always-on retrigger deferred — slot already held')
             return
         log_info(self, 'Always-on — starting next listening turn')
         threading.Thread(
@@ -415,6 +431,10 @@ class STTNode(Node):
 
     def trigger_callback(self, msg: Bool):
         """Handle an external /g1/voice/trigger message to start recording."""
+        log_debug(
+            self, 'Trigger callback',
+            data=msg.data, is_recording=self.is_recording,
+            tts_busy=self.tts_busy)
         if msg.data and not self.is_recording:
             if self._tts_echo_active():
                 # The TTS _TURN_END handoff races playback start: queue a
@@ -422,6 +442,10 @@ class STTNode(Node):
                 # trigger (dropping stalls chained turns until the 15 s
                 # watchdog fires).
                 delay = self._echo_guard_remaining() + 0.2
+                log_debug(
+                    self, 'TTS echo guard active',
+                    guard_remaining_s=round(self._echo_guard_remaining(), 2),
+                    delay_s=round(delay, 2))
                 log_info(self,
                          f'Trigger deferred — TTS echo guard active '
                          f'(starting in {delay:.1f}s)')
@@ -598,11 +622,22 @@ class STTNode(Node):
         self._turn_had_transcript = False
         self._publish_status('recording')
         log_info(self, 'Recording started — capturing audio...')
+        log_debug(
+            self, 'Recording thread start',
+            use_udp_mic=self.use_udp_mic,
+            sample_rate=self.sample_rate,
+            recording_duration=self.recording_duration)
 
         if self.use_udp_mic:
             audio_data = self._record_via_udp()
         else:
             audio_data = self._record_via_sounddevice()
+
+        log_debug(
+            self, 'Audio captured',
+            bytes=len(audio_data) if audio_data is not None else 0,
+            seconds=round((len(audio_data) if audio_data is not None else 0)
+                          / (self.sample_rate * 2), 2))
 
         if audio_data is None or len(audio_data) == 0:
             log_warn(self, 'No audio recorded')
@@ -822,6 +857,10 @@ class STTNode(Node):
         # speech so the duel still runs (never lose a real turn to a missing
         # import).
         if not self._has_speech(auto_segments):
+            log_debug(
+                self, 'Language duel skipped — no speech in auto pass',
+                auto=detected or 'unknown',
+                probability=round(probability, 2))
             log_info(
                 self, 'No speech in auto pass '
                 f'(auto={detected or "unknown"} probability={probability:.2f}); '
@@ -885,6 +924,13 @@ class STTNode(Node):
             return auto_segments, auto_info
 
         best_segments, best_info = candidates[best_language]
+        log_debug(
+            self, 'Language duel override',
+            winner=best_language,
+            auto=detected or 'unknown',
+            auto_score=round(auto_score, 2),
+            best_score=round(best_score, 2),
+            margin=round(self.language_duel_override_margin, 2))
         log_info(self,
                  f'Duel: auto={detected or "unknown"} '
                  f'(probability={probability:.2f}) score={auto_score:.2f} | '

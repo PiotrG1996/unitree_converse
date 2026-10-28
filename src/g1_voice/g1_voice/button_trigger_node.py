@@ -23,10 +23,10 @@ SELECT_KEY = 8
 DEBOUNCE_TIME = 0.25  # seconds — de-bounce the switch but allow fast double-taps
 
 try:
-    from .node_logging import info as log_info, warning as log_warning
+    from .node_logging import info as log_info, warn as log_warn
 except ImportError:
     try:
-        from g1_voice.node_logging import info as log_info, warning as log_warning
+        from g1_voice.node_logging import info as log_info, warn as log_warn
     except ImportError:
         import os as _os
         import sys as _sys
@@ -35,7 +35,7 @@ except ImportError:
         import node_logging as _node_logging
 
         log_info = _node_logging.info
-        log_warning = _node_logging.warning
+        log_warn = _node_logging.warn
 
 
 class ButtonTriggerNode(Node):
@@ -224,7 +224,7 @@ class ButtonTriggerNode(Node):
     def _publish_say_text(self):
         text = (self.custom_say_text or '').strip()
         if not text:
-            log_warning(self, 'SELECT pressed but custom_say_text is empty')
+            log_warn(self, 'SELECT pressed but custom_say_text is empty')
             return
         msg = String()
         msg.data = text

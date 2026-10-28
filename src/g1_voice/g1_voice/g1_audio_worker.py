@@ -7,6 +7,20 @@ import time
 import traceback
 
 
+def _log(level, message, **fields):
+    """
+    Structured diagnostic to stderr, mirroring node_logging's key=value style.
+
+    g1_audio_worker is a standalone subprocess (no ROS node), so it cannot use
+    node_logging directly. This helper keeps its diagnostics parseable and
+    level-tagged so they can be grepped from journalctl/stderr alongside the
+    ROS nodes' output.
+    """
+    suffix = ''.join(f' {k}={v}' for k, v in fields.items())
+    print(f'[g1_audio_worker] {level.upper()}: {message}{suffix}',
+          file=sys.stderr, flush=True)
+
+
 def send_message(message):
     print(json.dumps(message), flush=True)
 
@@ -95,13 +109,11 @@ def main():
                     # call, running slower than realtime with gaps.
                     sleep_time = max(
                         0.0, len(chunk) / 32000.0 - send_time)
-                    print(
-                        f"Audio chunk: {len(chunk) / 32000.0:.2f}s; "
-                        f"PlayStream call: {send_time:.2f}s; "
-                        f"pacing sleep: {sleep_time:.2f}s",
-                        file=sys.stderr,
-                        flush=True,
-                    )
+                    _log(
+                        'debug', 'Audio chunk pacing',
+                        chunk_s=f'{len(chunk) / 32000.0:.2f}s',
+                        playstream_call_s=f'{send_time:.2f}s',
+                        pacing_sleep_s=f'{sleep_time:.2f}s')
                     time.sleep(sleep_time)
 
                 client.PlayStop(app_name)
@@ -114,7 +126,9 @@ def main():
                 raise
 
         except Exception as exc:
-            traceback.print_exc(file=sys.stderr)
+            _log(
+                'error', 'Command processing failed',
+                error=str(exc), traceback=traceback.format_exc())
             send_message({"ok": False, "error": str(exc)})
 
     try:

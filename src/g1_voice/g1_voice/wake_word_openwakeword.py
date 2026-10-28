@@ -163,6 +163,7 @@ class OpenWakeWordDetector:
             framework, melspec_model_path, embedding_model_path)
         self.model = None
         self._model_name = None
+        self.logger = None
         # Peak score from the most recent process() call — surfaced so the
         # node can log it and the threshold can be calibrated on the robot.
         self.last_score = 0.0
@@ -177,6 +178,7 @@ class OpenWakeWordDetector:
         Never raises. Any failure (missing model file, missing ``openwakeword``
         package, missing base feature models) is logged and returns ``False``.
         """
+        self.logger = logger
         if not self.model_path or not os.path.exists(self.model_path):
             self._log(logger, 'error',
                       'Aletta wake word model not found at '
@@ -253,7 +255,7 @@ class OpenWakeWordDetector:
             try:
                 self.model.reset()
             except Exception as exc:  # noqa: BLE001 - never crash the loop
-                logging.debug('openWakeWord reset failed: %s', exc)
+                self._log(self.logger, 'debug', f'openWakeWord reset failed: {exc}')
 
     def close(self):
         """Drop the loaded model so its memory can be reclaimed."""
