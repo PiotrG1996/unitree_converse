@@ -126,6 +126,20 @@ class TTSNode(Node):
                                os.path.expanduser('~/.local/piper-bin/piper'))
         self.declare_parameter('piper_lib_dir',
                                os.path.expanduser('~/.local/piper-bin'))
+        self.declare_parameter('log_level', 'INFO')
+
+        # Startup diagnostic dump: log every declared parameter so a boot-time
+        # failure (missing Piper model, wrong device, wrong voice) is
+        # diagnosable directly from the node's own log lines.
+        log_info(self, 'Startup parameters')
+        for _name in dir(self):
+            if _name.startswith('_') or _name == 'log_level':
+                continue
+            try:
+                log_info(self, f'  {_name}={self._param(_name)}')
+            except Exception:
+                continue
+
         # Piper speaking rate. 1.0 = the model's natural baseline; lower speaks
         # faster, higher speaks slower. Exposed as a parameter so "make it feel
         # faster" is a config tweak, not a code change.
