@@ -24,6 +24,16 @@ _CTRANSLATE2_LIB_DIRS = (
 )
 
 
+_LOG_LEVEL_MAP = {
+    'DEBUG': 10,
+    'INFO': 20,
+    'WARN': 30,
+    'WARNING': 30,
+    'ERROR': 40,
+    'FATAL': 50,
+}
+
+
 def _preload_ctranslate2(logger=None):
     """
     Preload a hand-built CUDA libctranslate2 by absolute path.
@@ -153,6 +163,9 @@ class STTNode(Node):
         # after), the mic hears its own Piper voice. The watchdog defers and
         # new triggers wait, mirroring the wake-word node's echo_guard_sec.
         self.declare_parameter('tts_echo_guard_sec', 2.0)
+        # Per-node log level (DEBUG/INFO/WARN/ERROR/FATAL). Default INFO keeps
+        # output quiet; set to DEBUG on the robot for turn-level tracing.
+        self.declare_parameter('log_level', 'INFO')
 
         self.model_size = self._param('model_size')
         self.language = self._param('language')
@@ -181,6 +194,7 @@ class STTNode(Node):
         self.vad_speech_pad_ms = int(self._param('vad_speech_pad_ms'))
         self.normalize_audio = bool(self._param('normalize_audio'))
         self.tts_echo_guard_sec = float(self._param('tts_echo_guard_sec'))
+        self.log_level = str(self._param('log_level'))
 
         self._recording_lock = threading.Lock()
         self.is_recording = False
@@ -190,6 +204,11 @@ class STTNode(Node):
         # operator can grep one turn's progression through STT logs
         # (trigger -> audio captured -> transcript -> publish).
         self._turn_seq = 0
+        # Apply the configured log level so DEBUG/INFO/WARN filtering takes
+        # effect for all node_logging calls (they delegate to the ROS logger).
+        _level = _LOG_LEVEL_MAP.get(self.log_level.upper(), 20)
+        self.get_logger().set_level(_level)
+        log_info(self, f'Log level set to {self.log_level.upper()}')
         self.stop_requested = False
         self._transcript_published = False
         self.llm_busy = False

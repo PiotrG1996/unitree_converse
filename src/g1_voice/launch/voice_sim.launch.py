@@ -1,6 +1,7 @@
 from launch import LaunchDescription
 from launch_ros.actions import Node
-from launch.actions import LogInfo
+from launch.actions import LogInfo, DeclareLaunchArgument
+from launch.substitutions import LaunchConfiguration
 from ament_index_python.packages import get_package_share_directory
 import os
 
@@ -10,7 +11,14 @@ def generate_launch_description():
     pkg_share = get_package_share_directory('g1_voice')
     params_file = os.path.join(pkg_share, 'config', 'voice_params.yaml')
 
+    log_level = LaunchConfiguration('log_level', default='INFO')
+
     return LaunchDescription([
+
+        DeclareLaunchArgument(
+            'log_level',
+            default_value='INFO',
+            description='ROS log level (DEBUG/INFO/WARN/ERROR/FATAL) applied to all nodes'),
 
         LogInfo(msg='Starting G1 voice pipeline (sim mode)...'),
 
@@ -21,6 +29,7 @@ def generate_launch_description():
             name='wake_word_node',
             output='screen',
             parameters=[params_file],
+            arguments=['--ros-args', '--log-level', log_level],
         ),
 
         # Speech to text
@@ -30,6 +39,7 @@ def generate_launch_description():
             name='stt_node',
             output='screen',
             parameters=[params_file],
+            arguments=['--ros-args', '--log-level', log_level],
         ),
 
         # LLM — using bob_llm
@@ -43,6 +53,7 @@ def generate_launch_description():
             name='llm_node',
             output='screen',
             parameters=[params_file],
+            arguments=['--ros-args', '--log-level', log_level],
         ),
 
         # Text to speech
@@ -52,6 +63,7 @@ def generate_launch_description():
             name='tts_node',
             output='screen',
             parameters=[params_file],
+            arguments=['--ros-args', '--log-level', log_level],
         ),
 
         # Gamepad SELECT → fixed-phrase speech via /g1/voice/say_text.
@@ -62,6 +74,7 @@ def generate_launch_description():
             name='button_trigger_node',
             output='screen',
             parameters=[params_file],
+            arguments=['--ros-args', '--log-level', log_level],
         ),
 
         # Robot state - enriches transcripts with battery/IMU/network context.
@@ -73,5 +86,6 @@ def generate_launch_description():
             name='robot_state_node',
             output='screen',
             parameters=[params_file],
+            arguments=['--ros-args', '--log-level', log_level],
         ),
     ])
