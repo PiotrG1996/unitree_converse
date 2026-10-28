@@ -220,6 +220,7 @@ class _FakeSttTriggerNode:
     def __init__(self):
         self.logged = []
         self.is_recording = False
+        self._last_trigger_time = 0.0
         self._recording_lock = threading.Lock()
         self._watchdog_lock = threading.Lock()
         self._watchdog = None
