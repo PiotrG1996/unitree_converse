@@ -1,30 +1,41 @@
 # unitree_converse
 
-Offline voice conversation for the **Unitree G1** humanoid ("Aletta"). Everything
-runs on the robot's Jetson Orin NX: wake word, speech recognition, LLM and speech
-synthesis, in English and Polish. No cloud service is involved; the robot works
-without internet.
+Spoken conversation for the **Unitree G1** humanoid, with and without internet:
 
-- **Say "Aletta"**: opens a conversation session. Turns chain automatically until
-  you press START, 4 turns in a row produce no transcript, or 5 minutes pass.
-  Inside a session you don't need to say "Aletta" again; if you do, the name is
-  cut off the recording (see [Cutting the name](#2-cutting-the-name-off-a-turn)).
-- **F1, robot online** (Unitree GPT answering): **press to switch to Aletta**
-  on the Jetson ("Switching to Aletta, one moment, please." … ~5 s while the
-  LLM loads … "Aletta is ready. How can I help you?", then just talk). Aletta
-  stays until the next **F1 press, which switches back to the Unitree GPT**
-  (~3 s plus a few seconds of its own start-up). Presses during a switch are
-  answered with "Still switching, please wait."
-- **Hold F1, robot offline**: push-to-talk for a single turn.
-- **START**: ends the session. Only "Aletta" can open one.
-- **F3** (labelled F2 on the pad): mutes or unmutes the spoken replies.
-- **SELECT**: speaks the fixed `custom_say_text` introduction.
+| Robot state | Who answers | Where it runs |
+|-------------|-------------|---------------|
+| **Online** (the G1 reports Wi-Fi/internet) | The **official Unitree GPT**: its own speech recognition, cloud LLM, male English voice and gestures | The robot's own computer; the Jetson pipeline idles and frees its LLM |
+| **Offline**, or **F1** pressed while online | **Aletta**: wake word, Whisper speech recognition, Ollama llama3.2, Piper voices, in English and Polish | Fully offline on the G1's Jetson Orin NX |
 
-Contents: [Stack](#hardware-and-software-stack) ·
-[How it works](#how-it-works) · [Configuration](#configuration) ·
-[Setup](#setup) · [Running](#running) · [Wake word](#wake-word) ·
-[Development history](#development-history) · [Known issues](#known-issues) ·
-[Future work](#future-work) · [Networking](#networking)
+Everything is one ROS 2 package, [`g1_voice`](src/g1_voice) (node, topic and
+parameter reference in its [README](src/g1_voice/README.md)), plus the
+[`bob_llm`](src/bob_llm) LLM node and the
+[wake-word training kit](src/wakeword_training) as submodules.
+
+**Online (Unitree GPT):**
+- Say **"Hey, robot, ..."**; it then answers follow-ups without the phrase.
+  "Aletta" is ignored, so false wakes can't interrupt it.
+- **F1** switches to Aletta: "Switching to Aletta, one moment, please." ... ~5 s
+  while the LLM loads ... "Aletta is ready. How can I help you?", then just talk.
+  The next **F1** switches back to the Unitree GPT (~3 s plus a few seconds of
+  its own start-up). Presses during a switch get "Still switching...".
+
+**Offline, or after F1 (Aletta):**
+- **Say "Aletta"**: opens a conversation session. Turns chain automatically
+  until you press START, 4 turns in a row produce no transcript, or 5 minutes
+  pass. Inside a session you don't need to say "Aletta" again; if you do, the
+  name is cut off the recording (see [Cutting the name](#2-cutting-the-name-off-a-turn)).
+- **Hold F1** (offline): push-to-talk for a single turn.
+- **START**: ends the session.
+
+**Always:** **F3** (labelled F2 on the pad) mutes or unmutes Aletta's replies;
+**SELECT** speaks the fixed `custom_say_text` introduction.
+
+Contents: [Stack](#hardware-and-software-stack) |
+[How it works](#how-it-works) | [Configuration](#configuration) |
+[Setup](#setup) | [Running](#running) | [Wake word](#wake-word) |
+[Development history](#development-history) | [Known issues](#known-issues) |
+[Future work](#future-work) | [Networking](#networking)
 
 ---
 
@@ -48,18 +59,16 @@ Contents: [Stack](#hardware-and-software-stack) ·
 
 ### Architecture
 
-![architecture](unitree_converse_architecture.svg)
-
 ```
 G1 mic (UDP multicast 239.168.123.161:5555, 16 kHz int16, 160 ms packets)
-  ├─ wake_word_node   openWakeWord "Aletta" ──── /g1/voice/trigger, /g1/wake/detected,
-  │                                              /g1/voice/continuous_start|stop, llm_reset
-  └─ stt_node         faster-whisper medium+small (GPU) ── /g1/stt/transcript  "[USER_LANGUAGE:xx]\n<text>"
-robot_state_node      + battery/IMU/network ──── llm_prompt
-llm_node (bob_llm)    Ollama llama3.2 3B ─────── llm_stream (deltas), llm_response (final)
-tts_node              Piper ── g1_audio_worker ── AudioHub PlayStream ── G1 speaker
-button_trigger_node   /wirelesscontroller ────── trigger / stop_recording / continuous_stop / speak_enable / say_text
-assistant_mode_node   /public_network_status, /gpt_state ── chat_go on/off, /g1/voice/assistant_mode
+  +- wake_word_node   openWakeWord "Aletta" ---- /g1/voice/trigger, /g1/wake/detected,
+  |                                              /g1/voice/continuous_start|stop, llm_reset
+  `- stt_node         faster-whisper medium+small (GPU) -- /g1/stt/transcript  "[USER_LANGUAGE:xx]\n<text>"
+robot_state_node      + battery/IMU/network ---- llm_prompt
+llm_node (bob_llm)    Ollama llama3.2 3B ------- llm_stream (deltas), llm_response (final)
+tts_node              Piper -- g1_audio_worker -- AudioHub PlayStream -- G1 speaker
+button_trigger_node   /wirelesscontroller ------ trigger / stop_recording / continuous_stop / speak_enable / say_text
+assistant_mode_node   /public_network_status, /gpt_state -- chat_go on/off, /g1/voice/assistant_mode
 ```
 
 Both `wake_word_node` and `stt_node` open their own socket on the same multicast
@@ -70,27 +79,27 @@ Nodes are started by [voice_real.launch.py](src/g1_voice/launch/voice_real.launc
 
 ### Topics
 
-| Topic | Type | Publisher → subscribers | Meaning |
+| Topic | Type | Publisher -> subscribers | Meaning |
 |-------|------|-------------------------|---------|
-| `/g1/voice/trigger` | Bool | wake word, F1, tts_node (next turn), stt watchdog → stt | Record one turn |
-| `/g1/voice/stop_recording` | Bool | F1 release → stt | End the recording now |
-| `/g1/voice/continuous_start` / `_stop` | Bool | wake word, START → stt, tts, wake word | Session opened / closed |
-| `/g1/wake/detected` | Float64 | wake word → stt | Wall-clock time of a detection (turn start, or name cut) |
+| `/g1/voice/trigger` | Bool | wake word, F1, tts_node (next turn), stt watchdog -> stt | Record one turn |
+| `/g1/voice/stop_recording` | Bool | F1 release -> stt | End the recording now |
+| `/g1/voice/continuous_start` / `_stop` | Bool | wake word, START -> stt, tts, wake word | Session opened / closed |
+| `/g1/wake/detected` | Float64 | wake word -> stt | Wall-clock time of a detection (turn start, or name cut) |
 | `/g1/wake/session_state` | String | wake word | `open` / `closed` |
-| `/g1/stt/status` | String | stt → wake word | `recording`, `transcribing`, `empty_turn`, `idle` |
-| `/g1/stt/transcript` | String | stt → robot_state, tts, wake word | `"[USER_LANGUAGE:en]\n<text>"` |
-| `llm_prompt` | String | robot_state → llm_node | Transcript plus `[ROBOT STATE]` block and reply-language instruction |
-| `llm_reset` | Bool | wake word → llm_node | Clear chat history (new session) |
-| `llm_stream` | String | llm_node → tts | Reply deltas as they are generated |
-| `llm_response` | String | llm_node → tts, stt, wake word | Final reply (ends the turn) |
-| `/g1/tts/status` | String | tts → stt, wake word | `speaking` / `idle` (echo guard) |
-| `/g1/voice/say_text` | String | SELECT, manual → tts | Speak exact text |
-| `/g1/voice/speak_enable` | Bool | F3 → tts | Mute / unmute |
+| `/g1/stt/status` | String | stt -> wake word | `recording`, `transcribing`, `empty_turn`, `idle` |
+| `/g1/stt/transcript` | String | stt -> robot_state, tts, wake word | `"[USER_LANGUAGE:en]\n<text>"` |
+| `llm_prompt` | String | robot_state -> llm_node | Transcript plus `[ROBOT STATE]` block and reply-language instruction |
+| `llm_reset` | Bool | wake word -> llm_node | Clear chat history (new session) |
+| `llm_stream` | String | llm_node -> tts | Reply deltas as they are generated |
+| `llm_response` | String | llm_node -> tts, stt, wake word | Final reply (ends the turn) |
+| `/g1/tts/status` | String | tts -> stt, wake word | `speaking` / `idle` (echo guard) |
+| `/g1/voice/say_text` | String | SELECT, manual -> tts | Speak exact text |
+| `/g1/voice/speak_enable` | Bool | F3 -> tts | Mute / unmute |
 | `/g1/robot_state` | String | robot_state | State block, every 30 s (diagnostics) |
-| `/g1/voice/assistant_mode` | String (latched) | assistant_mode → stt, wake word | `aletta` / `unitree`: who answers |
-| `/public_network_status`, `/gpt_state` | String | robot → assistant_mode | Robot internet state; Unitree assistant heartbeat |
-| `/api/robot_state/request` | unitree_api/Request | assistant_mode → robot | `ServiceSwitch` for `chat_go` |
-| `/audio_msg` | String | G1 audio board → stt, wake word | `{"play_state": 0}` / `1`: speaker state (echo guard); its ASR results are ignored |
+| `/g1/voice/assistant_mode` | String (latched) | assistant_mode -> stt, wake word | `aletta` / `unitree`: who answers |
+| `/public_network_status`, `/gpt_state` | String | robot -> assistant_mode | Robot internet state; Unitree assistant heartbeat |
+| `/api/robot_state/request` | unitree_api/Request | assistant_mode -> robot | `ServiceSwitch` for `chat_go` |
+| `/audio_msg` | String | G1 audio board -> stt, wake word | `{"play_state": 0}` / `1`: speaker state (echo guard); its ASR results are ignored |
 
 The language marker `[USER_LANGUAGE:pl|en]` is added by `stt_node` and travels
 with the text: `robot_state_node` turns it into an instruction for the LLM, and
@@ -109,15 +118,15 @@ sequenceDiagram
     U->>W: "Aletta"
     W->>L: llm_reset
     W->>S: continuous_start, wake/detected(t), trigger
-    S->>S: record from ring buffer at t − 0.35 s
+    S->>S: record from ring buffer at t - 0.35 s
     U->>S: "what's your battery?"
-    S->>S: endpoint → language ID → decode
-    S->>R: transcript "[USER_LANGUAGE:en]\n…"
+    S->>S: endpoint -> language ID -> decode
+    S->>R: transcript "[USER_LANGUAGE:en]\n..."
     R->>L: llm_prompt (+ [ROBOT STATE])
     L-->>T: llm_stream deltas
     T->>U: speaks each sentence as it completes
     L->>T: llm_response (end of turn)
-    T->>S: trigger (session open → next turn)
+    T->>S: trigger (session open -> next turn)
 ```
 
 #### 1. Trigger and recording (`stt_node`)
@@ -134,20 +143,20 @@ sequenceDiagram
   mute the mic forever.
 - **The answer's start is kept anyway.** People answer as soon as the robot
   stops, during the echo guard. The G1 mic's echo suppression leaves only a
-  faint tail (≤ 420 int16 RMS, measured) 0.1 s after the speaker stops, so a
+  faint tail (<= 420 int16 RMS, measured) 0.1 s after the speaker stops, so a
   turn that follows playback takes its audio from the ring buffer starting
   `echo_tail_sec` (0.3 s) after the speaker stopped. Before this, 8 of 11
   recorded turns began mid-sentence and Whisper invented the rest.
 - A background thread keeps the last 4 s of mic audio in a **ring buffer**. A
   turn opened by the wake word starts in that buffer 1.5 s before the
-  detection (`wake_audio_offset_sec`; the detector fires 0.3–1.0 s after the
+  detection (`wake_audio_offset_sec`; the detector fires 0.3-1.0 s after the
   word, later when people don't pause), so "Aletta, what's your battery?"
   works in one breath; the name is then cut at the pause after it (below).
 - The **endpointer** (`logic.Endpointer`) decides when the turn ends, from
   per-packet RMS smoothed with a 5-packet median:
-  - speech starts after 0.2 s above `speech_start_threshold` (0.02 ≈ 655
-    int16 RMS: room ~150, the robot's echo tail ≤ 420, a person talking to
-    the robot 1,000–4,200), so noise, a click or the echo can't start a turn;
+  - speech starts after 0.2 s above `speech_start_threshold` (0.02 ~ 655
+    int16 RMS: room ~150, the robot's echo tail <= 420, a person talking to
+    the robot 1,000-4,200), so noise, a click or the echo can't start a turn;
   - once started, anything above `silence_threshold` (0.010) still counts as
     speech, so quiet word endings aren't cut;
   - with no speech for 8 s the turn is empty;
@@ -159,23 +168,23 @@ sequenceDiagram
 
 Inside a session people say "Aletta" again before each question, while a turn is
 already recording. Whisper mishears the name and merges it into the question
-("Aletta, what is two times two" → "All that for both is two times two"; a lone
-"Aletta" → "stream."). `wake_word_node` therefore reports detections made during
+("Aletta, what is two times two" -> "All that for both is two times two"; a lone
+"Aletta" -> "stream."). `wake_word_node` therefore reports detections made during
 a recording on `/g1/wake/detected`, and `stt_node` cuts the audio
 (`logic.name_cut`):
 
-- the wake model scores one "Aletta" twice, ~1.1–1.3 s apart (its window
+- the wake model scores one "Aletta" twice, ~1.1-1.3 s apart (its window
   still holds the word after a reset), so `wake_word_node` ignores hits within
   `refractory_sec` (1.5 s) of the last one, and `stt_node` never treats a
   detection within 1.5 s of the turn-starting one as a new name. Before this
   fix the repeat was taken as the name and the cut removed the start of the
-  question ("[ile to je]st 2 razy…");
+  question ("[ile to je]st 2 razy...");
 - only the first detection inside the recording counts, and only if it falls
   within `wake_trim_max_sec` (1.5 s) of the speech onset; a later detection is
   the model misfiring on the question itself;
 - the cut is placed `wake_trim_offset_sec` (0.2 s) before the detection, which
-  lands in the pause after the name (the detector lag varies 0.27–0.6 s);
-- the cut is then moved back to the end of a real pause (≥ 100 ms below
+  lands in the pause after the name (the detector lag varies 0.27-0.6 s);
+- the cut is then moved back to the end of a real pause (>= 100 ms below
   `silence_threshold`, `logic.snap_cut_to_pause`), or not made at all: when
   people don't pause, the score peaks up to ~1 s after the name, inside the
   question (all 4 cuts in the second live test landed in speech). Keeping the
@@ -186,7 +195,7 @@ a recording on `/g1/wake/detected`, and `stt_node` cuts the audio
 #### 3. Language and transcription (`logic.choose_transcription`)
 
 - **Vocabulary hint:** English decodes get a Whisper `initial_prompt` of
-  robot/lab words (Aletta, Unitree G1, battery, ROS 2, nodes, …; words only,
+  robot/lab words (Aletta, Unitree G1, battery, ROS 2, nodes, ...; words only,
   never example questions). A transcript that only repeats the hint is
   dropped (`logic.echoes_prompt`). Polish has no hint by default (it fixed
   nothing on recorded Polish turns and once echoed itself).
@@ -199,7 +208,7 @@ a recording on `/g1/wake/detected`, and `stt_node` cuts the audio
   | `small` + hint | 0.47 + 0.67 s | ~1.5 / 5 |
   | `medium` int8 + hint | 1.25 + 1.6 s | 4 / 5 |
   | `medium` int8 + hint, `language_id_model: small` | 0.47 + 1.6 s | 4 / 5 |
-  | `large-v3-turbo` int8 | – + 2.2 s | 1 / 5 |
+  | `large-v3-turbo` int8 | - + 2.2 s | 1 / 5 |
 
   The robot runs the last `medium` row (`model_size: "medium"`, `compute_type:
   "int8_float16"`, `language_id_model: "small"`): both models load in ~12 s,
@@ -207,8 +216,8 @@ a recording on `/g1/wake/detected`, and `stt_node` cuts the audio
   "small"`, `compute_type: ""`, `language_id_model: ""`.
 
 - One language-ID pass (~0.5 s) gives Whisper's probabilities.
-  `logic.pick_language` accepts English when p(en) ≥ 0.25 and ≥ 10× p(pl), and
-  Polish when p(pl) ≥ 0.2 and ≥ 2× p(en). The rules are asymmetric because
+  `logic.pick_language` accepts English when p(en) >= 0.25 and >= 10x p(pl), and
+  Polish when p(pl) >= 0.2 and >= 2x p(en). The rules are asymmetric because
   Whisper detects English reliably on this mic but scores short Polish phrases
   as hi/zh/en.
 - Then one decode (~0.7 s, beam 5, temperature 0, Silero VAD filter) in that
@@ -217,12 +226,12 @@ a recording on `/g1/wake/detected`, and `stt_node` cuts the audio
   the better-scoring non-hallucination wins.
 - Filters (`logic.keep_segment`), tuned on recorded G1 turns:
   - `no_speech_prob` > 0.85: dropped;
-  - `avg_logprob` < −1.0 (`min_avg_logprob`): dropped. Real turns decoded at
-    −0.66 to −0.88, invented ones ("God bless you all, God bless you all") at
-    −1.01 to −1.22;
-  - `no_speech_prob` > 0.5 *and* `avg_logprob` < −0.7 (Whisper's combined
+  - `avg_logprob` < -1.0 (`min_avg_logprob`): dropped. Real turns decoded at
+    -0.66 to -0.88, invented ones ("God bless you all, God bless you all") at
+    -1.01 to -1.22;
+  - `no_speech_prob` > 0.5 *and* `avg_logprob` < -0.7 (Whisper's combined
     rule, `noisy_*`): dropped. Distant talk and noise ("That's the end of the
-    episode…") scored 0.58–0.65 / −0.79 to −0.93, real turns 0.04–0.27;
+    episode...") scored 0.58-0.65 / -0.79 to -0.93, real turns 0.04-0.27;
   - `logic.looks_like_noise` rejects phrase loops, non-Latin script and
     subtitle phrases ("Thanks for watching", "see you in the next video");
   - a transcript that is only the name is ignored.
@@ -238,7 +247,7 @@ a recording on `/g1/wake/detected`, and `stt_node` cuts the audio
   charging, health, orientation, motion mode, network, local time, uptime)
   and an instruction to answer in the user's language. When the user asks
   about the software (`logic.asks_about_system`: nodes, topics, parameters,
-  settings, models, thresholds, modes…) it adds the ROS graph, the assistant
+  settings, models, thresholds, modes...) it adds the ROS graph, the assistant
   mode, key settings and **every parameter whose name matches the question**
   (`logic.match_parameters`). It lists and reads *all* parameters of the
   pipeline nodes (about 100) through their ROS parameter services every 30 s.
@@ -260,16 +269,16 @@ a recording on `/g1/wake/detected`, and `stt_node` cuts the audio
   (`logic.split_complete_sentences`); the first piece may end at a comma once
   it has 5 words (`first_clause_words`), so speech starts sooner.
 - A synthesis thread feeds each sentence to a **persistent Piper process**
-  (`--json-input`, one per voice, warmed up at start; 0.1–0.5 s per sentence),
-  resamples 22.05 kHz → 16 kHz (polyphase), and queues it; a playback thread
+  (`--json-input`, one per voice, warmed up at start; 0.1-0.5 s per sentence),
+  resamples 22.05 kHz -> 16 kHz (polyphase), and queues it; a playback thread
   plays the previous sentence meanwhile.
 - Playback goes through `g1_audio_worker.py`, a **separate process** that owns
   `unitree_sdk2py` (it brings its own DDS participant) and speaks a one-line
-  JSON protocol over stdin/stdout. Playback has a timeout of 15 s + 2× the
+  JSON protocol over stdin/stdout. Playback has a timeout of 15 s + 2x the
   audio length; after a failure the rest of the reply is skipped and the
   worker restarts.
 - When the reply ends during a session, `tts_node` triggers the next turn.
-  `Reply timing:` logs transcript → first token and → first audio.
+  `Reply timing:` logs transcript -> first token and -> first audio.
 
 ### The session state machine
 
@@ -298,11 +307,11 @@ Measured on the robot (journal of 21 Nov 2026):
 | Stage | Time |
 |-------|------|
 | End-of-speech wait (trailing silence) | 1.28 s |
-| Language ID | 0.50–0.54 s |
-| Whisper decode | 0.67–0.74 s |
-| LLM first token after transcript | 0.30–0.68 s |
-| First audio after transcript | 0.60–1.75 s |
-| **End of speech → robot starts talking** | **≈ 3–4 s** |
+| Language ID | 0.50-0.54 s |
+| Whisper decode | 0.67-0.74 s |
+| LLM first token after transcript | 0.30-0.68 s |
+| First audio after transcript | 0.60-1.75 s |
+| **End of speech -> robot starts talking** | **~ 3-4 s** |
 
 About 40 % of that is the fixed end-of-speech wait; see [Future work](#future-work).
 
@@ -323,6 +332,8 @@ About 40 % of that is the fixed end-of-speech wait; see [Future work](#future-wo
 
 ### Code layout (`src/g1_voice/g1_voice/`)
 
+Per-node topics and all parameters: [src/g1_voice/README.md](src/g1_voice/README.md).
+
 | File | Role |
 |------|------|
 | `logic.py` | ROS-free logic: language markers, sentence splitting, Whisper filters and the language duel, `Endpointer`, `name_cut` / `has_speech`, the `Session` state machine, system summaries, finding the robot network by IP. Fully unit-tested. |
@@ -341,8 +352,9 @@ Other parts of the repository:
 |------|----------|
 | `src/bob_llm/` | Submodule: ROS 2 LLM node (fork with `llm_reset`, stream retry policy, bounded history) |
 | `src/wakeword_training/` | Submodule: "Aletta" data, training and evaluation scripts, models |
-| `scripts/` | Health checks (`check_audio.sh`, `check_pipeline.sh`), benchmarks (`bench_stt.py`, `bench_llm.py`, `bench_whisper_gpu.py`), `test_mic_live.py`, Wi-Fi watchdog, service start gate, links to the wake-word scripts |
+| `scripts/` | Health checks (`check_audio.sh`, `check_pipeline.sh`), benchmarks (`bench_stt.py`, `bench_llm.py`, `bench_whisper_gpu.py`), `test_mic_live.py`, Wi-Fi watchdog, service start gate, links to the wake-word scripts (they always save into `src/wakeword_training`, wherever they are run from) |
 | `setup.sh`, `source_ros.sh` | Installation and environment |
+| `LICENSE` | MIT |
 | `*.service` | systemd units |
 
 ---
@@ -361,7 +373,7 @@ node defaults live in the source. The most important ones:
 | stt_node | `language` | auto | Or `en` / `pl` to skip language ID |
 | stt_node | `speech_start_threshold` | 0.02 | RMS needed to start a turn |
 | stt_node | `silence_threshold` | 0.010 | RMS that still counts as speech once started |
-| stt_node | `min_avg_logprob`, `noisy_no_speech_prob`, `noisy_min_avg_logprob` | −1.0, 0.5, −0.7 | Confidence filters for Whisper segments |
+| stt_node | `min_avg_logprob`, `noisy_no_speech_prob`, `noisy_min_avg_logprob` | -1.0, 0.5, -0.7 | Confidence filters for Whisper segments |
 | stt_node | `echo_tail_sec` | 0.3 | A turn after playback starts this long after the speaker stopped |
 | stt_node | `silence_duration` | 1.2 | Trailing silence that ends a turn (s) |
 | stt_node | `max_wait_for_speech`, `recording_duration` | 8, 10 | Empty-turn timeout; max utterance (s) |
@@ -396,7 +408,8 @@ cd unitree_converse
 `setup.sh` does the following:
 
 - installs Python packages, the Piper voices (en_US-lessac, pl_PL-gosia),
-  Whisper `small` and the openWakeWord models;
+  Whisper `medium` and `small` (both cached, so the first start needs no
+  internet) and the openWakeWord models;
 - on the robot, installs the Piper binary to `~/.local/piper-bin`;
 - installs Ollama with the tuned [ollama.service](ollama.service) and pulls
   `llama3.2`;
@@ -479,8 +492,8 @@ Set `debug_audio_dir: ""` to turn it off. The recordings contain people's
 voices; don't copy them off the robot without consent.
 
 Reference levels on the G1 mic (int16 RMS): quiet room about 170 (99th
-percentile about 350), a person talking nearby 3000–4500, the robot's own
-speaker as heard by its mic 1100–1500, before the echo suppression mutes it.
+percentile about 350), a person talking nearby 3000-4500, the robot's own
+speaker as heard by its mic 1100-1500, before the echo suppression mutes it.
 
 ---
 
@@ -494,8 +507,12 @@ about 1 s *after* the word.
 Training data, scripts and models are in the
 [`src/wakeword_training`](src/wakeword_training) submodule: synthesize clips with
 Piper, **record real positives and negatives** on the robot, train, then
-evaluate on real clips before you deploy. `setup.sh` copies
-`models/aletta_v0.1.onnx` to `~/.local/share/openwakeword/`.
+evaluate on real clips before you deploy. The submodule holds 460 positive
+clips (60 recorded on the robot) and 930 negatives, and models v0.1-v0.4. The
+scripts default to the submodule's own `data/aletta` and `models` folders
+(also through the `scripts/` links in this repo). `setup.sh` copies
+`models/aletta_v0.1.onnx` to `~/.local/share/openwakeword/`; v0.2-v0.4 are
+candidates that must pass `eval_real_separation.py` before deployment.
 
 Runtime guards (all in the YAML):
 
@@ -538,10 +555,10 @@ How it works:
   plain ROS messages on `/api/robot_state/request`. Switching off takes
   ~0.1 s, on ~3 s. The service list keeps reporting status 0 either way, so
   the node judges by `/gpt_state`, which `chat_go` publishes every ~5 s
-  (`{"state": true, "llm_name": "clound", "chat_state": …}`).
+  (`{"state": true, "llm_name": "clound", "chat_state": ...}`).
 - **Internet:** the robot's own `/public_network_status`
   (`{"network_status": "NetworkStatus.ON_WIFI_CONNECTED"}`); any
-  `…_CONNECTED` counts as online, and no report for 30 s counts as offline.
+  `..._CONNECTED` counts as online, and no report for 30 s counts as offline.
   While the state is undecided (just started, just came online) nothing is
   switched, so the service is never turned off and straight back on.
 - **Handover:** the mode is published latched on `/g1/voice/assistant_mode`
@@ -566,14 +583,14 @@ How it works:
   "Aletta" opens an Aletta session even online; `chat_go` is switched off
   (~0.1 s) until the session closes, then on again (~3 s; say "Hey, robot"
   again, its conversation restarts).
-- **How Unitree's GPT works** (recorded 21 Nov): it reacted to "Hey, robot, …"
+- **How Unitree's GPT works** (recorded 21 Nov): it reacted to "Hey, robot, ..."
   and then answered every follow-up without the phrase ("Hey, tell me what
   time is it" alone got no reaction), so it seems to have its own wake phrase
   and conversation mode. For each question a Unitree process sends the
   recorded speech to `chat_go` (`/api/gpt/request`, api 1018, MP3 in base64:
   "speech request success"); `chat_go` sends body-language commands on
   `/gpt_cmd` and plays the answer as app `gpt` (`PlayStream`). The node logs
-  `Unitree GPT: question received (… kB of speech)` for each question.
+  `Unitree GPT: question received (... kB of speech)` for each question.
 - **`chat_state` is not an on/off switch:** it went `false` at 18:16:14 while
   `chat_go` went on answering six questions, so it is ignored. `"state":
   false, "llm_name": "no"` also appears for ~5 s every ~33 s (cloud
@@ -587,8 +604,8 @@ How it works:
 What else was measured (passive DDS monitor, 21 Nov 2026):
 
 - Unitree's offline ASR transcribes everything the mic hears, without a wake
-  word, on `/audio_msg` (`{"text": …, "language": "<|ja|>", …}`), guessing
-  freely between languages: Polish "Aletta" came out as Japanese "アレさん。".
+  word, on `/audio_msg` (`{"text": ..., "language": "<|ja|>", ...}`), guessing
+  freely between languages: Polish "Aletta" came out as Japanese text ("are-san").
   This project never uses these results; its own language set is fixed to
   Polish and English (`logic.LANGUAGES`).
 - `chat_go` speaks by sending `PlayStream` audio as app **`gpt`**. In the
@@ -598,7 +615,7 @@ What else was measured (passive DDS monitor, 21 Nov 2026):
   error 3104) and muting the `vui` volume (it is the same master volume as
   AudioHub, so it mutes Aletta too).
 - `AudioClient.TtsMaker(text, speaker_id)` (Unitree's built-in TTS) works:
-  speech starts 0.2–0.5 s after the call and calls queue, but there is no
+  speech starts 0.2-0.5 s after the call and calls queue, but there is no
   Polish voice, and the Python SDK never changes the request `index`, so
   every call after the first is ignored unless the index is set by hand.
 
@@ -620,15 +637,15 @@ November 2026 review. All numbers below were measured on the robot.
 
 | Area | Before | Now |
 |------|--------|-----|
-| Speech recognition | Whisper `base` on CPU: about 1.2 s per 5 s clip; misheard "Aletta, what is…" as "A letter…" | Whisper `medium` (int8) with `small` for language ID, on the GPU: about 2.1 s per turn (language ID + decode), 4/5 clean questions right vs 1/5 with `small` alone |
+| Speech recognition | Whisper `base` on CPU: about 1.2 s per 5 s clip; misheard "Aletta, what is..." as "A letter..." | Whisper `medium` (int8) with `small` for language ID, on the GPU: about 2.1 s per turn (language ID + decode), 4/5 clean questions right vs 1/5 with `small` alone |
 | Question cut off | The 10 s limit started when the turn opened; a question begun 8 s in was cut after 2 s | The 10 s limit starts when you start talking (it waits up to 8 s for you) and keeps 1 s from just before |
 | Wake word "Aletta" | Fired 6 s late or not at all: the loudness check looked at the current frame, but the score peaks about 1 s *after* the word | Fires about 1.5 s after the word; the loudness check looks back 2 s |
-| Reply speed | Piper restarted for every sentence (0.62 s); first reply took 2.9 s | Piper keeps running (0.1–0.5 s per sentence) and warms up at start; first audio 0.6–1.75 s after the transcript |
-| Hallucination filter | ASCII only; a question said twice was dropped; "ご視聴ありがとうございました" reached the LLM | Unicode-aware (Polish); only 3+ repeats count as a Whisper loop; non-Latin text and subtitle phrases ("Thanks for watching", "Amara.org") are dropped |
-| Misheard turns derailing answers | A garbled turn ("I na peryski 2x2") stayed in the LLM history, and "ile to jest 2x2?" was then answered with a made-up "2 m × 2 m periscope plate" | Each question is answered on its own (`max_history_length: 1`); bob_llm also resets on every new "Aletta" session (`llm_reset`). The prompt says: ask to repeat when a message is garbled, never claim to have moved. |
+| Reply speed | Piper restarted for every sentence (0.62 s); first reply took 2.9 s | Piper keeps running (0.1-0.5 s per sentence) and warms up at start; first audio 0.6-1.75 s after the transcript |
+| Hallucination filter | ASCII only; a question said twice was dropped; the Japanese "thanks for watching" subtitle reached the LLM | Unicode-aware (Polish); only 3+ repeats count as a Whisper loop; non-Latin text and subtitle phrases ("Thanks for watching", "Amara.org") are dropped |
+| Misheard turns derailing answers | A garbled turn ("I na peryski 2x2") stayed in the LLM history, and "ile to jest 2x2?" was then answered with a made-up "2 m x 2 m periscope plate" | Each question is answered on its own (`max_history_length: 1`); bob_llm also resets on every new "Aletta" session (`llm_reset`). The prompt says: ask to repeat when a message is garbled, never claim to have moved. |
 | Name garbling in-session questions | "Aletta, what is two times two" became "All that for both is two times two"; a lone "Aletta" became "stream." and got a reply. Detections during a recording were dropped | The name is cut off the turn's audio using the wake detection time; a turn with only the name is dropped |
 | Off-topic replies | The prompt carried battery current, temperature and cycles, which the LLM volunteered | Only battery %, charging and health |
-| Session bookkeeping | Relied on `/g1/llm/status`, which nothing published, so every session counted as a false wake | Uses transcript → `llm_response`; busy flags expire after 60 s |
+| Session bookkeeping | Relied on `/g1/llm/status`, which nothing published, so every session counted as a false wake | Uses transcript -> `llm_response`; busy flags expire after 60 s |
 
 **Robustness**
 
@@ -642,9 +659,10 @@ November 2026 review. All numbers below were measured on the robot.
 | Wi-Fi | Not monitored | `wifi-watchdog.service`: checks internet through `wlan0`, reconnects, switches network, resets the radio and reloads the driver |
 | Ollama tuning | The tuned unit was never installed and used an ignored variable | Installed by `setup.sh`: model stays loaded, `OLLAMA_CONTEXT_LENGTH=2048`, OOM protection |
 
-**Codebase:** the `g1_voice` code shrank from about 4,400 to about 2,500 lines. The
-pure logic lives in `logic.py`; the package has about 95 unit tests plus flake8
-and pep257 checks.
+**Codebase:** the `g1_voice` package has about 3,500 lines (about 4,400 before
+the review, although the Unitree GPT mode, F1 switching, name cut and filters
+were added since). The pure logic lives in `logic.py`; about 150 unit tests,
+many using timings and scores recorded on the robot, plus flake8 and pep257.
 
 ---
 
@@ -654,14 +672,14 @@ and pep257 checks.
 |---------|-------------|
 | Follow-ups like "A trzy razy trzy?" get "please repeat" | No earlier turns are sent to the LLM, because misheard turns derailed later answers. Ask complete questions. To allow follow-ups, raise `max_history_length` (each "Aletta" session still starts fresh). |
 | A male English voice answers too, before or alongside Aletta | Unitree's built-in assistant (`chat_go`, plays as app `gpt`). With `unitree_assistant: off` (default) `assistant_mode_node` switches it off; check the log for `switched OFF`. See [Unitree's built-in assistant](#unitrees-built-in-assistant). |
-| Accented English is misheard ("two times three" → "tool time is free") | Whisper `small` on the far-field mic. `medium` and `large-v3-turbo` were tested on the same recordings: neither was better overall, and both are 4–6× slower (2.7–4.2 s per turn). Polish is recognized well. |
-| Aletta wakes on speech that isn't her name | The deployed `aletta_v0.1` does not separate the name from other speech: `eval_real_separation.py` scores real negatives (median 0.993) as high as real positives (gap −0.175, "Do NOT deploy"). It also fires right after some questions. Wake is effectively speech plus the `min_rms` gate and cooldowns. Record more real negatives and retrain. |
+| Accented English is misheard ("two times three" -> "tool time is free") | Whisper `small` on the far-field mic. `medium` and `large-v3-turbo` were tested on the same recordings: neither was better overall, and both are 4-6x slower (2.7-4.2 s per turn). Polish is recognized well. |
+| Aletta wakes on speech that isn't her name | The deployed `aletta_v0.1` does not separate the name from other speech: `eval_real_separation.py` scores real negatives (median 0.993) as high as real positives (gap -0.175, "Do NOT deploy"). It also fires right after some questions. Wake is effectively speech plus the `min_rms` gate and cooldowns. Record more real negatives and retrain. |
 | A one-syllable answer ("Tak.") is missed | The endpointer needs 0.2 s of smoothed speech above `speech_start_threshold`; a very short word doesn't reach it. Answer with a few words. |
-| A quiet or distant speaker is ignored | A turn needs RMS 0.02 (≈ 655) to start, which keeps noise and distant talk out. Speak within ~1 m, or lower `speech_start_threshold` (at 0.010 noise started turns). |
+| A quiet or distant speaker is ignored | A turn needs RMS 0.02 (~ 655) to start, which keeps noise and distant talk out. Speak within ~1 m, or lower `speech_start_threshold` (at 0.010 noise started turns). |
 | Polish answers are sometimes wrong or ungrammatical ("Trzy razy trzy to piętnastu") | llama3.2 3B is weak in Polish. A stronger multilingual or Polish model would help. |
 | A pause after "Aletta" splits the question | The turn ends after 1.2 s of silence. The name-only part is dropped and the next turn starts at once, but words said in that gap can be lost. Say the question in one breath. |
 | `No microphone audio received`, TTS `PlayStream returned 3102`, `ping 192.168.123.161` fails | The robot IP `192.168.123.164` is on the wrong Ethernet port. Pin the `unitree1` profile to the built-in port by MAC (see [Robot network port](#robot-network-port)). If .161 still doesn't answer, the robot is off. |
-| `unregister_netdevice: waiting for eth0 to become free`, `ip addr` hangs | The USB Ethernet dongle dropped off the bus (`r8152 … Tx status -71`) and the kernel can't release it. Only a reboot clears it. Run without the dongle; Wi-Fi provides internet. |
+| `unregister_netdevice: waiting for eth0 to become free`, `ip addr` hangs | The USB Ethernet dongle dropped off the bus (`r8152 ... Tx status -71`) and the kernel can't release it. Only a reboot clears it. Run without the dongle; Wi-Fi provides internet. |
 | DDS fails at boot | `cyclonedds.xml` must bind `address="192.168.123.164"`, not an interface name. |
 | Battery `unknown` | `BmsState` comes from `unitree_hg` and needs RELIABLE QoS (already set). |
 | No SSH over Wi-Fi | AP isolation: use Ethernet (`192.168.123.164`). |
@@ -679,16 +697,16 @@ so a change can be accepted or rejected on numbers from the robot.
    other speech. Record a larger set of real negatives on the robot (lab
    conversations, the robot's own voice, Polish speech), retrain, and deploy
    only a model with a positive separation gap in `eval_real_separation.py`.
-   Evaluate the v0.2–v0.4 candidates the same way first.
+   Evaluate the v0.2-v0.4 candidates the same way first.
    *Measure:* false wakes per hour of background talk; misses per 100 "Aletta".
 2. **Shorter end-of-speech wait.** The fixed 1.2 s silence is about 40 % of the
    response time. Endpoint on the Silero VAD speech probability instead of RMS,
    with a shorter silence after a falling intonation or a complete sentence,
-   and keep 1.2 s as the fallback. *Target:* −0.5 s per turn without cutting off
+   and keep 1.2 s as the fallback. *Target:* -0.5 s per turn without cutting off
    slow speakers.
 3. **Drop the separate language-ID pass.** Lock the language for the rest of a
    session once a turn is confidently identified, or reuse the encoder output
-   for detection and decoding. *Target:* −0.5 s on most in-session turns.
+   for detection and decoding. *Target:* -0.5 s on most in-session turns.
 4. **Regression tests from real audio.** Turn the `/tmp/stt_turns` recordings
    (with consent) into a fixture set that replays through `Endpointer`,
    `name_cut`, language selection and Whisper, with expected transcripts.
@@ -705,14 +723,14 @@ so a change can be accepted or rejected on numbers from the robot.
    (or a distilled larger model) on speech recorded through the G1 mic, or
    evaluate `distil-large-v3` int8. Larger stock models were not better on
    the current clips, so data from the target microphone is the likely lever.
-   *Measure:* word error rate on the regression set, latency ≤ 1 s.
+   *Measure:* word error rate on the regression set, latency <= 1 s.
 7. **A stronger multilingual LLM.** Benchmark Qwen 2.5 3B/7B, Gemma, and the
    Polish Bielik models in Ollama with `scripts/bench_llm.py`: Polish grammar,
    arithmetic, refusal of physical actions, first-token latency and memory
    next to Whisper.
 8. **Better Polish voice.** `pl_PL-gosia-medium` is intelligible but flat.
    Compare other Piper Polish voices and a newer neural TTS (an initial
-   Phonon TTS experiment exists locally) for naturalness at ≤ 0.3 s per
+   Phonon TTS experiment exists in `~/phonon_tts`) for naturalness at <= 0.3 s per
    sentence.
 9. **Barge-in.** Let the user interrupt a long reply ("Aletta, stop"). The G1
    mic suppresses the robot's own speaker, which may make wake-word detection
@@ -774,8 +792,8 @@ password stored in the file. The systemd unit `wifi-watchdog.service` brings
 - enables `wifi-watchdog.service`.
 
 Every 20 s the watchdog checks internet access through `wlan0` itself. After
-about 1 minute offline it escalates: reconnect → try every known network in
-range → radio off/on → reload the `8852bu` driver (the USB Wi-Fi driver can
+about 1 minute offline it escalates: reconnect -> try every known network in
+range -> radio off/on -> reload the `8852bu` driver (the USB Wi-Fi driver can
 hang while still "connected"). Then it waits 2 minutes and repeats.
 
 Logs: `journalctl -u wifi-watchdog -f`. To add a network, run
@@ -784,9 +802,10 @@ Logs: `journalctl -u wifi-watchdog -f`. To add a network, run
 
 ## Credits
 
-[bob_llm](https://github.com/bob-ros2/bob_llm) · [Piper](https://github.com/rhasspy/piper) ·
-[faster-whisper](https://github.com/SYSTRAN/faster-whisper) ·
-[openWakeWord](https://github.com/dscripka/openWakeWord) · Unitree G1 SDK / AudioHub.
+[bob_llm](https://github.com/bob-ros2/bob_llm) | [Piper](https://github.com/rhasspy/piper) |
+[faster-whisper](https://github.com/SYSTRAN/faster-whisper) |
+[openWakeWord](https://github.com/dscripka/openWakeWord) | Unitree G1 SDK / AudioHub.
 
 Forked from [SaxionMechatronics/unitree_converse](https://github.com/SaxionMechatronics/unitree_converse).
-Piotr Gapski, Poznań University of Technology.
+Piotr Gapski, Poznań University of Technology. Released under the MIT license
+(see [LICENSE](LICENSE)); `bob_llm` is Apache-2.0.

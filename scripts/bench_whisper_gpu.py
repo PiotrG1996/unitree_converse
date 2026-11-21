@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-bench_whisper_gpu.py — head-to-head CPU vs GPU benchmark for faster-whisper.
+bench_whisper_gpu.py - head-to-head CPU vs GPU benchmark for faster-whisper.
 
 Measures, for the SAME audio and the SAME model size:
   * model load time (first construction)

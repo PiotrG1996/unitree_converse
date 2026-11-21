@@ -6,7 +6,7 @@ package_name = 'g1_voice'
 
 setup(
     name=package_name,
-    version='0.0.0',
+    version='1.0.0',
     packages=find_packages(exclude=['test']),
     data_files=[
         ('share/ament_index/resource_index/packages', ['resource/' + package_name]),
@@ -16,9 +16,9 @@ setup(
     ],
     install_requires=['setuptools'],
     zip_safe=True,
-    maintainer='asmn',
-    maintainer_email='a.s.naurathae@saxion.nl',
-    description='G1 voice interface with LLM',
+    maintainer='Piotr Gapski',
+    maintainer_email='maintainer@example.com',  # TODO: public e-mail
+    description='Unitree G1 conversation: Unitree GPT online, offline Aletta pipeline',
     license='MIT',
     tests_require=['pytest'],
     entry_points={

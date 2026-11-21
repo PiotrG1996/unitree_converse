@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-test_mic_live.py — interactive live microphone test for the G1.
+test_mic_live.py - interactive live microphone test for the G1.
 
 Captures the RockChip UDP mic stream (the exact path stt_node uses) while YOU
 speak, then reports:
@@ -90,7 +90,7 @@ def main():
     audio, npkts = capture(args.seconds)
 
     if audio.size == 0:
-        print("\n[FAIL] No UDP packets received — mic stream is dead.")
+        print("\n[FAIL] No UDP packets received - mic stream is dead.")
         print("  Is the RockChip MCU streaming? Are you on the robot?")
         return 2
 
@@ -146,16 +146,16 @@ def main():
 
     print("\n" + "=" * 60)
     if not cleared_threshold:
-        print("FAIL — speech never cleared the level threshold.")
+        print("FAIL - speech never cleared the level threshold.")
         print("  Likely cause: mic muted / gain too low / not near the mic.")
         print("  Check the RockChip mic hardware mute and mic volume.")
         rc = 1
     elif not transcript:
-        print("FAIL — mic captured speech-level audio but Whisper got nothing")
+        print("FAIL - mic captured speech-level audio but Whisper got nothing")
         print("  Level OK; inspect STT (model/language) for the problem.")
         rc = 1
     else:
-        print("PASS — mic delivers speech and it transcribes.")
+        print("PASS - mic delivers speech and it transcribes.")
         rc = 0
     print("=" * 60)
     return rc

@@ -185,7 +185,7 @@ class RobotStateNode(Node):
     def state_block(self, system=False, text=''):
         lines = ['[ROBOT STATE]', self.battery or 'Battery: unknown']
         if self.rpy:
-            lines.append('Orientation: roll={}° pitch={}° yaw={}°'.format(*self.rpy))
+            lines.append('Orientation: roll={} deg pitch={} deg yaw={} deg'.format(*self.rpy))
         if self.mode is not None:
             lines.append('Motion mode: {}'.format(
                 MOTION_MODES.get(self.mode, self.mode)))

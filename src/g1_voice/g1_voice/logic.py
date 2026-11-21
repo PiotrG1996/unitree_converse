@@ -265,7 +265,7 @@ def looks_like_noise(text):
     t = (text or '').strip()
     words = re.findall(r"[^\W_]+(?:'[^\W_]+)?", t.lower())
     if not words or not is_latin_text(t):
-        return True  # empty, or e.g. Japanese "ご視聴ありがとうございました"
+        return True  # empty, or e.g. the Japanese "thanks for watching" subtitle
     if any(phrase in t.lower() for phrase in _SUBTITLE_PHRASES):
         return True
 

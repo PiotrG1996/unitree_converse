@@ -28,7 +28,7 @@ sys.path.insert(0, os.path.join(REPO, 'src', 'g1_voice'))
 OLLAMA = 'http://localhost:11434'
 STATE = """[ROBOT STATE]
 Battery: 80%, not charging, health 98%
-Orientation: roll=0.3° pitch=-1.2° yaw=45.0°
+Orientation: roll=0.3 deg pitch=-1.2 deg yaw=45.0 deg
 Motion mode: idle
 Network: robot bus 192.168.123.164 (eth0), wifi 192.168.1.115
 Uptime: 0h 47m
@@ -123,7 +123,7 @@ def bench(model, system, runs):
             firsts.append(first)
             speeds.append(tps)
             if i == 0 or not ok:
-                print('  {} {} {!r:38} -> {}'.format('✓' if ok else '✗', lang, text, reply[:100]))
+                print('  {} {} {!r:38} -> {}'.format('OK ' if ok else 'BAD', lang, text, reply[:100]))
     print('  correct: en {}/{}, pl {}/{} | reply language right: en {}/{}, pl {}/{}'.format(
         *score['en'], *score['pl'], *lang_ok['en'], *lang_ok['pl']))
     print('  first token median {:.2f}s, {:.1f} tok/s'.format(

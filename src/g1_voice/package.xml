@@ -2,16 +2,24 @@
 <?xml-model href="http://download.ros.org/schema/package_format3.xsd" schematypens="http://www.w3.org/2001/XMLSchema"?>
 <package format="3">
   <name>g1_voice</name>
-  <version>0.0.0</version>
-  <description>G1 voice conversation pipeline: STT + LLM + TTS ROS 2 nodes for the Unitree G1 robot.</description>
-  <maintainer email="a.s.naurathae@saxion.nl">asmn</maintainer>
+  <version>1.0.0</version>
+  <description>
+    Spoken conversation for the Unitree G1: the official Unitree GPT while the
+    robot is online, and the offline "Aletta" pipeline on the Jetson (wake word,
+    faster-whisper STT, Ollama LLM via bob_llm, Piper TTS; English and Polish)
+    when offline or selected with F1.
+  </description>
+  <!-- TODO: replace the placeholder with the maintainer's public e-mail. -->
+  <maintainer email="maintainer@example.com">Piotr Gapski</maintainer>
   <license>MIT</license>
+  <url type="repository">https://github.com/PiotrG1996/unitree_converse</url>
 
   <depend>rclpy</depend>
   <depend>std_msgs</depend>
   <depend>rcl_interfaces</depend>
   <depend>bob_llm</depend>
   <depend>unitree_go</depend>
+  <depend>unitree_hg</depend>
   <depend>unitree_api</depend>
   <exec_depend>python3-numpy</exec_depend>
 

@@ -1,15 +1,15 @@
 #!/usr/bin/env bash
-# check_pipeline.sh — verify each stage of the on-robot LLM voice pipeline.
+# check_pipeline.sh - verify each stage of the on-robot LLM voice pipeline.
 #
 # WHAT IT CHECKS (each stage independently, no mic/speaker needed)
-#   1. Ollama  — the OpenAI-compatible endpoint answers a trivial chat request
+#   1. Ollama  - the OpenAI-compatible endpoint answers a trivial chat request
 #                and returns the expected model (llama3.2 by default).
-#   2. Piper   — the standalone binary synthesises non-empty WAV audio from text
+#   2. Piper   - the standalone binary synthesises non-empty WAV audio from text
 #                (mirrors tts_node._speak_binary, including LD_LIBRARY_PATH and
 #                ESPEAK_DATA_PATH so espeak phonemisation works).
-#   3. Whisper — faster-whisper transcribes a synthesised clip back to text that
+#   3. Whisper - faster-whisper transcribes a synthesised clip back to text that
 #                contains an expected keyword (end-to-end TTS->STT sanity).
-#   4. ROS2    — (optional, ROS_FULL=1) with the pipeline already running, checks
+#   4. ROS2    - (optional, ROS_FULL=1) with the pipeline already running, checks
 #                the key topics exist and prints the live /g1/robot_state.
 #
 # USAGE
@@ -39,7 +39,7 @@ bad()  { echo "  [FAIL] $*"; FAIL=$((FAIL+1)); }
 info() { echo "  [INFO] $*"; }
 hdr()  { echo; echo "== $* =="; }
 
-# ── 1. OLLAMA (LLM backend) ──────────────────────────────────────────────────
+# -- 1. OLLAMA (LLM backend) --------------------------------------------------
 hdr "Ollama LLM backend ($OLLAMA_URL, model=$OLLAMA_MODEL)"
 if ! command -v curl >/dev/null 2>&1; then
     bad "curl not available"
@@ -101,7 +101,7 @@ except Exception:
 fi
 
 
-# ── 2. PIPER (TTS synthesis) ─────────────────────────────────────────────────
+# -- 2. PIPER (TTS synthesis) -------------------------------------------------
 hdr "Piper TTS ($PIPER_BIN)"
 if [ ! -x "$PIPER_BIN" ]; then
     bad "piper binary missing/not executable: $PIPER_BIN"
@@ -128,7 +128,7 @@ else
 fi
 PIPER_WAV="${PIPER_WAV:-}"
 
-# ── 3. WHISPER (STT) — TTS->STT round trip ───────────────────────────────────
+# -- 3. WHISPER (STT) - TTS->STT round trip -----------------------------------
 hdr "faster-whisper STT (round-trip on synthesised audio)"
 if [ -z "$PIPER_WAV" ] || [ ! -s "$PIPER_WAV" ]; then
     info "skipping STT round-trip (no Piper WAV to transcribe)"
@@ -146,7 +146,7 @@ for _d in (os.environ.get('CTRANSLATE2_LIB_DIR', ''), '/home/unitree/ct2_install
             _p = os.path.join(_d, _n)
             if os.path.exists(_p):
                 try:
-                    # RTLD_LOCAL (not RTLD_GLOBAL) — avoids heap corruption in the
+                    # RTLD_LOCAL (not RTLD_GLOBAL) - avoids heap corruption in the
                     # ROS process; the ct2 extension binds by soname. See stt_node.
                     ctypes.CDLL(_p, mode=ctypes.RTLD_LOCAL)
                 except OSError:
@@ -159,7 +159,7 @@ try:
     from faster_whisper import WhisperModel
     device = sys.argv[2]
     compute_type = 'float16' if device == 'cuda' else 'int8'
-    m = WhisperModel('base', device=device, compute_type=compute_type)
+    m = WhisperModel('small', device=device, compute_type=compute_type)
     segs, _ = m.transcribe(sys.argv[1], language='en', beam_size=5)
     print(' '.join(s.text.strip() for s in segs).strip())
 except Exception as e:
@@ -176,17 +176,17 @@ PY
         *)
             # Non-empty but no keyword: still proves STT runs end-to-end.
             ok "whisper transcribed audio: \"$TRANSCRIPT\""
-            info "expected the word 'Aletta' — check mic/TTS clarity if needed." ;;
+            info "expected the word 'Aletta' - check mic/TTS clarity if needed." ;;
     esac
 fi
 rm -f "$PIPER_WAV"
 
-# ── 4. ROS2 (optional, requires running pipeline) ────────────────────────────
+# -- 4. ROS2 (optional, requires running pipeline) ----------------------------
 hdr "ROS2 pipeline topics (optional)"
 if [ "$ROS_FULL" != "1" ]; then
     info "skipped (set ROS_FULL=1 with the pipeline running to probe topics)"
 elif ! command -v ros2 >/dev/null 2>&1; then
-    info "ros2 not on PATH — source the workspace first"
+    info "ros2 not on PATH - source the workspace first"
 else
     for t in /g1/stt/transcript /g1/robot_state /llm_response /g1/tts/status; do
         if timeout 8 ros2 topic list 2>/dev/null | grep -q "^${t}$"; then
@@ -199,11 +199,11 @@ else
     timeout 10 ros2 topic echo --once /g1/robot_state 2>/dev/null || info "no robot_state sample"
 fi
 
-# ── Summary ──────────────────────────────────────────────────────────────────
+# -- Summary ------------------------------------------------------------------
 hdr "Pipeline check summary"
 echo "  PASS=$PASS  FAIL=$FAIL"
 if [ "$FAIL" -eq 0 ]; then
-    echo "  RESULT: OK — every enabled pipeline stage works."
+    echo "  RESULT: OK - every enabled pipeline stage works."
     exit 0
 fi
 echo "  RESULT: one or more pipeline stages FAILED (see [FAIL] lines above)."

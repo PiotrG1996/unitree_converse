@@ -4,7 +4,7 @@ Unit tests for the custom "Aletta" openWakeWord detector and its helpers.
 The detection logic lives in :mod:`wake_word_openwakeword`, which defers the
 ``openwakeword`` import until ``init``. These tests exercise the pure scoring
 helpers directly, and drive :class:`OpenWakeWordDetector` with a fake
-``openwakeword`` module injected into ``sys.modules`` — so no real
+``openwakeword`` module injected into ``sys.modules`` - so no real
 ONNX/tflite model file is required.
 """
 
@@ -126,7 +126,7 @@ class TestBaseModelPaths(unittest.TestCase):
 
     openWakeWord raises "The onnx inference framework is selected, but tflite
     models were provided!" on a mismatch, which would silently disable wake on
-    an ONNX-only install — so that is asserted explicitly.
+    an ONNX-only install - so that is asserted explicitly.
     """
 
     def test_onnx_framework_uses_onnx_base_models(self):
@@ -297,7 +297,7 @@ class TestConsecutiveConfirmation(unittest.TestCase):
     def test_below_threshold_resets_counter(self):
         detector = self._ready([0.9, 0.2, 0.9, 0.9])
         self.assertFalse(detector.process(self._frame()))  # 1st hit
-        self.assertFalse(detector.process(self._frame()))  # below → reset
+        self.assertFalse(detector.process(self._frame()))  # below -> reset
         self.assertFalse(detector.process(self._frame()))  # 1st hit again
         self.assertTrue(detector.process(self._frame()))   # 2nd consecutive
 

@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# source_ros.sh — set up the ROS 2 + CycloneDDS environment for the G1 voice
+# source_ros.sh - set up the ROS 2 + CycloneDDS environment for the G1 voice
 # pipeline so manual `ros2 topic pub/echo` commands work without OOM-killing.
 #
 # WHY THIS EXISTS (cline fix 2026-10-10):
@@ -22,7 +22,7 @@
 #   ros2 topic echo /g1/robot_state
 #   ros2 topic echo --once /g1/voice/tts/speaking
 #
-# NOTE: use `source`, do not execute — it sets env vars in the current shell.
+# NOTE: use `source`, do not execute - it sets env vars in the current shell.
 
 # Guard against double-sourcing harmlessly.
 if [ -n "$__UNITREE_CONVERSE_ROS_SOURCED" ]; then
@@ -39,7 +39,7 @@ if [ -f "$HOME/unitree_ros2/cyclonedds_ws/install/setup.bash" ]; then
     source "$HOME/unitree_ros2/cyclonedds_ws/install/setup.bash"
 fi
 
-# Absolute path is REQUIRED — never use a literal "~" here.
+# Absolute path is REQUIRED - never use a literal "~" here.
 export RMW_IMPLEMENTATION=rmw_cyclonedds_cpp
 export CYCLONEDDS_URI="$HOME/cyclonedds_ws/cyclonedds.xml"
 export ROS_DOMAIN_ID=0

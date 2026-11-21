@@ -1,8 +1,0 @@
-# Phonon TTS for Jetson Orin NX
-
-# Core dependency
-ptts = ">=0.5.0"
-
-# Audio support
-rubato = ">=0.15.0"
-symphonia = ">=0.5.3"

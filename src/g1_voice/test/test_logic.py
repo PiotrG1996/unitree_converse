@@ -81,7 +81,9 @@ class NoiseFilterTest(unittest.TestCase):
 
     def test_hallucinations(self):
         for text in ['', '...', 'sorry sorry sorry', 'Thank you very much. ' * 3,
-                     'ご視聴ありがとうございました。', 'Thanks for watching!',
+                     ('\u3054\u8996\u8074\u3042\u308a\u304c\u3068'
+                      '\u3046\u3054\u3056\u3044\u307e\u3057\u305f\u3002'),  # Japanese subtitle
+                     'Thanks for watching!',
                      'Napisy stworzone przez społeczność Amara.org',
                      "I can't help it, I can't help it, I can't help it",
                      'lalalalala', 'you you you you',
@@ -511,9 +513,12 @@ class AssistantArbiterTest(unittest.TestCase):
         a = self.online_auto()
         a.toggle()
         a.session_open = True
-        self.assertEqual(a.toggle(), 'aletta')       # still in a conversation
+        self.assertEqual(a.toggle(), 'unitree')      # F1: target is Unitree...
+        self.assertEqual(a.mode(), 'aletta')          # ...but the conversation is open
+        self.assertFalse(a.wanted_gpt())              # chat_go stays off meanwhile
         a.session_open = False                         # node closed it (continuous_stop)
         self.assertEqual(a.mode(), 'unitree')
+        self.assertTrue(a.wanted_gpt())
 
     def test_f1_during_open_conversation_keeps_aletta(self):
         # 21 Nov 20:48: F1 pressed while an Aletta conversation was open; when

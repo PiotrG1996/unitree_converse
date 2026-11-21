@@ -21,7 +21,7 @@ piper/
 piper_linux_aarch64.tar.gz
 src/g1_voice/g1_voice.egg-info/
 
-# Output of running the scripts/*aletta* symlinks from the repo root
-# (training data and models belong in src/wakeword_training).
+# Safety net: wake-word data and models live in src/wakeword_training (the
+# training scripts save there by default, also via the scripts/ links).
 /data/
 /models/

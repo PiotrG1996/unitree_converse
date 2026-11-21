@@ -17,7 +17,7 @@ and unit-testable:
   error and leaves wake disabled (there is no fallback backend).
 * The scoring helpers (``is_detection``, ``peak_score``, ``to_int16``) are pure
   functions with no framework dependency, so the detection logic is exercised
-  directly in tests with a fake model — no real ONNX/tflite file is needed.
+  directly in tests with a fake model - no real ONNX/tflite file is needed.
 """
 
 import logging
@@ -100,7 +100,7 @@ def _resolve_path(value, default_filename=''):
         return os.path.join(DEFAULT_MODEL_DIR, default_filename)
     # An explicit path (even relative) is honoured as given: it is resolved
     # against the CWD by openWakeWord/the caller. Only EMPTY paths fall back to
-    # the default dir — prepending it to relative paths broke
+    # the default dir - prepending it to relative paths broke
     # `eval_aletta_model.py --model models/aletta_v0.1.onnx`, which silently
     # rewrote the path to ~/.local/share/openwakeword/models/... and made the
     # eval error out with "model not found" (so nothing got deploy-gated).
@@ -113,7 +113,7 @@ def base_model_paths(framework, melspec_path='', embedding_path=''):
 
     openWakeWord refuses to mix frameworks (ONNX runtime + ``.tflite`` base
     models raises ``ValueError``), so the default filenames must follow the
-    selected ``framework`` — an ONNX wake-word model needs the ``.onnx`` base
+    selected ``framework`` - an ONNX wake-word model needs the ``.onnx`` base
     models, and vice versa. setup.sh downloads both variants.
     """
     ext = 'tflite' if framework == 'tflite' else 'onnx'
@@ -150,7 +150,7 @@ class OpenWakeWordDetector:
         ``process()`` calls (one 80 ms frame each, as the node feeds them) to
         score at/above the threshold before reporting a detection. Real
         utterances hold high scores for several frames, while single-spike
-        false accepts (noise transients, playback bleed) rarely do — so this
+        false accepts (noise transients, playback bleed) rarely do - so this
         trades ~80 ms of latency per extra frame for far fewer false wakes.
         Coerced to at least 1 (1 = fire on the first over-threshold frame,
         the old behaviour).
@@ -164,7 +164,7 @@ class OpenWakeWordDetector:
         self.model = None
         self._model_name = None
         self.logger = None
-        # Peak score from the most recent process() call — surfaced so the
+        # Peak score from the most recent process() call - surfaced so the
         # node can log it and the threshold can be calibrated on the robot.
         self.last_score = 0.0
         self.min_consecutive_frames = max(1, int(min_consecutive_frames))
@@ -182,14 +182,14 @@ class OpenWakeWordDetector:
         if not self.model_path or not os.path.exists(self.model_path):
             self._log(logger, 'error',
                       'Aletta wake word model not found at '
-                      f'{self.model_path!r} — wake disabled (no fallback; '
+                      f'{self.model_path!r} - wake disabled (no fallback; '
                       'pad buttons still work)')
             return False
         try:
             from openwakeword.model import Model
         except ImportError as exc:
             self._log(logger, 'error',
-                      f'openwakeword package unavailable ({exc}) — '
+                      f'openwakeword package unavailable ({exc}) - '
                       'wake disabled (no fallback; pad buttons still work)')
             return False
         try:
@@ -209,7 +209,7 @@ class OpenWakeWordDetector:
             return True
         except Exception as exc:  # noqa: BLE001 - degrade gracefully
             self._log(logger, 'error',
-                      f'Failed to load Aletta wake word model: {exc} — '
+                      f'Failed to load Aletta wake word model: {exc} - '
                       'wake disabled (no fallback; pad buttons still work)')
             self.model = None
             return False
@@ -224,7 +224,7 @@ class OpenWakeWordDetector:
 
         A detection requires ``min_consecutive_frames`` consecutive calls at/
         above the threshold (the node feeds one 80 ms frame per call). One
-        call counts as one step regardless of chunk length — feeding longer
+        call counts as one step regardless of chunk length - feeding longer
         chunks weakens the confirmation, so the node streams 80 ms frames.
         """
         if self.model is None:

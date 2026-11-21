@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# check_audio.sh — verify the G1 speaker + microphones are working.
+# check_audio.sh - verify the G1 speaker + microphones are working.
 #
 # WHAT IT CHECKS
 #   1. PulseAudio is up and the onboard sink/source are present.
@@ -10,7 +10,7 @@
 #      reports the RMS level so you can confirm the mic captures sound
 #      (speak during the capture for a live check).
 #   4. MIC (UDP multicast, RockChip): joins 239.168.123.161:5555 for a few
-#      seconds and reports how many packets/bytes arrived — this is the path
+#      seconds and reports how many packets/bytes arrived - this is the path
 #      stt_node actually uses on the real robot.
 #
 # USAGE
@@ -62,12 +62,12 @@ hdr "PulseAudio server"
 if pactl info >/dev/null 2>&1; then
     ok "PulseAudio reachable ($(pactl info 2>/dev/null | awk -F': ' '/Default Sink/{print $2}'))"
 else
-    bad "PulseAudio NOT reachable at $PULSE_SERVER (run ensure_pulse.sh / log in)"
+    bad "PulseAudio NOT reachable at $PULSE_SERVER (only needed for a local sound card; the robot speaker uses AudioHub)"
     echo "        Skipping speaker + ALSA-mic checks (no PulseAudio)."
     SKIP_MIC=1
 fi
 
-# ── 1. SPEAKER ──────────────────────────────────────────────────────────────
+# -- 1. SPEAKER --------------------------------------------------------------
 hdr "Speaker (PulseAudio sink: $SINK)"
 if ! pactl info >/dev/null 2>&1; then
     info "speaker check skipped (no PulseAudio)"
@@ -105,14 +105,14 @@ else
         if python3 -c "import sys; sys.exit(0 if float('$MON_RMS') > 0.005 else 1)"; then
             ok "speaker loopback detected (monitor RMS=$MON_RMS)"
         else
-            bad "no audio on $SINK monitor (RMS=$MON_RMS) — speaker may be muted"
+            bad "no audio on $SINK monitor (RMS=$MON_RMS) - speaker may be muted"
         fi
         rm -f "$TONE" "$MON_RAW"
     fi
 fi
 
 
-# ── 2. MIC (PulseAudio input) ────────────────────────────────────────────────
+# -- 2. MIC (PulseAudio input) ------------------------------------------------
 hdr "Microphone (PulseAudio source: $SRC)"
 if [ "$SKIP_MIC" = "1" ]; then
     info "ALSA/PulseAudio mic check skipped (SKIP_MIC=1)"
@@ -141,7 +141,7 @@ else
     fi
 fi
 
-# ── 3. MIC (UDP multicast — the real stt_node path) ──────────────────────────
+# -- 3. MIC (UDP multicast - the real stt_node path) --------------------------
 hdr "Microphone (UDP multicast: $UDP_GROUP:$UDP_PORT)"
 if [ "$SKIP_UDP" = "1" ]; then
     info "UDP multicast mic check skipped (SKIP_UDP=1)"
@@ -176,7 +176,7 @@ except Exception as e:
     raise SystemExit(1)
 if pkts > 0:
     print(f"  [PASS] received {pkts} UDP packets ({nbytes} bytes) from {group}:{port}")
-    print("  [INFO] RockChip mic multicast is live — stt_node can capture.")
+    print("  [INFO] RockChip mic multicast is live - stt_node can capture.")
     raise SystemExit(0)
 print(f"  [FAIL] no UDP packets on {group}:{port} in 3s "
       f"(is the RockChip MCU streaming? mic muted? not on robot?)")
@@ -188,11 +188,11 @@ else
     FAIL=$((FAIL+1))
 fi
 
-# ── Summary ──────────────────────────────────────────────────────────────────
+# -- Summary ------------------------------------------------------------------
 hdr "Audio check summary"
 echo "  PASS=$PASS  FAIL=$FAIL"
 if [ "$FAIL" -eq 0 ]; then
-    echo "  RESULT: OK — speaker and microphones look healthy."
+    echo "  RESULT: OK - speaker and microphones look healthy."
     exit 0
 fi
 echo "  RESULT: one or more audio checks FAILED (see [FAIL] lines above)."

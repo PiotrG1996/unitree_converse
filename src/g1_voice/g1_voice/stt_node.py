@@ -365,6 +365,14 @@ class STTNode(Node):
             deadline = time.monotonic() + 30.0
             while self._echo_active() and time.monotonic() < deadline:
                 time.sleep(0.1)
+            # Cancelled while waiting out the echo guard: the session closed
+            # (continuous_stop clears the trigger) or F1 handed over to the
+            # Unitree GPT. Seen 21 Nov 22:34: such a turn still recorded 7 s.
+            if not self._trigger.is_set() or (
+                    self._unitree_mode and not self.continuous_mode):
+                self._trigger.clear()
+                self.get_logger().info('Turn cancelled before recording')
+                continue
             self._busy = True
             published = False
             try:

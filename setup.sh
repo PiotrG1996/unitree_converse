@@ -39,7 +39,9 @@ for f in pl_PL-gosia-medium.onnx pl_PL-gosia-medium.onnx.json; do
 done
 
 echo "[3/6] Whisper + openWakeWord models"
-python3 -c "from faster_whisper.utils import download_model; download_model('small')"
+# medium transcribes, small does the language-ID pass (voice_params_real.yaml);
+# both are cached so the first start needs no internet.
+python3 -c "from faster_whisper.utils import download_model; download_model('medium'); download_model('small')"
 mkdir -p "$OWW_DIR"
 python3 -c "from openwakeword.utils import download_models; download_models(target_directory='$OWW_DIR')"
 MODEL="$REPO/src/wakeword_training/models/aletta_v0.1.onnx"
