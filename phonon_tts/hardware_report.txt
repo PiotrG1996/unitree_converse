@@ -1,0 +1,216 @@
+=== NVIDIA Jetson Phonon TTS Hardware Report ===
+Generated: Wed 28 Oct 2026 08:01:12 AM UTC
+
+--- System Identification ---
+Model: NVIDIA Orin NX Developer Kit
+Architecture: aarch64
+Kernel: 5.10.104-tegra
+
+--- OS and L4T ---
+# R35 (release), REVISION: 3.1, GCID: 32827747, BOARD: t186ref, EABI: aarch64, DATE: Sun Mar 19 15:19:21 UTC 2023
+
+--- Python ---
+Python 3.8.10
+Platform: linux
+
+--- CUDA ---
+CUDA 11.4: available
+PyTorch: 2.4.1
+CUDA available: False
+
+--- cuDNN ---
+cuDNN: available
+
+--- TensorRT ---
+TensorRT: not installed
+
+--- Memory and CPU ---
+              total        used        free      shared  buff/cache   available
+Mem:           15Gi        13Gi       1.2Gi       5.0Mi       398Mi       1.3Gi
+Swap:         7.5Gi       2.7Gi       4.8Gi
+Architecture:                    aarch64
+CPU op-mode(s):                  32-bit, 64-bit
+Byte Order:                      Little Endian
+CPU(s):                          8
+On-line CPU(s) list:             0-7
+Thread(s) per core:              1
+Core(s) per socket:              8
+Socket(s):                       1
+Vendor ID:                       ARM
+Model:                           1
+Model name:                      ARMv8 Processor rev 1 (v8l)
+Stepping:                        r0p1
+CPU max MHz:                     1984.0000
+CPU min MHz:                     115.2000
+BogoMIPS:                        62.50
+L1d cache:                       512 KiB
+L1i cache:                       512 KiB
+L2 cache:                        2 MiB
+L3 cache:                        4 MiB
+Vulnerability Itlb multihit:     Not affected
+Vulnerability L1tf:              Not affected
+Vulnerability Mds:               Not affected
+Vulnerability Meltdown:          Not affected
+Vulnerability Spec store bypass: Mitigation; Speculative Store Bypass disabled via prctl
+Vulnerability Spectre v1:        Mitigation; __user pointer sanitization
+Vulnerability Spectre v2:        Not affected
+Vulnerability Srbds:             Not affected
+Vulnerability Tsx async abort:   Not affected
+Flags:                           fp asimd evtstrm aes pmull sha1 sha2 crc32 atomics fphp asimdhp cpuid asimdrdm lrcpc dcpop asimddp uscat ilrcpc flagm
+
+--- Power and Thermal ---
+10-28-2026 09:01:16 RAM 15073/15389MB (lfb 44x1MB) SWAP 2744/7694MB (cached 1MB) CPU [38%@1984,59%@1984,14%@1984,32%@1984,87%@1984,18%@1984,28%@1984,13%@1984] EMC_FREQ 0% GR3D_FREQ 0% GR3D2_FREQ 0%@0 CV0@54.937C CPU@57C SOC2@55.375C SOC0@56.781C CV1@55.812C GPU@54.656C tj@57.5C SOC1@57.5C CV2@54.5C
+10-28-2026 09:01:17 RAM 15171/15389MB (lfb 32x1MB) SWAP 3269/7694MB (cached 1MB) CPU [40%@1984,100%@1984,17%@1984,36%@1984,39%@1984,27%@1984,60%@1984,18%@1984] EMC_FREQ 0% GR3D_FREQ 0% GR3D2_FREQ 0%@0 CV0@55C CPU@56.937C SOC2@55.343C SOC0@56.843C CV1@55.531C GPU@54.75C tj@57.562C SOC1@57.562C CV2@54.625C
+10-28-2026 09:01:18 RAM 15203/15389MB (lfb 32x1MB) SWAP 3968/7694MB (cached 1MB) CPU [39%@1984,100%@1984,38%@1984,44%@1984,19%@729,26%@729,51%@729,50%@729] EMC_FREQ 0% GR3D_FREQ 0% GR3D2_FREQ 0%@0 CV0@54.906C CPU@57.031C SOC2@55.343C SOC0@56.781C CV1@55.531C GPU@54.843C tj@57.468C SOC1@57.468C CV2@54.437C
+10-28-2026 09:01:20 RAM 15218/15389MB (lfb 32x1MB) SWAP 4840/7694MB (cached 1MB) CPU [26%@1984,100%@1984,16%@1984,16%@1984,97%@1984,18%@1984,19%@1984,11%@1984] EMC_FREQ 0% GR3D_FREQ 0% GR3D2_FREQ 0%@0 CV0@54.937C CPU@56.781C SOC2@55.312C SOC0@56.906C CV1@55.718C GPU@54.625C tj@57.468C SOC1@57.468C CV2@54.437C
+10-28-2026 09:01:21 RAM 15187/15389MB (lfb 32x1MB) SWAP 5746/7694MB (cached 1MB) CPU [30%@1984,100%@1984,16%@1984,30%@1984,52%@1984,14%@1984,16%@1984,37%@1984] EMC_FREQ 0% GR3D_FREQ 0% GR3D2_FREQ 0%@0 CV0@55.031C CPU@57.281C SOC2@55.312C SOC0@56.687C CV1@55.593C GPU@54.875C tj@57.5C SOC1@57.5C CV2@54.468C
+Thermal zone0: 56°C
+
+--- Audio Devices ---
+**** List of CAPTURE Hardware Devices ****
+card 1: APE [NVIDIA Jetson Orin NX APE], device 0: tegra-dlink-0 XBAR-ADMAIF1-0 []
+  Subdevices: 1/1
+  Subdevice #0: subdevice #0
+card 1: APE [NVIDIA Jetson Orin NX APE], device 1: tegra-dlink-1 XBAR-ADMAIF2-1 []
+  Subdevices: 1/1
+  Subdevice #0: subdevice #0
+card 1: APE [NVIDIA Jetson Orin NX APE], device 2: tegra-dlink-2 XBAR-ADMAIF3-2 []
+  Subdevices: 1/1
+  Subdevice #0: subdevice #0
+card 1: APE [NVIDIA Jetson Orin NX APE], device 3: tegra-dlink-3 XBAR-ADMAIF4-3 []
+  Subdevices: 1/1
+  Subdevice #0: subdevice #0
+card 1: APE [NVIDIA Jetson Orin NX APE], device 4: tegra-dlink-4 XBAR-ADMAIF5-4 []
+  Subdevices: 1/1
+  Subdevice #0: subdevice #0
+card 1: APE [NVIDIA Jetson Orin NX APE], device 5: tegra-dlink-5 XBAR-ADMAIF6-5 []
+  Subdevices: 1/1
+  Subdevice #0: subdevice #0
+card 1: APE [NVIDIA Jetson Orin NX APE], device 6: tegra-dlink-6 XBAR-ADMAIF7-6 []
+  Subdevices: 1/1
+  Subdevice #0: subdevice #0
+card 1: APE [NVIDIA Jetson Orin NX APE], device 7: tegra-dlink-7 XBAR-ADMAIF8-7 []
+  Subdevices: 1/1
+  Subdevice #0: subdevice #0
+card 1: APE [NVIDIA Jetson Orin NX APE], device 8: tegra-dlink-8 XBAR-ADMAIF9-8 []
+  Subdevices: 1/1
+  Subdevice #0: subdevice #0
+card 1: APE [NVIDIA Jetson Orin NX APE], device 9: tegra-dlink-9 XBAR-ADMAIF10-9 []
+  Subdevices: 1/1
+  Subdevice #0: subdevice #0
+card 1: APE [NVIDIA Jetson Orin NX APE], device 10: tegra-dlink-10 XBAR-ADMAIF11-10 []
+  Subdevices: 1/1
+  Subdevice #0: subdevice #0
+card 1: APE [NVIDIA Jetson Orin NX APE], device 11: tegra-dlink-11 XBAR-ADMAIF12-11 []
+  Subdevices: 1/1
+  Subdevice #0: subdevice #0
+card 1: APE [NVIDIA Jetson Orin NX APE], device 12: tegra-dlink-12 XBAR-ADMAIF13-12 []
+  Subdevices: 1/1
+  Subdevice #0: subdevice #0
+card 1: APE [NVIDIA Jetson Orin NX APE], device 13: tegra-dlink-13 XBAR-ADMAIF14-13 []
+  Subdevices: 1/1
+  Subdevice #0: subdevice #0
+card 1: APE [NVIDIA Jetson Orin NX APE], device 14: tegra-dlink-14 XBAR-ADMAIF15-14 []
+  Subdevices: 1/1
+  Subdevice #0: subdevice #0
+card 1: APE [NVIDIA Jetson Orin NX APE], device 15: tegra-dlink-15 XBAR-ADMAIF16-15 []
+  Subdevices: 1/1
+  Subdevice #0: subdevice #0
+card 1: APE [NVIDIA Jetson Orin NX APE], device 16: tegra-dlink-16 XBAR-ADMAIF17-16 []
+  Subdevices: 1/1
+  Subdevice #0: subdevice #0
+card 1: APE [NVIDIA Jetson Orin NX APE], device 17: tegra-dlink-17 XBAR-ADMAIF18-17 []
+  Subdevices: 1/1
+  Subdevice #0: subdevice #0
+card 1: APE [NVIDIA Jetson Orin NX APE], device 18: tegra-dlink-18 XBAR-ADMAIF19-18 []
+  Subdevices: 1/1
+  Subdevice #0: subdevice #0
+card 1: APE [NVIDIA Jetson Orin NX APE], device 19: tegra-dlink-19 XBAR-ADMAIF20-19 []
+  Subdevices: 1/1
+  Subdevice #0: subdevice #0
+card 1: APE [NVIDIA Jetson Orin NX APE], device 20: tegra-dlink-20 ADSP-FE1-20 []
+  Subdevices: 1/1
+  Subdevice #0: subdevice #0
+card 1: APE [NVIDIA Jetson Orin NX APE], device 21: tegra-dlink-21 ADSP-FE2-21 []
+  Subdevices: 1/1
+  Subdevice #0: subdevice #0
+**** List of PLAYBACK Hardware Devices ****
+card 0: HDA [NVIDIA Jetson Orin NX HDA], device 3: HDMI 0 [HDMI 0]
+  Subdevices: 1/1
+  Subdevice #0: subdevice #0
+card 0: HDA [NVIDIA Jetson Orin NX HDA], device 7: HDMI 1 [HDMI 1]
+  Subdevices: 1/1
+  Subdevice #0: subdevice #0
+card 0: HDA [NVIDIA Jetson Orin NX HDA], device 8: HDMI 2 [HDMI 2]
+  Subdevices: 1/1
+  Subdevice #0: subdevice #0
+card 0: HDA [NVIDIA Jetson Orin NX HDA], device 9: HDMI 3 [HDMI 3]
+  Subdevices: 1/1
+  Subdevice #0: subdevice #0
+card 1: APE [NVIDIA Jetson Orin NX APE], device 0: tegra-dlink-0 XBAR-ADMAIF1-0 []
+  Subdevices: 1/1
+  Subdevice #0: subdevice #0
+card 1: APE [NVIDIA Jetson Orin NX APE], device 1: tegra-dlink-1 XBAR-ADMAIF2-1 []
+  Subdevices: 1/1
+  Subdevice #0: subdevice #0
+card 1: APE [NVIDIA Jetson Orin NX APE], device 2: tegra-dlink-2 XBAR-ADMAIF3-2 []
+  Subdevices: 1/1
+  Subdevice #0: subdevice #0
+card 1: APE [NVIDIA Jetson Orin NX APE], device 3: tegra-dlink-3 XBAR-ADMAIF4-3 []
+  Subdevices: 1/1
+  Subdevice #0: subdevice #0
+card 1: APE [NVIDIA Jetson Orin NX APE], device 4: tegra-dlink-4 XBAR-ADMAIF5-4 []
+  Subdevices: 1/1
+  Subdevice #0: subdevice #0
+card 1: APE [NVIDIA Jetson Orin NX APE], device 5: tegra-dlink-5 XBAR-ADMAIF6-5 []
+  Subdevices: 1/1
+  Subdevice #0: subdevice #0
+card 1: APE [NVIDIA Jetson Orin NX APE], device 6: tegra-dlink-6 XBAR-ADMAIF7-6 []
+  Subdevices: 1/1
+  Subdevice #0: subdevice #0
+card 1: APE [NVIDIA Jetson Orin NX APE], device 7: tegra-dlink-7 XBAR-ADMAIF8-7 []
+  Subdevices: 1/1
+  Subdevice #0: subdevice #0
+card 1: APE [NVIDIA Jetson Orin NX APE], device 8: tegra-dlink-8 XBAR-ADMAIF9-8 []
+  Subdevices: 1/1
+  Subdevice #0: subdevice #0
+card 1: APE [NVIDIA Jetson Orin NX APE], device 9: tegra-dlink-9 XBAR-ADMAIF10-9 []
+  Subdevices: 1/1
+  Subdevice #0: subdevice #0
+card 1: APE [NVIDIA Jetson Orin NX APE], device 10: tegra-dlink-10 XBAR-ADMAIF11-10 []
+  Subdevices: 1/1
+  Subdevice #0: subdevice #0
+card 1: APE [NVIDIA Jetson Orin NX APE], device 11: tegra-dlink-11 XBAR-ADMAIF12-11 []
+  Subdevices: 1/1
+  Subdevice #0: subdevice #0
+card 1: APE [NVIDIA Jetson Orin NX APE], device 12: tegra-dlink-12 XBAR-ADMAIF13-12 []
+  Subdevices: 1/1
+  Subdevice #0: subdevice #0
+card 1: APE [NVIDIA Jetson Orin NX APE], device 13: tegra-dlink-13 XBAR-ADMAIF14-13 []
+  Subdevices: 1/1
+  Subdevice #0: subdevice #0
+card 1: APE [NVIDIA Jetson Orin NX APE], device 14: tegra-dlink-14 XBAR-ADMAIF15-14 []
+  Subdevices: 1/1
+  Subdevice #0: subdevice #0
+card 1: APE [NVIDIA Jetson Orin NX APE], device 15: tegra-dlink-15 XBAR-ADMAIF16-15 []
+  Subdevices: 1/1
+  Subdevice #0: subdevice #0
+card 1: APE [NVIDIA Jetson Orin NX APE], device 16: tegra-dlink-16 XBAR-ADMAIF17-16 []
+  Subdevices: 1/1
+  Subdevice #0: subdevice #0
+card 1: APE [NVIDIA Jetson Orin NX APE], device 17: tegra-dlink-17 XBAR-ADMAIF18-17 []
+  Subdevices: 1/1
+  Subdevice #0: subdevice #0
+card 1: APE [NVIDIA Jetson Orin NX APE], device 18: tegra-dlink-18 XBAR-ADMAIF19-18 []
+  Subdevices: 1/1
+  Subdevice #0: subdevice #0
+card 1: APE [NVIDIA Jetson Orin NX APE], device 19: tegra-dlink-19 XBAR-ADMAIF20-19 []
+  Subdevices: 1/1
+  Subdevice #0: subdevice #0
+card 1: APE [NVIDIA Jetson Orin NX APE], device 20: tegra-dlink-20 ADSP-FE1-20 []
+  Subdevices: 1/1
+  Subdevice #0: subdevice #0
+card 1: APE [NVIDIA Jetson Orin NX APE], device 21: tegra-dlink-21 ADSP-FE2-21 []
+  Subdevices: 1/1
+  Subdevice #0: subdevice #0
+

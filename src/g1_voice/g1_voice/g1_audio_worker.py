@@ -1,143 +1,87 @@
 #!/usr/bin/env python3
-"""Separate-process worker for native Unitree G1 speaker playback."""
+"""
+Subprocess that plays PCM on the G1 speaker via the Unitree AudioHub API.
+
+Kept out of the ROS process because unitree_sdk2py brings its own DDS
+participant. Protocol (stdin/stdout, one JSON line each):
+
+  -> {"ready": true, "native_audio": bool}          on start
+  <- {"command": "play", "length": N} + N bytes of 16 kHz mono s16le PCM
+  -> {"ok": true} | {"ok": false, "error": "..."}  after playback finished
+
+Without unitree_sdk2py (dev machine) it reports native_audio=false and the
+caller plays audio locally instead.
+"""
 
 import json
+import os
 import sys
 import time
-import traceback
+
+APP_NAME = 'unitree_converse'
+BYTES_PER_SECOND = 32000  # 16 kHz * 2 bytes
+
+# unitree_sdk2py (and CycloneDDS) print diagnostics to stdout, which would
+# corrupt the JSON replies. Keep a private copy of stdout for the protocol and
+# point fd 1 (Python and C-level prints) at stderr.
+_PROTOCOL = os.fdopen(os.dup(1), 'w')
+os.dup2(2, 1)
+sys.stdout = sys.stderr
 
 
-def _log(level, message, **fields):
-    """
-    Structured diagnostic to stderr, mirroring node_logging's key=value style.
-
-    g1_audio_worker is a standalone subprocess (no ROS node), so it cannot use
-    node_logging directly. This helper keeps its diagnostics parseable and
-    level-tagged so they can be grepped from journalctl/stderr alongside the
-    ROS nodes' output.
-    """
-    suffix = ''.join(f' {k}={v}' for k, v in fields.items())
-    print(f'[g1_audio_worker] {level.upper()}: {message}{suffix}',
-          file=sys.stderr, flush=True)
-
-
-def send_message(message):
-    print(json.dumps(message), flush=True)
+def send(message):
+    _PROTOCOL.write(json.dumps(message) + '\n')
+    _PROTOCOL.flush()
 
 
 def main():
-    interface = sys.argv[1] if len(sys.argv) > 1 else "eth0"
-
+    interface = sys.argv[1] if len(sys.argv) > 1 else 'eth0'
+    client = None
     try:
         from unitree_sdk2py.core.channel import ChannelFactoryInitialize
         from unitree_sdk2py.g1.audio.g1_audio_client import AudioClient
-
-        ChannelFactoryInitialize(0, interface)
-        client = AudioClient()
-        client.SetTimeout(10.0)
-        client.Init()
-        send_message({"ready": True})
-    except Exception as exc:
-        send_message({"ready": False, "error": str(exc)})
-        return 1
-
-    while True:
-        line = sys.stdin.buffer.readline()
-        if not line:
-            break
-        try:
-            command = json.loads(line.decode("utf-8"))
-
-            if command.get("command") == "quit":
-                break
-
-            if command.get("command") != "play":
-                send_message({"ok": False, "error": "Unknown command"})
-                continue
-
-            app_name = "unitree_converse"
-            # Monotonic per-process counter: wall-clock ms collided for
-            # back-to-back sentences (same ms + same seq within one
-            # process restart), mixing two playbacks in one stream handle.
-            # time_ns() alone can still collide across rapid calls, so the
-            # process counter guarantees uniqueness for every play command.
-            if not hasattr(main, "_stream_seq"):
-                main._stream_seq = 0
-            main._stream_seq += 1
-            stream_id = f"{time.time_ns()}-{main._stream_seq}"
-
-            length = command.get("length")
-            if length is None:
-                # Backward compat: read from file if path provided
-                path = command.get("path")
-                if path is None:
-                    send_message({"ok": False, "error": "Missing length/path"})
-                    continue
-                with open(path, "rb") as audio_file:
-                    pcm_data = audio_file.read()
-            else:
-                length = int(length)
-                pcm_data = sys.stdin.buffer.read(length)
-                if len(pcm_data) != length:
-                    send_message({"ok": False, "error": "Short PCM read from stdin"})
-                    continue
-
-            if not pcm_data:
-                send_message({"ok": False, "error": "Empty PCM audio"})
-                continue
-
-            # 16 kHz, mono, signed 16-bit PCM: 32,000 bytes per second.
-            chunk_size = 32000
-
-            try:
-                for offset in range(0, len(pcm_data), chunk_size):
-                    chunk = pcm_data[offset:offset + chunk_size]
-                    t0 = time.monotonic()
-                    ret_code, _ = client.PlayStream(
-                        app_name, stream_id, chunk
-                    )
-                    send_time = time.monotonic() - t0
-
-                    if ret_code != 0:
-                        raise RuntimeError(
-                            f"PlayStream returned code {ret_code}"
-                        )
-
-                    # Pace to realtime: PlayStream already consumed
-                    # send_time, so only sleep the remainder. The old code
-                    # slept the full chunk duration AFTER the blocking
-                    # call, running slower than realtime with gaps.
-                    sleep_time = max(
-                        0.0, len(chunk) / 32000.0 - send_time)
-                    _log(
-                        'debug', 'Audio chunk pacing',
-                        chunk_s=f'{len(chunk) / 32000.0:.2f}s',
-                        playstream_call_s=f'{send_time:.2f}s',
-                        pacing_sleep_s=f'{sleep_time:.2f}s')
-                    time.sleep(sleep_time)
-
-                client.PlayStop(app_name)
-                send_message({"ok": True})
-            except Exception:
-                try:
-                    client.PlayStop(app_name)
-                except Exception:
-                    pass
-                raise
-
-        except Exception as exc:
-            _log(
-                'error', 'Command processing failed',
-                error=str(exc), traceback=traceback.format_exc())
-            send_message({"ok": False, "error": str(exc)})
-
-    try:
-        client.PlayStop("unitree_converse")
-    except Exception:
+    except ImportError:
         pass
+    else:
+        try:
+            ChannelFactoryInitialize(0, interface)
+            client = AudioClient()
+            client.SetTimeout(10.0)
+            client.Init()
+        except Exception as exc:  # noqa: BLE001
+            send({'ready': False, 'error': str(exc)})
+            return 1
+    send({'ready': True, 'native_audio': client is not None})
 
+    stdin = sys.stdin.buffer
+    seq = 0
+    for line in stdin:
+        command = json.loads(line)
+        if command.get('command') != 'play':
+            break
+        pcm = stdin.read(int(command['length']))
+        if client is None:
+            send({'ok': True})
+            continue
+        seq += 1
+        stream_id = '{}-{}'.format(time.time_ns(), seq)  # unique per utterance
+        try:
+            for offset in range(0, len(pcm), BYTES_PER_SECOND):
+                chunk = pcm[offset:offset + BYTES_PER_SECOND]
+                start = time.monotonic()
+                code, _ = client.PlayStream(APP_NAME, stream_id, chunk)
+                if code != 0:
+                    raise RuntimeError('PlayStream returned {}'.format(code))
+                # Pace to real time; PlayStream itself took part of it.
+                time.sleep(max(0.0, len(chunk) / BYTES_PER_SECOND
+                               - (time.monotonic() - start)))
+            send({'ok': True})
+        except Exception as exc:  # noqa: BLE001
+            send({'ok': False, 'error': str(exc)})
+        finally:
+            client.PlayStop(APP_NAME)
     return 0
 
 
-if __name__ == "__main__":
+if __name__ == '__main__':
     sys.exit(main())

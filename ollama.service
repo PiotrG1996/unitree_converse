@@ -1,24 +1,22 @@
+# Installed to /etc/systemd/system/ollama.service by setup.sh (replaces the
+# stock unit written by the Ollama installer).
 [Unit]
 Description=Ollama Service
 After=network-online.target
 
 [Service]
 ExecStart=/usr/local/bin/ollama serve
-# Keep the 3B model resident in memory between turns so the first token of each
-# reply is not delayed by reloading the model from disk.
-Environment="OLLAMA_KEEP_ALIVE=-1"
-# Don't let the kernel OOM killer pick the LLM as victim: at 2026-10-13 11:01
-# an OOM killed llama-server mid-reply (llm_node saw "model runner has
-# unexpectedly stopped" 500s). Lower score => smaller processes die first.
-OOMScoreAdjust=-500
-# 2048 context is ample for <=2-sentence turns with the configured history
-# cap; halves the KV cache vs the 4096 default and saves RAM on this Jetson.
-Environment="OLLAMA_NUM_CTX=2048"
 User=ollama
 Group=ollama
 Restart=always
 RestartSec=3
-Environment="PATH=/home/unitree/.local/bin:/home/unitree/.cargo/bin:/usr/local/cuda-11.4/bin:/home/unitree/cyclonedds_ws/install/cyclonedds/bin:/opt/ros/foxy/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/usr/games:/usr/local/games:/snap/bin"
+# Keep llama3.2 resident so the first reply after a pause is not delayed.
+Environment="OLLAMA_KEEP_ALIVE=-1"
+# Short spoken turns + a 6-turn history fit easily; halves the KV cache.
+Environment="OLLAMA_CONTEXT_LENGTH=2048"
+Environment="PATH=/usr/local/cuda/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+# An OOM once killed the model runner mid-reply; prefer other victims.
+OOMScoreAdjust=-500
 
 [Install]
 WantedBy=default.target

@@ -1,0 +1,1 @@
+../src/wakeword_training/scripts/train_aletta_wakeword.py

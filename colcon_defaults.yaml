@@ -7,3 +7,8 @@
 # in this pytest-style suite and reports success vacuously.
 test:
   python-testing: pytest
+
+# Symlink installs: edits to config/*.yaml and Python sources take effect on
+# restart without a rebuild, so the installed config can't go stale.
+build:
+  symlink-install: true

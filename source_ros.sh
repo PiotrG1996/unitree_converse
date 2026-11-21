@@ -45,8 +45,8 @@ export CYCLONEDDS_URI="$HOME/cyclonedds_ws/cyclonedds.xml"
 export ROS_DOMAIN_ID=0
 
 # The voice pipeline workspace (g1_voice, bob_llm).
-if [ -f "$HOME/unitree_converse/install/setup.bash" ]; then
-    source "$HOME/unitree_converse/install/setup.bash"
+if [ -f "$HOME/unitree_os/unitree_conversional/install/setup.bash" ]; then
+    source "$HOME/unitree_os/unitree_conversional/install/setup.bash"
 fi
 
 echo "[source_ros.sh] ROS2 env ready: RMW=$RMW_IMPLEMENTATION DOMAIN=$ROS_DOMAIN_ID CYCLONEDDS_URI=$CYCLONEDDS_URI"

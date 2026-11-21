@@ -1,265 +1,223 @@
+"""
+Robot state node: adds live robot state to each STT transcript.
+
+The enriched prompt goes to the LLM on ``llm_prompt``. The state block is
+also published on /g1/robot_state every 30 s for diagnostics.
+
+When the user asks about the software (nodes, topics, settings, ...; see
+``logic.asks_about_system``) the block also summarizes the ROS graph, the
+assistant mode, key settings, and every parameter of the voice nodes whose
+name matches the question (``logic.match_parameters``): all parameters of
+all pipeline nodes are listed and read via their ROS parameter services.
+This is strictly read-only: the graph comes from local discovery, the
+parameters from each node's ``list_parameters`` / ``get_parameters``
+services (refreshed every 30 s in the background); nothing is ever set,
+called with side effects, or published to another node's topics.
+"""
+
+import threading
+import time
+
 import rclpy
+from rcl_interfaces.srv import GetParameters, ListParameters
 from rclpy.node import Node
+from rclpy.qos import DurabilityPolicy, QoSProfile, ReliabilityPolicy
 from std_msgs.msg import String
-import socket
-import subprocess
 
-try:
-    from .node_logging import info as log_info, warn as log_warn
-except ImportError:
-    try:
-        from g1_voice.node_logging import info as log_info, warn as log_warn
-    except ImportError:
-        import os as _os
-        import sys as _sys
+from g1_voice.logic import (ROBOT_IP, VOICE_NODES, asks_about_system, format_local_time,
+                            match_parameters,
+                            format_parameters, interface_for_ip, interface_ip,
+                            parameter_value, split_language, summarize_graph)
 
-        _sys.path.insert(0, _os.path.dirname(_os.path.abspath(__file__)))
-        import node_logging as _node_logging
+MOTION_MODES = {0: 'idle', 1: 'balancing', 2: 'walking', 3: 'running'}
+LANGUAGE_NAMES = {'en': 'English', 'pl': 'Polish'}
 
-        log_info = _node_logging.info
-        log_warn = _node_logging.warn
+
+def uptime():
+    with open('/proc/uptime') as f:
+        seconds = int(float(f.read().split()[0]))
+    return '{}h {}m'.format(seconds // 3600, seconds % 3600 // 60)
 
 
 class RobotStateNode(Node):
-    """
-    Enrich STT transcripts with live robot state before the LLM sees them.
-
-    Subscribes to /g1/stt/transcript, enriches it with live robot state,
-    and republishes to llm_prompt (which llm_node listens to).
-
-    State collected:
-    - Battery: SOC, SOH, current, temperature
-    - Network: WiFi IP, ethernet IP
-    - System: uptime, ROS2 nodes count
-    - IMU: orientation (roll/pitch/yaw)
-    """
 
     def __init__(self):
         super().__init__('robot_state_node')
-
-        # Internal state cache
-        self.battery_soc = None
-        self.battery_soh = None
-        self.battery_current = None
-        self.battery_temp = None
-        self.battery_voltage = None
-        self.battery_cycles = None
-        self.imu_rpy = None
+        self.battery = None
+        self.rpy = None
         self.mode = None
 
-        # Cached ROS2 node count. Counting nodes requires spawning `ros2 node
-        # list`, which performs full DDS discovery and can take hundreds of ms
-        # to seconds. It is refreshed periodically in the background instead of
-        # on every user turn so it never blocks the transcript -> LLM path.
-        self._cached_ros_nodes = 'unknown'
-
-        # Subscribe to robot state topics
         try:
             from unitree_hg.msg import BmsState
-            from rclpy.qos import QoSProfile, ReliabilityPolicy, DurabilityPolicy
-            qos = QoSProfile(
-                reliability=ReliabilityPolicy.RELIABLE,
-                durability=DurabilityPolicy.VOLATILE,
-                depth=10
-            )
+            # BmsState lives in unitree_hg and is published RELIABLE.
             self.create_subscription(
-                BmsState, '/lf/bmsstate', self._bms_callback, qos)
-            log_info(self, 'Subscribed to /lf/bmsstate')
-        except Exception as e:
-            log_warn(self, f'Could not subscribe to BmsState: {e}')
-
+                BmsState, '/lf/bmsstate', self._on_bms,
+                QoSProfile(depth=10, reliability=ReliabilityPolicy.RELIABLE))
+        except ImportError as exc:
+            self.get_logger().warn('No battery state: {}'.format(exc))
         try:
             from unitree_go.msg import SportModeState
             self.create_subscription(
-                SportModeState,
-                '/odommodestate',
-                self._sport_callback,
-                10)
-            log_info(self, 'Subscribed to /odommodestate')
-        except Exception as e:
-            log_warn(self, f'Could not subscribe to SportModeState: {e}')
+                SportModeState, '/odommodestate', self._on_sport, 10)
+        except ImportError as exc:
+            self.get_logger().warn('No IMU state: {}'.format(exc))
 
-        # Subscribe to STT transcript
-        self.transcript_sub = self.create_subscription(
-            String, '/g1/stt/transcript', self._transcript_callback, 10)
-
-        # Publish enriched prompt to LLM
+        self.create_subscription(String, '/g1/stt/transcript', self._on_transcript, 10)
         self.prompt_pub = self.create_publisher(String, 'llm_prompt', 10)
-        self.status_pub = self.create_publisher(String, '/g1/robot_state', 10)
+        self.state_pub = self.create_publisher(String, '/g1/robot_state', 10)
+        self.create_timer(
+            30.0, lambda: self.state_pub.publish(String(data=self.state_block())))
 
-        # Publish state summary every 30 seconds
-        self.create_timer(30.0, self._publish_state_summary)
+        # Read-only cache of ALL parameters of the voice nodes:
+        # {(node, param): value}, refreshed every 30 s.
+        self._params = {}
+        self._param_clients = {}
+        for node in VOICE_NODES:
+            if node == self.get_name():
+                continue  # our own parameters: nothing useful, and no self-calls
+            self._param_clients[node] = (
+                self.create_client(ListParameters, '/{}/list_parameters'.format(node)),
+                self.create_client(GetParameters, '/{}/get_parameters'.format(node)))
+        self.assistant_mode = None
+        self.create_subscription(
+            String, '/g1/voice/assistant_mode', self._on_assistant_mode,
+            QoSProfile(depth=1, durability=DurabilityPolicy.TRANSIENT_LOCAL))
+        self.create_timer(30.0, self._refresh_parameters)
+        self.create_timer(3.0, self._first_refresh)
 
-        # Refresh the (expensive) ROS2 node count in the background, decoupled
-        # from the per-turn prompt path.
-        self.create_timer(30.0, self._update_ros_node_count)
+        # Load the LLM now: after a reboot Ollama loads the model on the first
+        # question, which then took 5.4 s to its first token (later: 0.3-0.6 s).
+        warmup_url = self.declare_parameter(
+            'llm_warmup_url', 'http://localhost:11434/api/generate').value
+        warmup_model = self.declare_parameter('llm_warmup_model', 'llama3.2').value
+        if warmup_url:
+            threading.Thread(target=self._warm_llm, args=(warmup_url, warmup_model),
+                             daemon=True).start()
 
-        log_info(self, 'Robot state node ready')
+    def _warm_llm(self, url, model):
+        """Ask Ollama to load ``model`` (empty prompt) so the first reply is fast."""
+        import json
+        import urllib.request
+        time.sleep(2.0)  # let the latched assistant mode arrive first
+        if self.assistant_mode == 'unitree':
+            return  # Unitree's GPT answers; assistant_mode_node loads it when needed
+        start = time.monotonic()
+        body = json.dumps({'model': model, 'keep_alive': -1}).encode()
+        for _ in range(10):  # Ollama may still be starting
+            try:
+                req = urllib.request.Request(url, body, {'Content-Type': 'application/json'})
+                urllib.request.urlopen(req, timeout=60).read()
+                self.get_logger().info('LLM {} loaded in {:.1f}s'.format(
+                    model, time.monotonic() - start))
+                return
+            except Exception as exc:  # noqa: BLE001 - only a speed-up
+                last = exc
+                time.sleep(3.0)
+        self.get_logger().warn('LLM warm-up failed: {}'.format(last))
 
-    def _update_ros_node_count(self):
-        """Count ROS2 nodes in the background; cache for per-turn reuse."""
+    def _first_refresh(self):
+        if not self._params:
+            self._refresh_parameters()
+
+    def _on_assistant_mode(self, msg):
+        self.assistant_mode = msg.data
+
+    def _refresh_parameters(self):
+        """List, then read, every parameter of each voice node (async, never blocks)."""
+        for node, (lister, getter) in self._param_clients.items():
+            if not lister.service_is_ready() or not getter.service_is_ready():
+                continue
+            future = lister.call_async(ListParameters.Request())
+            future.add_done_callback(
+                lambda f, node=node, getter=getter: self._on_list(node, getter, f))
+
+    def _on_list(self, node, getter, future):
         try:
-            result = subprocess.run(
-                ['ros2', 'node', 'list'],
-                capture_output=True, text=True, timeout=5
-            )
-        except Exception:
-            # Timeout/spawn failure: keep the previous cached value.
+            names = list(future.result().result.names)
+        except Exception as exc:  # noqa: BLE001 - the summary just omits them
+            self.get_logger().debug('list_parameters on {} failed: {}'.format(node, exc))
             return
-        if result.returncode != 0:
-            # CLI/daemon errors return empty stdout; caching that would
-            # overwrite a good count with a bogus 0.
-            return
-        nodes = [n for n in result.stdout.strip().split('\n') if n]
-        if not nodes:
-            # An empty graph is never true (this node itself is always in it);
-            # treat as a discovery race and keep the previous value.
-            return
-        self._cached_ros_nodes = len(nodes)
+        names = [n for n in names if n != 'use_sim_time']
+        if names:
+            done = getter.call_async(GetParameters.Request(names=names))
+            done.add_done_callback(
+                lambda f, node=node, names=names: self._on_parameters(node, names, f))
 
-    def _bms_callback(self, msg):
-        self.battery_soc = msg.soc
-        self.battery_soh = msg.soh
-        self.battery_current = msg.current / 1000.0  # mA to A
-        temps = [t for t in msg.temperature if t > 0]
-        self.battery_temp = max(temps) if temps else None
-        self.battery_voltage = msg.bmsvoltage[0] / \
-            1000.0 if len(msg.bmsvoltage) > 0 else None
-        self.battery_cycles = msg.cycle
+    def _on_parameters(self, node, names, future):
+        try:
+            values = future.result().values
+        except Exception as exc:  # noqa: BLE001 - the summary just omits them
+            self.get_logger().debug('get_parameters on {} failed: {}'.format(node, exc))
+            return
+        for name, value in zip(names, values):
+            self._params[(node, name)] = parameter_value(value)
 
-    def _sport_callback(self, msg):
-        if msg.imu_state:
-            rpy = msg.imu_state.rpy
-            self.imu_rpy = (
-                round(rpy[0] * 57.3, 1),  # rad to deg
-                round(rpy[1] * 57.3, 1),
-                round(rpy[2] * 57.3, 1)
-            )
+    def system_lines(self, text=''):
+        """ROS graph, mode, settings and the parameters a question names (read-only)."""
+        nodes = [name for name, _ in self.get_node_names_and_namespaces()]
+        topics = [name for name, _ in self.get_topic_names_and_types()]
+        lines = summarize_graph(nodes, topics)
+        if self.assistant_mode:
+            lines.append('Assistant mode: {} (Unitree GPT answers by default while the '
+                         'robot is online; saying "Aletta" switches to Aletta)'.format(
+                             self.assistant_mode))
+        settings = format_parameters(self._params)
+        if settings:
+            lines.append(settings)
+        matched = match_parameters(self._params, text)
+        if matched:
+            lines.append('Parameters named in the question (read-only): ' + '; '.join(matched))
+        lines.append('Parameters readable: {} on {} nodes. They can be read, not changed, '
+                     'by voice.'.format(len(self._params),
+                                        len({n for n, _ in self._params})))
+        return lines
+
+    def _on_bms(self, msg):
+        # Only what is useful in conversation: a 3B model otherwise volunteers
+        # currents, temperatures and cycle counts nobody asked about.
+        self.battery = 'Battery: {}%, {}, health {}%'.format(
+            msg.soc, 'charging' if msg.current > 0 else 'not charging', msg.soh)
+
+    def _on_sport(self, msg):
+        self.rpy = [round(v * 57.2958, 1) for v in msg.imu_state.rpy]
         self.mode = msg.mode
 
-    def _get_system_info(self):
-        """Collect system info: IPs, uptime."""
-        info = {}
-
-        # Network IPs
-        try:
-            info['eth_ip'] = '192.168.123.164'
-            s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-            s.connect(('8.8.8.8', 80))
-            info['wifi_ip'] = s.getsockname()[0]
-            s.close()
-        except Exception:
-            info['wifi_ip'] = 'not connected'
-
-        # Uptime
-        try:
-            with open('/proc/uptime', 'r') as f:
-                uptime_seconds = float(f.read().split()[0])
-            hours = int(uptime_seconds // 3600)
-            minutes = int((uptime_seconds % 3600) // 60)
-            info['uptime'] = f'{hours}h {minutes}m'
-        except Exception:
-            info['uptime'] = 'unknown'
-
-        # ROS2 nodes (use the background-cached count; never block the turn
-        # here)
-        info['ros_nodes'] = self._cached_ros_nodes
-
-        return info
-
-    def _build_state_context(self):
-        """Build a concise state string to prepend to LLM prompts."""
-        lines = ['[ROBOT STATE]']
-
-        # Battery
-        if self.battery_soc is not None:
-            charging = self.battery_current and self.battery_current > 0
-            status = 'charging' if charging else 'discharging'
-            lines.append(
-                f'Battery: {self.battery_soc}% (health {self.battery_soh}%, '
-                f'{abs(self.battery_current):.1f}A {status}, '
-                f'temp {self.battery_temp}°C, {self.battery_cycles} cycles)'
-            )
-        else:
-            lines.append('Battery: unknown')
-
-        # IMU
-        if self.imu_rpy:
-            r, p, y = self.imu_rpy
-            lines.append(f'Orientation: roll={r}° pitch={p}° yaw={y}°')
-
-        # Mode
+    def state_block(self, system=False, text=''):
+        lines = ['[ROBOT STATE]', self.battery or 'Battery: unknown']
+        if self.rpy:
+            lines.append('Orientation: roll={}° pitch={}° yaw={}°'.format(*self.rpy))
         if self.mode is not None:
-            mode_names = {
-                0: 'idle',
-                1: 'balancing',
-                2: 'walking',
-                3: 'running'}
-            mode_str = mode_names.get(self.mode, f'mode {self.mode}')
-            lines.append(f'Motion mode: {mode_str}')
-
-        # System
-        sys_info = self._get_system_info()
-        lines.append(
-            f'Network: eth {sys_info["eth_ip"]}, wifi {sys_info["wifi_ip"]}')
-        lines.append(f'Uptime: {sys_info["uptime"]}')
-        lines.append(f'Active ROS2 nodes: {sys_info["ros_nodes"]}')
-        lines.append(f'LLM: Ollama LLaMA 3.2 3B (local)')
-        lines.append(f'STT: faster-whisper base')
-        lines.append(f'TTS: Piper en_US-lessac-medium (Aletta voice)')
+            lines.append('Motion mode: {}'.format(
+                MOTION_MODES.get(self.mode, self.mode)))
+        lines += [
+            'Network: robot bus {} ({}), wifi {}'.format(
+                ROBOT_IP, interface_for_ip() or 'DOWN',
+                interface_ip('wlan0') or 'not connected'),
+            'Local time: {}'.format(format_local_time()),
+            'Uptime: {}'.format(uptime()),
+            'Software: local LLM (Ollama), faster-whisper, Piper TTS (all on-robot)',
+        ]
+        if system:
+            try:
+                lines += self.system_lines(text)
+            except Exception as exc:  # noqa: BLE001 - never lose the turn
+                self.get_logger().warn('System summary failed: {}'.format(exc))
         lines.append('[/ROBOT STATE]')
-
         return '\n'.join(lines)
 
-    def _transcript_callback(self, msg: String):
-        """Intercept transcript, enrich with robot state, forward to LLM."""
-        raw_text = msg.data.strip()
-        language_code = ''
-        transcript = raw_text
-
-        # Read language metadata from STT while preserving the spoken text.
-        first_line, separator, remaining = raw_text.partition('\n')
-        if separator and first_line.startswith(
-                '[USER_LANGUAGE:') and first_line.endswith(']'):
-            language_code = first_line[len('[USER_LANGUAGE:'):-1].lower()
-            transcript = remaining.strip()
-        if not transcript:
+    def _on_transcript(self, msg):
+        language, text = split_language(msg.data)
+        if not text:
             return
-
-        state_context = self._build_state_context()
-        if language_code == 'pl':
-            language_name = 'Polish'
-        elif language_code == 'en':
-            language_name = 'English'
-        else:
-            language_name = ''
-
-        if language_name:
-            language_instruction = (
-                f"LATEST USER TURN LANGUAGE: {language_name} ({language_code}). "
-                f"Reply in {language_name} for this turn, regardless of earlier "
-                "conversation turns. This instruction overrides the language "
-                "used in previous turns, unless the user explicitly requests "
-                "a different language.")
-            enriched = (
-                f"{state_context}\n\n{language_instruction}"
-                f"\n\nUser: {transcript}"
-            )
-        else:
-            enriched = f"{state_context}\n\nUser: {transcript}"
-
-        out = String()
-        out.data = enriched
-        self.prompt_pub.publish(out)
-
-        log_info(self, f'Forwarded enriched prompt to LLM')
-
-    def _publish_state_summary(self):
-        """Publish robot state summary every 30s."""
-        state = self._build_state_context()
-        msg = String()
-        msg.data = state
-        self.status_pub.publish(msg)
+        parts = [self.state_block(system=asks_about_system(text), text=text)]
+        if language in LANGUAGE_NAMES:
+            name = LANGUAGE_NAMES[language]
+            parts.append(
+                'LATEST USER TURN LANGUAGE: {0} ({1}). Reply in {0} for this '
+                'turn, unless the user explicitly asks for another '
+                'language.'.format(name, language))
+        parts.append('User: ' + text)
+        self.prompt_pub.publish(String(data='\n\n'.join(parts)))
 
 
 def main(args=None):

@@ -248,6 +248,10 @@ class OpenWakeWordDetector:
             self._consecutive = 0
         return self._consecutive >= self.min_consecutive_frames
 
+    def veto(self):
+        """Reject the current frame: restart the consecutive-frame count."""
+        self._consecutive = 0
+
     def reset(self):
         """Clear the model's rolling buffers (call after a trigger)."""
         self._consecutive = 0

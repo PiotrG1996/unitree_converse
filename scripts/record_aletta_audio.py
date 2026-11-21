@@ -1,0 +1,1 @@
+../src/wakeword_training/scripts/record_aletta_audio.py

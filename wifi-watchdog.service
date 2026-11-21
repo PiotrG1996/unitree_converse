@@ -1,0 +1,19 @@
+# System-level Wi-Fi: brings wlan0 up at boot (no user login needed) and keeps
+# it online. Profiles are system-owned NetworkManager keyfiles in
+# /etc/NetworkManager/system-connections with the PSK stored in the file.
+[Unit]
+Description=Robot Wi-Fi: connect at boot and keep online
+After=NetworkManager.service
+Wants=NetworkManager.service
+Before=network-online.target
+# Never give up restarting.
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+ExecStart=/home/unitree/unitree_os/unitree_conversional/scripts/wifi_watchdog.sh
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

@@ -1,108 +1,53 @@
+# Dev machine (ROS 2 Humble, no G1): local mic, CPU Whisper, local playback
+# (g1_audio_worker reports no native audio and tts_node falls back to aplay).
+
 /llm_node:
   ros__parameters:
-    api_url: "http://localhost:11434/v1"      # Ollama OpenAI-compatible endpoint
+    api_url: "http://localhost:11434/v1"
     api_key: "no_key"
     api_model: "llama3.2"
-    system_prompt: "You are Aletta, a friendly humanoid robot by Unitree Robotics. Currently you are being researched and worked upon by the Poznan University of technology, Poland. Keep ALL responses under 2 sentences. You are speaking out loud, be concise."
+    system_prompt: "You are Aletta, a friendly humanoid robot by Unitree Robotics, researched at Poznan University of Technology, Poland. You are speaking out loud: keep every reply under 2 sentences."
     temperature: 0.7
-    max_history_length: 0
-    stream: false                             # keep false for TTS compatibility
+    max_history_length: 6
+    stream: true
 
 /stt_node:
   ros__parameters:
-    use_udp_mic: false                        # dev machine: use local sounddevice mic
-    continuous_mode: false
-    model_size: "base"
-    language: "en"
+    use_udp_mic: false        # sounddevice default input
     device: "cpu"
-    beam_size: 5
-    initial_prompt: ""
-    vad_threshold: 0.3
-    vad_min_silence_ms: 500
-    vad_speech_pad_ms: 400
-    normalize_audio: true
-    sample_rate: 16000
+    continuous_mode: false
     recording_duration: 8.0
-    silence_threshold: 0.0072
-    silence_duration: 2.5
-    # Raised 0.5 -> 0.85: live logs show real uncertain English speech at
-    # no_speech_prob ~0.75 being dropped on the noisy UDP mic feed. 0.85
-    # keeps those while still blocking high-confidence noise (>0.85). The
-    # _looks_like_noise gate and min_publish_avg_logprob floor (-11.0)
-    # provide a second line of defence.
-    max_no_speech_prob: 0.85
-    # Lowered 0.55 -> 0.50: Whisper's auto language detection on the noisy
-    # UDP mic feed rarely exceeds ~0.55-0.74 even for clear English speech.
-    # Above ~0.55 almost every turn goes to the pl/en duel, where Polish can
-    # wrongly override English (the wake word "Aletta" is English). At 0.50,
-    # moderately-confident English auto detections are accepted directly,
-    # avoiding Polish flips.
-    language_detection_min_probability: 0.50
-    # See voice_params_real.yaml for the rationale (duel margin + publish
-    # floor — guard against noise being decoded as Polish/English replies).
-    language_duel_override_margin: 0.25
-    # Raised from -2.5 to -11.0: real speech on a noisy mic feed decodes at
-    # low avg_logprob (~-10). Keep it; block only extreme garbage (< -11).
-    min_publish_avg_logprob: -11.0
-    # TTS echo guard (see voice_params_real.yaml): STT defers mic opens
-    # while the robot's own voice is on the air.
-    tts_echo_guard_sec: 2.0
 
 /wake_word_node:
   ros__parameters:
-    # Sole voice trigger: "Aletta" via the custom openWakeWord model.
-    # Pad buttons (F1/START/SELECT) via button_trigger_node are the only
-    # other triggers. No Whisper phrase matching, no keyboard trigger.
-    sample_rate: 16000
-    # openWakeWord 0.6.0 exports ONNX only (tflite conversion needs
-    # tensorflow + onnx_tf, not installed on the robot). setup.sh downloads
-    # BOTH base-feature variants; the detector picks the .onnx pair to match
-    # this framework.
-    aletta_model_path: "~/.local/share/openwakeword/aletta_v0.1.onnx"
-    aletta_framework: "onnx"
-    # Raised from 0.85 — synthetic-only model keys on Piper voice timbre,
-    # so ambient/noise frames still cross 0.85 (~46% false-accept). 0.95
-    # rejects most noise while keeping strong real "Aletta" utterances.
-    aletta_threshold: 0.95
-    # Confirmation: N consecutive 80 ms frames over threshold before firing.
-    # Raised from 2 to 4 — requires ~320 ms of sustained detection.
-    min_consecutive_frames: 4
-    # Ignore mic audio while the robot's own TTS is playing (+ ring-down).
-    echo_guard_sec: 2.0
-    # Base openWakeWord feature models (resolved at runtime to
-    # ~/.local/share/openwakeword/ when empty). Empty = portable default.
-    oww_melspec_model_path: ""
-    oww_embedding_model_path: ""
-    # Enable the UDP mic listener so "Aletta" wake can be tested on the dev
-    # machine by feeding UDP frames (node only listens; harmless if silent).
-    use_udp_mic: true
-    # RMS energy gate: frames below this int16 RMS are skipped before ONNX
-    # scoring. 300 rejects quiet room noise/HVAC that the synthetic model
-    # scores ~0.99.
-    silence_rms: 300.0
-    base_cooldown_sec: 4.0
-    # False-accept backoff: when a wake-opened session times out with no
-    # speech, multiply cooldown by this factor (caps at 15s). Resets on real
-    # activity. Reduced from 2.0/60s to make queued wakes more likely to fire.
-    false_accept_backoff_multiplier: 1.25
-    max_false_accept_cooldown: 15.0
-
-/button_trigger_node:
-  ros__parameters:
-    # Fixed phrase spoken when the SELECT pad button (bit 3, value 8)
-    # is pressed. Published on /g1/voice/say_text and spoken by tts_node,
-    # bypassing STT/LLM. Edit the text here — no code change needed.
-    custom_say_text: "Hello! I am Aletta, a humanoid robot assistant at Poznan University of Technology. I am here to support researchers, students, and academic staff in their daily activities. I can assist with research-related tasks, provide information, answer questions, and help you explore new ideas in science and technology. Whether you are conducting research, working on a project, or simply curious about robotics and artificial intelligence, I am happy to help. My goal is to make your work easier, support scientific collaboration, and contribute to an innovative research environment. Welcome to Poznan University of Technology! How can I assist you today?"
+    aletta_threshold: 0.8     # needs the G1 UDP mic; idle without it
 
 /tts_node:
   ros__parameters:
-    voice_model_path: "/home/asmn/.local/share/piper/en_US-lessac-medium.onnx"
-    polish_voice_model_path: "/home/asmn/.local/share/piper/pl_PL-gosia-medium/pl_PL-gosia-medium.onnx"
-    use_cuda: true
-    output_device: 5                          # unused: playback goes via native g1_audio_worker (AudioHub)
-    output_sample_rate: 44100
-    # Matches /stt_node: default is wake-word ("Aletta") gated; the wake
-    # word node enables the listen-again loop when a session opens.
+    tts_mode: "python"        # pip install piper-tts
     continuous_mode: false
-    tts_mode: "python"                        # 'python' (piper pip pkg) or 'binary' (standalone piper)
 
+/button_trigger_node:
+  ros__parameters:
+    custom_say_text: "Hello! I am Aletta, a humanoid robot assistant at Poznan University of Technology. I am here to support researchers, students, and academic staff in their daily activities. I can assist with research-related tasks, provide information, answer questions, and help you explore new ideas in science and technology. Whether you are conducting research, working on a project, or simply curious about robotics and artificial intelligence, I am happy to help. My goal is to make your work easier, support scientific collaboration, and contribute to an innovative research environment. Welcome to Poznan University of Technology! How can I assist you today?"
+
+# --------------------------------------------------------------------------
+# Environment Variable Overrides (for concurrent GPU/memory deployment)
+# --------------------------------------------------------------------------
+# These env vars allow runtime reconfiguration without editing YAML,
+# useful when running alongside other autonomous applications (navigation,
+# perception) that occupy GPU VRAM.
+#
+#   export STT_DEVICE=cpu       # Force STT to use CPU Whisper
+#   export TTS_MODE=python      # Force TTS to use CPU Piper mode
+#   export LLM_NGL=0            # Force LLM to CPU only (llama.cpp)
+#
+# When running on Orin NX with other GPU-heavy stacks, set these before
+# launching the voice pipeline, e.g.:
+#
+#   export STT_DEVICE=cpu
+#   export TTS_MODE=python
+#   ros2 launch g1_voice voice_real.launch.py
+#
+# Defaults (no env set) preserve existing behavior.
+# --------------------------------------------------------------------------

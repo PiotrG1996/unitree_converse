@@ -28,6 +28,7 @@ setup(
             'wake_word_node = g1_voice.wake_word_node:main',
             'button_trigger_node = g1_voice.button_trigger_node:main',
             'robot_state_node = g1_voice.robot_state_node:main',
+            'assistant_mode_node = g1_voice.assistant_mode_node:main',
         ],
     },
 )

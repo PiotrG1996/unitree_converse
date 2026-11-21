@@ -20,3 +20,8 @@ __pycache__/
 piper/
 piper_linux_aarch64.tar.gz
 src/g1_voice/g1_voice.egg-info/
+
+# Output of running the scripts/*aletta* symlinks from the repo root
+# (training data and models belong in src/wakeword_training).
+/data/
+/models/

@@ -1,5 +1,5 @@
 """
-Unit tests for the STT no-speech confidence gate (speech_gate.py).
+Unit tests for the STT no-speech confidence gate (logic.py).
 
 The gate drops Whisper segments it flags as likely non-speech so invented
 transcripts from ambient noise never reach the LLM ("please check the
@@ -11,9 +11,9 @@ speech scores well below 0.5.
 import sys
 import os
 
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'g1_voice'))
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
 
-from speech_gate import filter_segments, keep_segment  # noqa: E402
+from g1_voice.logic import filter_segments, keep_segment  # noqa: E402
 
 
 class _Seg:
